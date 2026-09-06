@@ -36,6 +36,7 @@ jobs:
           python tools/windv_archive_safe_finalize_fix.py windv
           python tools/windv_archive_safe_defaults_v23.py windv
           python tools/windv_archive_safe_finalize_v24.py windv
+          python tools/windv_archive_safe_progress_v25.py windv
           git -C windv diff --check
 
       - name: Verify capture invariants
@@ -75,6 +76,20 @@ jobs:
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start preview graph")')) { throw 'preview graph true-failure handling missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start AVI writer")')) { throw 'AVI writer true-failure handling missing' }
 
+          # v2.5 truthful live End Capture progress invariants.
+          if (-not (Select-String -Path windv/DShow.h -SimpleMatch 'WM_DV_FINALIZE_PROGRESS')) { throw 'finalization progress message missing' }
+          if (-not (Select-String -Path windv/DShow.h -SimpleMatch 'FinalizeDraining, FinalizeMux, FinalizeVerify, FinalizeHash, FinalizeDone')) { throw 'finalization phase enum missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'WaitForSingleObject(m_thread->m_hThread, 100)')) { throw 'responsive finalization polling missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'InterlockedExchange(&m_finalizePhase, FinalizeMux)')) { throw 'AVI mux phase missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'InterlockedExchange(&m_finalizePhase, FinalizeVerify)')) { throw 'AVI verify phase missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'InterlockedExchange(&m_finalizePhase, FinalizeHash)')) { throw 'SHA phase missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'GetFileSizeEx(hFile, &fileSize)')) { throw 'SHA byte-progress file size missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ComputeFileSHA256(f, hash, &m_finalizePercent)')) { throw 'SHA progress not wired to capture finalizer' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'Finalizing AVI - waiting for AVI mux/index completion...')) { throw 'AVI mux status text missing' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'AVI finalized - verifying RIFF/OpenDML index...')) { throw 'AVI verification status text missing' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'calculating SHA-256... %ld%%')) { throw 'SHA percentage status text missing' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'm_captureFinalizedStatusSticky')) { throw 'sticky final result missing' }
+
       - name: Configure Win32 Release
         run: cmake -S windv -B build -G "Visual Studio 17 2022" -A Win32
 
@@ -96,7 +111,7 @@ jobs:
           git -C windv config user.name 'ArchiveSafe Builder'
           git -C windv config user.email 'actions@users.noreply.github.com'
           git -C windv add -A
-          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.4 patches'
+          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.5 patches'
 
           Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force src | Out-Null
@@ -105,13 +120,13 @@ jobs:
 
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe
+          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.5_x86.exe
           Copy-Item windv/LICENSE LICENSE
-          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp AVICheck.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.4.patch
-          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
+          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp AVICheck.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.5.patch
+          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.5_x86.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  WinDV_1.6.0_ArchiveSafe_v2.5_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
           @"
-          WinDV 1.6.0 ArchiveSafe v2.4
+          WinDV 1.6.0 ArchiveSafe v2.5
           Upstream: Wachhund/WinDV f633c456c211a0fb0e05aa43f2b150ec787faab7
           Build: Windows x86 Release, Visual Studio 2022
           Live DV error scanner: disabled
@@ -119,7 +134,9 @@ jobs:
           Discontinuity threshold default: 0 (automatic discontinuity splitting disabled)
           Max AVI frames default: UINT_MAX / 4,294,967,295 frames
           Frame decimation: disabled (EveryNth=1)
-          End Capture: producer stop -> accepted-frame drain -> EOS -> wait for EC_COMPLETE -> AVI finalization -> OpenDML-aware verification
+          End Capture: producer stop -> accepted-frame drain -> EOS -> wait for EC_COMPLETE -> AVI finalization -> OpenDML-aware verification -> SHA-256
+          Finalization progress UI: live drain/mux/verify/hash phases with actual SHA bytes-read percentage
+          Final result UI: success/error remains visible after the capture graph is re-armed
           AVI mux finalization: no arbitrary 5-second timeout; fail closed unless EC_COMPLETE is received
           AVI verifier: recognizes nested OpenDML indx super-index under hdrl/strl
           DirectShow startup: input, preview, and AVI writer accept S_FALSE asynchronous success; only FAILED HRESULTs abort
@@ -133,14 +150,14 @@ jobs:
           git add src dist LICENSE
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m 'Refresh ArchiveSafe v2.4 source and executable [skip ci]'
+            git commit -m 'Refresh ArchiveSafe v2.5 source and executable [skip ci]'
             git push
           }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WinDV-1.6.0-ArchiveSafe-v2.4-x86
+          name: WinDV-1.6.0-ArchiveSafe-v2.5-x86
           path: |
             dist/*
             tools/*

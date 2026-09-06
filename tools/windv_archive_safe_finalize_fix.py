@@ -39,7 +39,26 @@ def main():
 \t\tbreak;
 ''')
 
-    print("ArchiveSafe final verification fix applied")
+    # DirectShow IMediaControl::Run may legitimately return S_FALSE while a
+    # push-source graph is transitioning to Running. The modern fork added a
+    # strict CHECK_HR here, but CHECK_HR treats any non-S_OK code as failure.
+    # Stock WinDV ignored the return value and then started MonitoringThread,
+    # which supplies the first preview samples. Accept every successful HRESULT
+    # and reject only true failures so S_FALSE cannot deadlock startup.
+    rep(root, "DShow.cpp",
+'''\thr = m_MC->Run();
+\tCHECK_HR(hr, "Can't start preview graph");
+
+\t/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
+''',
+'''\thr = m_MC->Run();
+\tif (FAILED(hr))
+\t\tThrowDShowException(CDShowException::error, "Can't start preview graph");
+
+\t/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
+''')
+
+    print("ArchiveSafe final verification + preview startup fixes applied")
     return 0
 
 

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/build.yml'
+      - 'tools/**'
       - 'README.md'
       - 'UPSTREAM_COMMIT.txt'
   workflow_dispatch:
@@ -26,15 +27,6 @@ jobs:
           git -C windv checkout f633c456c211a0fb0e05aa43f2b150ec787faab7
           $actual = (git -C windv rev-parse HEAD).Trim()
           if ($actual -ne 'f633c456c211a0fb0e05aa43f2b150ec787faab7') { throw "Unexpected upstream commit: $actual" }
-
-      - name: Import temporary ArchiveSafe patch scripts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force tools | Out-Null
-          $base = 'https://raw.githubusercontent.com/lizardpeter/destiny-1/windv-end-capture-build-20260906/tools'
-          Invoke-WebRequest "$base/windv_end_capture_patch.py" -OutFile tools/windv_end_capture_patch.py
-          Invoke-WebRequest "$base/windv_archive_safe_hardening.py" -OutFile tools/windv_archive_safe_hardening.py
-          Invoke-WebRequest "$base/windv_archive_safe_finalize_fix.py" -OutFile tools/windv_archive_safe_finalize_fix.py
 
       - name: Apply ArchiveSafe patches
         shell: pwsh
@@ -108,15 +100,15 @@ jobs:
           End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
           "@ | Out-File -Encoding utf8 dist/README.txt
 
-      - name: Commit self-contained source, tools, and EXE
+      - name: Commit reproducible outputs when changed
         shell: pwsh
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src tools dist LICENSE
+          git add src dist LICENSE
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m 'Materialize ArchiveSafe v2.1 source and executable [skip ci]'
+            git commit -m 'Refresh ArchiveSafe v2.1 source and executable [skip ci]'
             git push
           }
 

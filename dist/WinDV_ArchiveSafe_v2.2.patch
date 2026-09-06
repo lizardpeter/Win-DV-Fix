@@ -1,5 +1,5 @@
 diff --git a/DShow.cpp b/DShow.cpp
-index ec5e2a3..3c44c47 100644
+index ec5e2a3..e81450a 100644
 --- a/DShow.cpp
 +++ b/DShow.cpp
 @@ -530,14 +530,19 @@ STDMETHODIMP CInputGraph::CInputFilter::CInputPin::Receive(IMediaSample *pSample
@@ -84,7 +84,17 @@ index ec5e2a3..3c44c47 100644
  }
  
  /////////////////////////////////////////////////////////////////////////////
-@@ -1980,9 +1997,9 @@ static UINT CapturingThread(LPVOID pdv)
+@@ -1474,7 +1491,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
+ 	CHECK_HR(hr, "Can't set preview window style");
+ 	Resize();
+ 	hr = m_MC->Run();
+-	CHECK_HR(hr, "Can't start preview graph");
++	if (FAILED(hr))
++		ThrowDShowException(CDShowException::error, "Can't start preview graph");
+ 
+ 	/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
+ 	m_thread = AfxBeginThread(::MonitoringThread,this,THREAD_PRIORITY_BELOW_NORMAL,0,CREATE_SUSPENDED);
+@@ -1980,9 +1998,9 @@ static UINT CapturingThread(LPVOID pdv)
  CDV::CDV()
  : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
    m_thread(NULL),
@@ -96,7 +106,7 @@ index ec5e2a3..3c44c47 100644
    m_enableSHA256(true)
  {
  	ResetErrorStats(&m_errorStats);
-@@ -2087,7 +2104,7 @@ void CDV::Destroy()
+@@ -2087,7 +2105,7 @@ void CDV::Destroy()
  		if (m_DVctrl) m_dvInput->CtrlStop();
  		delete(m_dvInput);	m_dvInput = NULL;
  	}
@@ -105,7 +115,7 @@ index ec5e2a3..3c44c47 100644
  	if (m_dvOutput) {
  		if (m_DVctrl) m_dvOutput->CtrlStop();
  		delete(m_dvOutput); m_dvOutput = NULL;
-@@ -2138,6 +2155,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
+@@ -2138,6 +2156,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
  void CDV::BuildCapturing(LPCSTR vsrc)
  {
  	Destroy();
@@ -113,7 +123,7 @@ index ec5e2a3..3c44c47 100644
  	HRESULT hr = S_OK;
  
  	m_dvInput = new CDVInput(vsrc);
-@@ -2176,6 +2194,49 @@ void CDV::StopCapturing()
+@@ -2176,6 +2195,49 @@ void CDV::StopCapturing()
  	}
  }
  
@@ -163,7 +173,7 @@ index ec5e2a3..3c44c47 100644
  /*
   * CDV::StartCapturing
   *
-@@ -2264,6 +2325,16 @@ void CDV::StartRecording()
+@@ -2264,6 +2326,16 @@ void CDV::StartRecording()
  	}
  }
  
@@ -180,7 +190,7 @@ index ec5e2a3..3c44c47 100644
  /*
   * CDV::CapturingThread
   *
-@@ -2338,8 +2409,13 @@ void CDV::CapturingThread()
+@@ -2338,8 +2410,13 @@ void CDV::CapturingThread()
  			gotFrame = m_queue->GetWithTimeout(&duration, &buffer, &len, m_autoStopTimeout);
  		else
  			gotFrame = m_queue->Get(&duration, &buffer, &len);
@@ -195,7 +205,7 @@ index ec5e2a3..3c44c47 100644
  			capStats.eStopReason = 1; /* SIGNAL_LOST */
  			GetParent()->PostMessage(WM_DV_SIGNALLOST, 0, 0);
  			m_state = Finished;
-@@ -2367,26 +2443,20 @@ void CDV::CapturingThread()
+@@ -2367,26 +2444,20 @@ void CDV::CapturingThread()
  				/* Notify the UI of the new recording timestamp. */
  				GetParent()->PostMessage(WM_DV_TIMECHANGE, 0, dvTime);
  			}
@@ -225,7 +235,7 @@ index ec5e2a3..3c44c47 100644
  				}
  				/* Open a new AVI file if none is currently open. */
  				if (!m_aviWriter) {
-@@ -2433,8 +2503,7 @@ void CDV::CapturingThread()
+@@ -2433,8 +2504,7 @@ void CDV::CapturingThread()
  			else {
  				/* Paused or Finished: close any open writer cleanly. */
  				if (m_aviWriter) {
@@ -235,7 +245,7 @@ index ec5e2a3..3c44c47 100644
  				}
  				/* Reset the dropped-frame baseline for the next capture segment.
  				 * Do not reset if we just finished (preserve final stats). */
-@@ -2448,12 +2517,9 @@ void CDV::CapturingThread()
+@@ -2448,12 +2518,9 @@ void CDV::CapturingThread()
  		}
  	}
  	/* Close any writer that was open when the loop exited (e.g. on Destroy()). */
@@ -251,7 +261,7 @@ index ec5e2a3..3c44c47 100644
  		capStats.sFilename = m_captureFilename;
  		capStats.dwFrameCount = m_counter;
  		capStats.dwDroppedFrames = m_dropped;
-@@ -2464,28 +2530,34 @@ void CDV::CapturingThread()
+@@ -2464,28 +2531,34 @@ void CDV::CapturingThread()
  			capStats.errorStats = m_errorStats;
  		}
  

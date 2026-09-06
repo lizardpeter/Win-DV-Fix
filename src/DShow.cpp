@@ -1491,7 +1491,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
 	CHECK_HR(hr, "Can't set preview window style");
 	Resize();
 	hr = m_MC->Run();
-	CHECK_HR(hr, "Can't start preview graph");
+	if (FAILED(hr))
+		ThrowDShowException(CDShowException::error, "Can't start preview graph");
 
 	/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
 	m_thread = AfxBeginThread(::MonitoringThread,this,THREAD_PRIORITY_BELOW_NORMAL,0,CREATE_SUSPENDED);

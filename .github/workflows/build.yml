@@ -35,6 +35,7 @@ jobs:
           python tools/windv_archive_safe_hardening.py windv
           python tools/windv_archive_safe_finalize_fix.py windv
           python tools/windv_archive_safe_defaults_v23.py windv
+          python tools/windv_archive_safe_finalize_v24.py windv
           git -C windv diff --check
 
       - name: Verify capture invariants
@@ -57,6 +58,13 @@ jobs:
           if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveSafe always preserves every received DV frame')) { throw 'frame-decimation lock missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'duration = (len >= 144000) ? 400000 : 333667')) { throw 'DV timing fallback missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'CString CAVIWriter::FinalizeFile()')) { throw 'exact final-file tracking missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_ME->WaitForCompletion(INFINITE, &evCode)')) { throw 'AVI finalizer does not wait for EC_COMPLETE' }
+          if (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_ME->WaitForCompletion(5000, &evCode)' | Where-Object { $_.LineNumber -gt 0 }) {
+            $matches = Select-String -Path windv/DShow.cpp -SimpleMatch 'm_ME->WaitForCompletion(5000, &evCode)'
+            if ($matches.Count -gt 1) { throw 'unexpected extra five-second finalization waits' }
+          }
+          if (-not (Select-String -Path windv/AVICheck.cpp -SimpleMatch 'ContainsOpenDMLIndex')) { throw 'nested OpenDML index verifier missing' }
+          if (-not (Select-String -Path windv/AVICheck.cpp -SimpleMatch 'AVI 2.0 super-index is normally nested under hdrl/strl')) { throw 'nested indx scan not wired into checker' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_finalizedFiles.GetSize() > 0)')) { throw 'pause-safe verification gate missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_autoStopTimeout(0)')) { throw 'archive-safe auto-stop default missing' }
           if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveAutoStopTimeout')) { throw 'archive auto-stop registry isolation missing' }
@@ -88,7 +96,7 @@ jobs:
           git -C windv config user.name 'ArchiveSafe Builder'
           git -C windv config user.email 'actions@users.noreply.github.com'
           git -C windv add -A
-          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.3 patches'
+          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.4 patches'
 
           Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force src | Out-Null
@@ -97,13 +105,13 @@ jobs:
 
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.3_x86.exe
+          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe
           Copy-Item windv/LICENSE LICENSE
-          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.3.patch
-          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.3_x86.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  WinDV_1.6.0_ArchiveSafe_v2.3_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
+          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp AVICheck.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.4.patch
+          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  WinDV_1.6.0_ArchiveSafe_v2.4_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
           @"
-          WinDV 1.6.0 ArchiveSafe v2.3
+          WinDV 1.6.0 ArchiveSafe v2.4
           Upstream: Wachhund/WinDV f633c456c211a0fb0e05aa43f2b150ec787faab7
           Build: Windows x86 Release, Visual Studio 2022
           Live DV error scanner: disabled
@@ -111,7 +119,9 @@ jobs:
           Discontinuity threshold default: 0 (automatic discontinuity splitting disabled)
           Max AVI frames default: UINT_MAX / 4,294,967,295 frames
           Frame decimation: disabled (EveryNth=1)
-          End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
+          End Capture: producer stop -> accepted-frame drain -> EOS -> wait for EC_COMPLETE -> AVI finalization -> OpenDML-aware verification
+          AVI mux finalization: no arbitrary 5-second timeout; fail closed unless EC_COMPLETE is received
+          AVI verifier: recognizes nested OpenDML indx super-index under hdrl/strl
           DirectShow startup: input, preview, and AVI writer accept S_FALSE asynchronous success; only FAILED HRESULTs abort
           "@ | Out-File -Encoding utf8 dist/README.txt
 
@@ -123,14 +133,14 @@ jobs:
           git add src dist LICENSE
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m 'Refresh ArchiveSafe v2.3 source and executable [skip ci]'
+            git commit -m 'Refresh ArchiveSafe v2.4 source and executable [skip ci]'
             git push
           }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WinDV-1.6.0-ArchiveSafe-v2.3-x86
+          name: WinDV-1.6.0-ArchiveSafe-v2.4-x86
           path: |
             dist/*
             tools/*

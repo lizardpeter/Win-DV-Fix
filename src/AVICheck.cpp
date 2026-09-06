@@ -74,6 +74,36 @@ static BOOL ReadExact(HANDLE hFile, void *buf, DWORD n)
 	return ReadFile(hFile, buf, n, &dwRead, NULL) && dwRead == n;
 }
 
+/* Search AVI metadata LISTs for an OpenDML super-index without scanning movi data. */
+static BOOL ContainsOpenDMLIndex(HANDLE hFile, __int64 start, __int64 end, int depth)
+{
+	if (depth < 0) return FALSE;
+	__int64 pos = start;
+	while (pos + 8 <= end) {
+		if (!SeekAbs(hFile, pos)) return FALSE;
+		RIFFChunk ck;
+		if (!ReadExact(hFile, &ck, 8)) return FALSE;
+
+		__int64 payload = pos + 8;
+		__int64 nextPos = payload + (__int64)PADEVEN(ck.dwSize);
+		if (nextPos <= pos || nextPos > end) return FALSE;
+
+		if (FCC(ck.fourcc, "indx")) return TRUE;
+
+		if (FCC(ck.fourcc, "LIST") && ck.dwSize >= 4) {
+			char listType[4];
+			if (!ReadExact(hFile, listType, 4)) return FALSE;
+			if ((FCC(listType, "hdrl") || FCC(listType, "strl")) &&
+			    ContainsOpenDMLIndex(hFile, payload + 4,
+			                           pos + 8 + (__int64)ck.dwSize, depth - 1))
+				return TRUE;
+		}
+
+		pos = nextPos;
+	}
+	return FALSE;
+}
+
 /* ---- Main implementation ---- */
 
 AVICheckResult CheckAVIIntegrity(LPCSTR szPath)
@@ -161,6 +191,10 @@ AVICheckResult CheckAVIIntegrity(LPCSTR szPath)
 					if (ReadExact(hFile, &avih, readSz))
 						bHasAvih = TRUE;
 				}
+				/* AVI 2.0 super-index is normally nested under hdrl/strl. */
+				if (ContainsOpenDMLIndex(hFile, pos + 12,
+				                           pos + 8 + (__int64)ck.dwSize, 3))
+					r.bHasIndex = TRUE;
 			}
 			else if (FCC(listType, "movi")) {
 				bHasMovi = TRUE;

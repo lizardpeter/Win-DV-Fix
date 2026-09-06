@@ -1421,10 +1421,25 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
 CString CAVIWriter::FinalizeFile()
 {
 	if (!m_finalfile.IsEmpty()) return m_finalfile;
-	m_outputFilter->m_output->DeliverEndOfStream();
+
+	HRESULT eosHr = m_outputFilter->m_output->DeliverEndOfStream();
+	if (FAILED(eosHr)) {
+		if (m_MC) m_MC->Stop();
+		m_finalfile = m_tmpfile;
+		ThrowDShowException(CDShowException::error, "AVI finalization failed while sending end-of-stream");
+	}
+
 	if (m_ME) {
-		long evCode;
-		m_ME->WaitForCompletion(5000, &evCode);
+		long evCode = 0;
+		/* ArchiveSafe: do not truncate AVI mux/index finalization at an arbitrary
+		 * timeout.  Once the producer is stopped and EOS has been delivered,
+		 * EC_COMPLETE is the authoritative indication that the mux has finished. */
+		HRESULT waitHr = m_ME->WaitForCompletion(INFINITE, &evCode);
+		if (FAILED(waitHr) || evCode != EC_COMPLETE) {
+			if (m_MC) m_MC->Stop();
+			m_finalfile = m_tmpfile;
+			ThrowDShowException(CDShowException::error, "AVI mux did not complete finalization");
+		}
 	}
 	if (m_MC) m_MC->Stop();
 	CString finalPath = GetCaptureFilename(m_filename, m_dtformat, m_ndigits, m_dvtime);

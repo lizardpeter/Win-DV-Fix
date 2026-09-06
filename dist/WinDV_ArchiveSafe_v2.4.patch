@@ -1,5 +1,57 @@
+diff --git a/AVICheck.cpp b/AVICheck.cpp
+index f4051c4..b3e56c3 100644
+--- a/AVICheck.cpp
++++ b/AVICheck.cpp
+@@ -74,6 +74,36 @@ static BOOL ReadExact(HANDLE hFile, void *buf, DWORD n)
+ 	return ReadFile(hFile, buf, n, &dwRead, NULL) && dwRead == n;
+ }
+ 
++/* Search AVI metadata LISTs for an OpenDML super-index without scanning movi data. */
++static BOOL ContainsOpenDMLIndex(HANDLE hFile, __int64 start, __int64 end, int depth)
++{
++	if (depth < 0) return FALSE;
++	__int64 pos = start;
++	while (pos + 8 <= end) {
++		if (!SeekAbs(hFile, pos)) return FALSE;
++		RIFFChunk ck;
++		if (!ReadExact(hFile, &ck, 8)) return FALSE;
++
++		__int64 payload = pos + 8;
++		__int64 nextPos = payload + (__int64)PADEVEN(ck.dwSize);
++		if (nextPos <= pos || nextPos > end) return FALSE;
++
++		if (FCC(ck.fourcc, "indx")) return TRUE;
++
++		if (FCC(ck.fourcc, "LIST") && ck.dwSize >= 4) {
++			char listType[4];
++			if (!ReadExact(hFile, listType, 4)) return FALSE;
++			if ((FCC(listType, "hdrl") || FCC(listType, "strl")) &&
++			    ContainsOpenDMLIndex(hFile, payload + 4,
++			                           pos + 8 + (__int64)ck.dwSize, depth - 1))
++				return TRUE;
++		}
++
++		pos = nextPos;
++	}
++	return FALSE;
++}
++
+ /* ---- Main implementation ---- */
+ 
+ AVICheckResult CheckAVIIntegrity(LPCSTR szPath)
+@@ -161,6 +191,10 @@ AVICheckResult CheckAVIIntegrity(LPCSTR szPath)
+ 					if (ReadExact(hFile, &avih, readSz))
+ 						bHasAvih = TRUE;
+ 				}
++				/* AVI 2.0 super-index is normally nested under hdrl/strl. */
++				if (ContainsOpenDMLIndex(hFile, pos + 12,
++				                           pos + 8 + (__int64)ck.dwSize, 3))
++					r.bHasIndex = TRUE;
+ 			}
+ 			else if (FCC(listType, "movi")) {
+ 				bHasMovi = TRUE;
 diff --git a/DShow.cpp b/DShow.cpp
-index ec5e2a3..6d2b26c 100644
+index ec5e2a3..06a1f59 100644
 --- a/DShow.cpp
 +++ b/DShow.cpp
 @@ -427,7 +427,8 @@ void CInputGraph::Run(CFrameHandler *handler)
@@ -52,7 +104,7 @@ index ec5e2a3..6d2b26c 100644
  }
  
  /*
-@@ -1410,23 +1418,28 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
+@@ -1410,23 +1418,43 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
   * to compute the final filename from the same parameters used at construction.
   * MoveFile() performs an atomic rename on the same volume.
   */
@@ -60,11 +112,29 @@ index ec5e2a3..6d2b26c 100644
 +CString CAVIWriter::FinalizeFile()
  {
 -	/* Signal EOS so the AVI mux writes the file index and closes cleanly. */
+-	m_outputFilter->m_output->DeliverEndOfStream();
 +	if (!m_finalfile.IsEmpty()) return m_finalfile;
- 	m_outputFilter->m_output->DeliverEndOfStream();
++
++	HRESULT eosHr = m_outputFilter->m_output->DeliverEndOfStream();
++	if (FAILED(eosHr)) {
++		if (m_MC) m_MC->Stop();
++		m_finalfile = m_tmpfile;
++		ThrowDShowException(CDShowException::error, "AVI finalization failed while sending end-of-stream");
++	}
++
  	if (m_ME) {
- 		long evCode;
- 		m_ME->WaitForCompletion(5000, &evCode);
+-		long evCode;
+-		m_ME->WaitForCompletion(5000, &evCode);
++		long evCode = 0;
++		/* ArchiveSafe: do not truncate AVI mux/index finalization at an arbitrary
++		 * timeout.  Once the producer is stopped and EOS has been delivered,
++		 * EC_COMPLETE is the authoritative indication that the mux has finished. */
++		HRESULT waitHr = m_ME->WaitForCompletion(INFINITE, &evCode);
++		if (FAILED(waitHr) || evCode != EC_COMPLETE) {
++			if (m_MC) m_MC->Stop();
++			m_finalfile = m_tmpfile;
++			ThrowDShowException(CDShowException::error, "AVI mux did not complete finalization");
++		}
  	}
  	if (m_MC) m_MC->Stop();
 -	/* Compute the final filename and atomically rename from temp.
@@ -89,7 +159,7 @@ index ec5e2a3..6d2b26c 100644
  }
  
  /////////////////////////////////////////////////////////////////////////////
-@@ -1474,7 +1487,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
+@@ -1474,7 +1502,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
  	CHECK_HR(hr, "Can't set preview window style");
  	Resize();
  	hr = m_MC->Run();
@@ -99,7 +169,7 @@ index ec5e2a3..6d2b26c 100644
  
  	/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
  	m_thread = AfxBeginThread(::MonitoringThread,this,THREAD_PRIORITY_BELOW_NORMAL,0,CREATE_SUSPENDED);
-@@ -1980,9 +1994,9 @@ static UINT CapturingThread(LPVOID pdv)
+@@ -1980,9 +2009,9 @@ static UINT CapturingThread(LPVOID pdv)
  CDV::CDV()
  : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
    m_thread(NULL),
@@ -111,7 +181,7 @@ index ec5e2a3..6d2b26c 100644
    m_enableSHA256(true)
  {
  	ResetErrorStats(&m_errorStats);
-@@ -2087,7 +2101,7 @@ void CDV::Destroy()
+@@ -2087,7 +2116,7 @@ void CDV::Destroy()
  		if (m_DVctrl) m_dvInput->CtrlStop();
  		delete(m_dvInput);	m_dvInput = NULL;
  	}
@@ -120,7 +190,7 @@ index ec5e2a3..6d2b26c 100644
  	if (m_dvOutput) {
  		if (m_DVctrl) m_dvOutput->CtrlStop();
  		delete(m_dvOutput); m_dvOutput = NULL;
-@@ -2138,6 +2152,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
+@@ -2138,6 +2167,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
  void CDV::BuildCapturing(LPCSTR vsrc)
  {
  	Destroy();
@@ -128,7 +198,7 @@ index ec5e2a3..6d2b26c 100644
  	HRESULT hr = S_OK;
  
  	m_dvInput = new CDVInput(vsrc);
-@@ -2176,6 +2191,49 @@ void CDV::StopCapturing()
+@@ -2176,6 +2206,49 @@ void CDV::StopCapturing()
  	}
  }
  
@@ -178,7 +248,7 @@ index ec5e2a3..6d2b26c 100644
  /*
   * CDV::StartCapturing
   *
-@@ -2264,6 +2322,16 @@ void CDV::StartRecording()
+@@ -2264,6 +2337,16 @@ void CDV::StartRecording()
  	}
  }
  
@@ -195,7 +265,7 @@ index ec5e2a3..6d2b26c 100644
  /*
   * CDV::CapturingThread
   *
-@@ -2338,8 +2406,13 @@ void CDV::CapturingThread()
+@@ -2338,8 +2421,13 @@ void CDV::CapturingThread()
  			gotFrame = m_queue->GetWithTimeout(&duration, &buffer, &len, m_autoStopTimeout);
  		else
  			gotFrame = m_queue->Get(&duration, &buffer, &len);
@@ -210,7 +280,7 @@ index ec5e2a3..6d2b26c 100644
  			capStats.eStopReason = 1; /* SIGNAL_LOST */
  			GetParent()->PostMessage(WM_DV_SIGNALLOST, 0, 0);
  			m_state = Finished;
-@@ -2367,26 +2440,20 @@ void CDV::CapturingThread()
+@@ -2367,26 +2455,20 @@ void CDV::CapturingThread()
  				/* Notify the UI of the new recording timestamp. */
  				GetParent()->PostMessage(WM_DV_TIMECHANGE, 0, dvTime);
  			}
@@ -240,7 +310,7 @@ index ec5e2a3..6d2b26c 100644
  				}
  				/* Open a new AVI file if none is currently open. */
  				if (!m_aviWriter) {
-@@ -2433,8 +2500,7 @@ void CDV::CapturingThread()
+@@ -2433,8 +2515,7 @@ void CDV::CapturingThread()
  			else {
  				/* Paused or Finished: close any open writer cleanly. */
  				if (m_aviWriter) {
@@ -250,7 +320,7 @@ index ec5e2a3..6d2b26c 100644
  				}
  				/* Reset the dropped-frame baseline for the next capture segment.
  				 * Do not reset if we just finished (preserve final stats). */
-@@ -2448,12 +2514,9 @@ void CDV::CapturingThread()
+@@ -2448,12 +2529,9 @@ void CDV::CapturingThread()
  		}
  	}
  	/* Close any writer that was open when the loop exited (e.g. on Destroy()). */
@@ -266,7 +336,7 @@ index ec5e2a3..6d2b26c 100644
  		capStats.sFilename = m_captureFilename;
  		capStats.dwFrameCount = m_counter;
  		capStats.dwDroppedFrames = m_dropped;
-@@ -2464,28 +2527,34 @@ void CDV::CapturingThread()
+@@ -2464,28 +2542,34 @@ void CDV::CapturingThread()
  			capStats.errorStats = m_errorStats;
  		}
  

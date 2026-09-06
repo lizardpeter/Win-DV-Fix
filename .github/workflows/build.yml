@@ -54,6 +54,8 @@ jobs:
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_finalizedFiles.GetSize() > 0)')) { throw 'pause-safe verification gate missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_autoStopTimeout(0)')) { throw 'archive-safe auto-stop default missing' }
           if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveAutoStopTimeout')) { throw 'archive auto-stop registry isolation missing' }
+          if (Select-String -Path windv/DShow.cpp -SimpleMatch 'CHECK_HR(hr, "Can''t start preview graph")') { throw 'preview graph still rejects DirectShow S_FALSE success' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start preview graph")')) { throw 'preview graph failure handling missing' }
 
       - name: Configure Win32 Release
         run: cmake -S windv -B build -G "Visual Studio 17 2022" -A Win32
@@ -76,7 +78,7 @@ jobs:
           git -C windv config user.name 'ArchiveSafe Builder'
           git -C windv config user.email 'actions@users.noreply.github.com'
           git -C windv add -A
-          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.1 patches'
+          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.2 patches'
 
           Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force src | Out-Null
@@ -85,19 +87,20 @@ jobs:
 
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe
+          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.2_x86.exe
           Copy-Item windv/LICENSE LICENSE
-          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.1.patch
-          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
+          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.2.patch
+          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.2_x86.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  WinDV_1.6.0_ArchiveSafe_v2.2_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
           @"
-          WinDV 1.6.0 ArchiveSafe v2.1
+          WinDV 1.6.0 ArchiveSafe v2.2
           Upstream: Wachhund/WinDV f633c456c211a0fb0e05aa43f2b150ec787faab7
           Build: Windows x86 Release, Visual Studio 2022
           Live DV error scanner: disabled
           Archive default: Type-1 DV AVI
           Frame decimation: disabled (EveryNth=1)
           End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
+          Preview startup: accepts DirectShow S_FALSE asynchronous-success state; only FAILED HRESULTs abort
           "@ | Out-File -Encoding utf8 dist/README.txt
 
       - name: Commit reproducible outputs when changed
@@ -108,14 +111,14 @@ jobs:
           git add src dist LICENSE
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m 'Refresh ArchiveSafe v2.1 source and executable [skip ci]'
+            git commit -m 'Refresh ArchiveSafe v2.2 source and executable [skip ci]'
             git push
           }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WinDV-1.6.0-ArchiveSafe-v2.1-x86
+          name: WinDV-1.6.0-ArchiveSafe-v2.2-x86
           path: |
             dist/*
             tools/*

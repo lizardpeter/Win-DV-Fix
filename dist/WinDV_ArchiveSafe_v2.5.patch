@@ -51,7 +51,7 @@ index f4051c4..b3e56c3 100644
  			else if (FCC(listType, "movi")) {
  				bHasMovi = TRUE;
 diff --git a/DShow.cpp b/DShow.cpp
-index ec5e2a3..06a1f59 100644
+index ec5e2a3..80ce6f5 100644
 --- a/DShow.cpp
 +++ b/DShow.cpp
 @@ -427,7 +427,8 @@ void CInputGraph::Run(CFrameHandler *handler)
@@ -169,7 +169,63 @@ index ec5e2a3..06a1f59 100644
  
  	/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
  	m_thread = AfxBeginThread(::MonitoringThread,this,THREAD_PRIORITY_BELOW_NORMAL,0,CREATE_SUSPENDED);
-@@ -1980,9 +2009,9 @@ static UINT CapturingThread(LPVOID pdv)
+@@ -1786,29 +1815,53 @@ bool CDVQueue::GetWithTimeout(REFERENCE_TIME *duration, BYTE **data, int *len, D
+  * On success, writes the 64-char lowercase hex hash to szHashOut and returns TRUE.
+  * On failure (file not found, read error), sets szHashOut[0] = '\0' and returns FALSE.
+  */
+-BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65])
++BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65], volatile LONG *pProgressPercent)
+ {
+ 	szHashOut[0] = '\0';
++	if (pProgressPercent) InterlockedExchange(pProgressPercent, 0);
+ 
+ 	HANDLE hFile = CreateFile(szFilePath, GENERIC_READ, FILE_SHARE_READ,
+ 		NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+ 	if (hFile == INVALID_HANDLE_VALUE)
+ 		return FALSE;
+ 
++	LARGE_INTEGER fileSize;
++	fileSize.QuadPart = 0;
++	GetFileSizeEx(hFile, &fileSize);
++	ULONGLONG bytesReadTotal = 0;
++	LONG lastPercent = -1;
++
+ 	SHA256_CTX ctx;
+ 	sha256_init(&ctx);
+ 
+ 	BYTE buf[65536];
+ 	DWORD dwRead;
+-	while (ReadFile(hFile, buf, sizeof buf, &dwRead, NULL) && dwRead > 0) {
++	BOOL readOK = TRUE;
++	for (;;) {
++		if (!ReadFile(hFile, buf, sizeof buf, &dwRead, NULL)) { readOK = FALSE; break; }
++		if (dwRead == 0) break;
+ 		sha256_update(&ctx, buf, dwRead);
++		bytesReadTotal += dwRead;
++		if (pProgressPercent && fileSize.QuadPart > 0) {
++			LONG pct = (LONG)((bytesReadTotal * 100ULL) / (ULONGLONG)fileSize.QuadPart);
++			if (pct > 100) pct = 100;
++			if (pct != lastPercent) {
++				InterlockedExchange(pProgressPercent, pct);
++				lastPercent = pct;
++			}
++		}
+ 	}
+ 
+ 	CloseHandle(hFile);
++	if (!readOK) {
++		if (pProgressPercent) InterlockedExchange(pProgressPercent, 0);
++		return FALSE;
++	}
+ 
+ 	unsigned char hash[32];
+ 	sha256_final(&ctx, hash);
+ 	sha256_hex(hash, szHashOut);
++	if (pProgressPercent) InterlockedExchange(pProgressPercent, 100);
+ 
+ 	return TRUE;
+ }
+@@ -1980,10 +2033,11 @@ static UINT CapturingThread(LPVOID pdv)
  CDV::CDV()
  : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
    m_thread(NULL),
@@ -177,11 +233,14 @@ index ec5e2a3..06a1f59 100644
 +  m_type2AVI(false), m_discontinuityTreshold(0), m_maxAVIFrames(UINT_MAX), m_everyNth(1), m_recordPreview(TRUE),
    m_dropped(0), m_counter(-1), m_time(-1), m_captureTime(0), m_ndigits(0), m_DVctrl(FALSE),
 -  m_autoStopTimeout(5000),
+-  m_enableSHA256(true)
 +  m_autoStopTimeout(0),
-   m_enableSHA256(true)
++  m_enableSHA256(true),
++  m_finalizePhase(FinalizeNone), m_finalizePercent(0)
  {
  	ResetErrorStats(&m_errorStats);
-@@ -2087,7 +2116,7 @@ void CDV::Destroy()
+ }
+@@ -2087,7 +2141,7 @@ void CDV::Destroy()
  		if (m_DVctrl) m_dvInput->CtrlStop();
  		delete(m_dvInput);	m_dvInput = NULL;
  	}
@@ -190,15 +249,17 @@ index ec5e2a3..06a1f59 100644
  	if (m_dvOutput) {
  		if (m_DVctrl) m_dvOutput->CtrlStop();
  		delete(m_dvOutput); m_dvOutput = NULL;
-@@ -2138,6 +2167,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
+@@ -2138,6 +2192,9 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
  void CDV::BuildCapturing(LPCSTR vsrc)
  {
  	Destroy();
 +	m_finalizedFiles.RemoveAll();
++	InterlockedExchange(&m_finalizePhase, FinalizeNone);
++	InterlockedExchange(&m_finalizePercent, 0);
  	HRESULT hr = S_OK;
  
  	m_dvInput = new CDVInput(vsrc);
-@@ -2176,6 +2206,49 @@ void CDV::StopCapturing()
+@@ -2176,6 +2233,74 @@ void CDV::StopCapturing()
  	}
  }
  
@@ -225,6 +286,8 @@ index ec5e2a3..06a1f59 100644
 +
 +	BOOL writeQueuedFrames = (m_state == Capturing);
 +	m_captureTime = 0;
++	InterlockedExchange(&m_finalizePhase, FinalizeDraining);
++	InterlockedExchange(&m_finalizePercent, 0);
 +	m_state = writeQueuedFrames ? CaptureFinalizing : Finished;
 +
 +	/* Stop tape motion first when WinDV owns transport control, then stop the
@@ -237,24 +300,49 @@ index ec5e2a3..06a1f59 100644
 +	if (m_queue) m_queue->Put(-1, NULL, 0);
 +
 +	if (m_thread) {
-+		WaitForSingleObject(m_thread->m_hThread, INFINITE);
++		LONG lastPhase = -1, lastPercent = -1;
++		for (;;) {
++			DWORD wait = WaitForSingleObject(m_thread->m_hThread, 100);
++			LONG phase = m_finalizePhase;
++			LONG percent = m_finalizePercent;
++			if (phase != lastPhase || percent != lastPercent) {
++				CWnd *parent = GetParent();
++				if (parent && parent->GetSafeHwnd())
++					parent->SendMessage(WM_DV_FINALIZE_PROGRESS, (WPARAM)phase, (LPARAM)percent);
++				lastPhase = phase;
++				lastPercent = percent;
++			}
++			if (wait == WAIT_OBJECT_0) break;
++			if (wait == WAIT_FAILED) {
++				/* Preserve capture safety if the timed wait itself fails. */
++				WaitForSingleObject(m_thread->m_hThread, INFINITE);
++				break;
++			}
++		}
 +		delete m_thread;
 +		m_thread = NULL;
 +	}
 +
++	InterlockedExchange(&m_finalizePhase, FinalizeDone);
++	InterlockedExchange(&m_finalizePercent, 100);
++	CWnd *parent = GetParent();
++	if (parent && parent->GetSafeHwnd())
++		parent->SendMessage(WM_DV_FINALIZE_PROGRESS, FinalizeDone, 100);
 +	m_state = Finished;
 +}
 +
  /*
   * CDV::StartCapturing
   *
-@@ -2264,6 +2337,16 @@ void CDV::StartRecording()
+@@ -2264,6 +2389,18 @@ void CDV::StartRecording()
  	}
  }
  
 +void CDV::CloseAVIWriter()
 +{
 +	if (!m_aviWriter) return;
++	if (m_finalizePhase != FinalizeNone)
++		InterlockedExchange(&m_finalizePhase, FinalizeMux);
 +	CString p = m_aviWriter->FinalizeFile();
 +	if (!p.IsEmpty()) m_finalizedFiles.Add(p);
 +	delete m_aviWriter;
@@ -265,7 +353,7 @@ index ec5e2a3..06a1f59 100644
  /*
   * CDV::CapturingThread
   *
-@@ -2338,8 +2421,13 @@ void CDV::CapturingThread()
+@@ -2338,8 +2475,13 @@ void CDV::CapturingThread()
  			gotFrame = m_queue->GetWithTimeout(&duration, &buffer, &len, m_autoStopTimeout);
  		else
  			gotFrame = m_queue->Get(&duration, &buffer, &len);
@@ -280,7 +368,7 @@ index ec5e2a3..06a1f59 100644
  			capStats.eStopReason = 1; /* SIGNAL_LOST */
  			GetParent()->PostMessage(WM_DV_SIGNALLOST, 0, 0);
  			m_state = Finished;
-@@ -2367,26 +2455,20 @@ void CDV::CapturingThread()
+@@ -2367,26 +2509,20 @@ void CDV::CapturingThread()
  				/* Notify the UI of the new recording timestamp. */
  				GetParent()->PostMessage(WM_DV_TIMECHANGE, 0, dvTime);
  			}
@@ -310,7 +398,7 @@ index ec5e2a3..06a1f59 100644
  				}
  				/* Open a new AVI file if none is currently open. */
  				if (!m_aviWriter) {
-@@ -2433,8 +2515,7 @@ void CDV::CapturingThread()
+@@ -2433,8 +2569,7 @@ void CDV::CapturingThread()
  			else {
  				/* Paused or Finished: close any open writer cleanly. */
  				if (m_aviWriter) {
@@ -320,7 +408,7 @@ index ec5e2a3..06a1f59 100644
  				}
  				/* Reset the dropped-frame baseline for the next capture segment.
  				 * Do not reset if we just finished (preserve final stats). */
-@@ -2448,12 +2529,9 @@ void CDV::CapturingThread()
+@@ -2448,12 +2583,9 @@ void CDV::CapturingThread()
  		}
  	}
  	/* Close any writer that was open when the loop exited (e.g. on Destroy()). */
@@ -336,7 +424,7 @@ index ec5e2a3..06a1f59 100644
  		capStats.sFilename = m_captureFilename;
  		capStats.dwFrameCount = m_counter;
  		capStats.dwDroppedFrames = m_dropped;
-@@ -2464,28 +2542,34 @@ void CDV::CapturingThread()
+@@ -2464,28 +2596,40 @@ void CDV::CapturingThread()
  			capStats.errorStats = m_errorStats;
  		}
  
@@ -361,6 +449,10 @@ index ec5e2a3..06a1f59 100644
 -				sidecarPath.Format("%s.sha256", (LPCSTR)m_captureFilename);
 -				WriteSHA256Sidecar(sidecarPath, capStats.szSHA256, bareName, FALSE);
 +		/* Verify every exact path actually finalized by CAVIWriter. */
++		if (m_finalizePhase != FinalizeNone) {
++			InterlockedExchange(&m_finalizePhase, FinalizeVerify);
++			InterlockedExchange(&m_finalizePercent, 0);
++		}
 +		capStats.bCheckPassed = (m_finalizedFiles.GetSize() > 0);
 +		capStats.bCheckIndex = (m_finalizedFiles.GetSize() > 0);
 +		capStats.dwCheckDefect = 0;
@@ -376,8 +468,10 @@ index ec5e2a3..06a1f59 100644
 +			if (!r.bHasIndex) capStats.bCheckIndex = FALSE;
 +			capStats.dwCheckDefect += r.dwDefectFrames;
 +			if (m_enableSHA256) {
++				InterlockedExchange(&m_finalizePhase, FinalizeHash);
++				InterlockedExchange(&m_finalizePercent, 0);
 +				char hash[65];
-+				if (ComputeFileSHA256(f, hash)) {
++				if (ComputeFileSHA256(f, hash, &m_finalizePercent)) {
 +					CString bare = f; int sep = bare.ReverseFind('\\');
 +					if (sep >= 0) bare = bare.Mid(sep + 1);
 +					CString side; side.Format("%s.sha256", (LPCSTR)f);
@@ -391,11 +485,32 @@ index ec5e2a3..06a1f59 100644
  
  		/* Build log path next to the capture file. */
  		CString logPath = m_captureFilename;
+@@ -2495,6 +2639,9 @@ void CDV::CapturingThread()
+ 		logPath += "WinDV_CaptureLog.csv";
+ 		WriteCaptureLog(logPath, capStats);
+ 
++		InterlockedExchange(&m_finalizePhase, FinalizeDone);
++		InterlockedExchange(&m_finalizePercent, 100);
++
+ 		/* Notify the UI about the check result. */
+ 		GetParent()->PostMessage(WM_DV_CHECK_COMPLETE,
+ 			(WPARAM)capStats.bCheckPassed, 0);
 diff --git a/DShow.h b/DShow.h
-index 6389af6..c4e83e4 100644
+index 6389af6..4ae9b8a 100644
 --- a/DShow.h
 +++ b/DShow.h
-@@ -495,7 +495,7 @@ public:
+@@ -51,6 +51,10 @@
+  * The full result is available via CDV::GetLastCheckResult(). */
+ #define WM_DV_CHECK_COMPLETE	(WM_USER+204)
+ 
++/* Sent synchronously by FinalizeCapturing while it polls the capture worker.
++ * wParam = CDV::Finalize* phase, lParam = percentage for hash phase. */
++#define WM_DV_FINALIZE_PROGRESS	(WM_USER+205)
++
+ /*
+  * CDShowException
+  *
+@@ -495,7 +499,7 @@ public:
  	/* m_tmpfile  - Temporary path used while capture is in progress (~ prefix). */
  	/* m_filename - Base path for the final renamed file. */
  	/* m_dtformat - strftime format string for the date/time suffix. */
@@ -404,7 +519,7 @@ index 6389af6..c4e83e4 100644
  	/* m_ndigits  - Minimum digit width for the auto-increment numeric suffix. */
  	int m_ndigits;
  	/* m_dvtime   - Recording timestamp (from DV SSYB), used in the final filename. */
-@@ -508,7 +508,8 @@ public:
+@@ -508,7 +512,8 @@ public:
  	 * type2AVI  - TRUE to write Type-2 AVI (separate audio/video streams).
  	 * type      - DV media type negotiated from the source graph. */
  	CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim, bool type2AVI, CMediaType *type);
@@ -414,16 +529,21 @@ index 6389af6..c4e83e4 100644
  	~CAVIWriter();
  };
  
-@@ -716,7 +717,7 @@ void WriteCaptureLog(LPCSTR szLogPath, const CaptureStats& stats);
+@@ -716,7 +721,12 @@ void WriteCaptureLog(LPCSTR szLogPath, const CaptureStats& stats);
  
  class CDV:public CStatic, CFrameHandler  {
  public:
 -	enum {Idle, RecordPaused, Recording, CapturePaused, Capturing, Finished} m_state;
 +	enum {Idle, RecordPaused, Recording, CapturePaused, Capturing, CaptureFinalizing, Finished} m_state;
++	/* End Capture progress is written only by the capture worker/finalizer and
++	 * read by the UI thread. LONG stores are atomic on supported Win32 targets. */
++	enum {FinalizeNone, FinalizeDraining, FinalizeMux, FinalizeVerify, FinalizeHash, FinalizeDone};
++	volatile LONG m_finalizePhase;
++	volatile LONG m_finalizePercent;
  	/* TRUE = write Type-2 AVI (separate audio/video); FALSE = Type-1 (interleaved). */
  	bool m_type2AVI;
  	/* DV timestamp delta (seconds) that triggers a new split file; 0 = disabled. */
-@@ -731,7 +732,7 @@ public:
+@@ -731,7 +741,7 @@ public:
  	bool m_DVctrl;
  	/* Timeout in milliseconds for end-of-signal auto-detection during capture.
  	 * If no frames arrive within this period, capture stops automatically.
@@ -432,7 +552,16 @@ index 6389af6..c4e83e4 100644
  	DWORD m_autoStopTimeout;
  	/* WDV-11: TRUE = compute SHA-256 checksum after capture and write sidecar. */
  	bool m_enableSHA256;
-@@ -766,8 +767,11 @@ public:
+@@ -753,6 +763,8 @@ public:
+ 	CString GetCaptureFilename();
+ 	/* WDV-10: Returns a snapshot of the current DV error statistics (thread-safe). */
+ 	ErrorStats GetErrorStats();
++	LONG GetFinalizePhase() const { return m_finalizePhase; }
++	LONG GetFinalizePercent() const { return m_finalizePercent; }
+ 
+ 	/* Tears down the entire pipeline and resets state to Idle. */
+ 	void Destroy();
+@@ -766,8 +778,11 @@ public:
  	 * ndigits     - Minimum digit count for auto-increment numeric suffix.
  	 * captureTime - Optional recording duration limit (100-ns units; 0 = unlimited). */
  	void StartCapturing(LPCSTR filename, LPCSTR dtformat, int ndigits, REFERENCE_TIME captureTime = 0);
@@ -445,7 +574,7 @@ index 6389af6..c4e83e4 100644
  	/* Builds the record pipeline from a file list to the named FireWire output device.
  	 * filenames - Pipe-separated list of AVI paths / glob patterns.
  	 * vdst      - Friendly device name (from GetVideoDstList). */
-@@ -806,6 +810,7 @@ protected:
+@@ -806,6 +821,7 @@ protected:
  	CWinThread *m_thread;
  	/* Base filename passed to StartCapturing(); used when opening new split files. */
  	CString m_captureFilename, m_dtformat;
@@ -453,7 +582,7 @@ index 6389af6..c4e83e4 100644
  	int m_ndigits;
  	/* Cumulative dropped-frame count (updated each frame in CapturingThread). */
  	long m_dropped;
-@@ -816,6 +821,7 @@ protected:
+@@ -816,6 +832,7 @@ protected:
  	/* If non-zero, capture stops automatically after this many 100-ns units. */
  	REFERENCE_TIME m_captureTime;
  
@@ -461,8 +590,17 @@ index 6389af6..c4e83e4 100644
  	/* CFrameHandler implementation: enqueues every incoming frame into m_queue. */
  	void HandleFrame(REFERENCE_TIME duration, BYTE *data, int len);
  
+@@ -837,7 +854,7 @@ CString FormatTime(LPCSTR format, time_t tim);
+ /* WDV-11: Compute SHA-256 of a file and write a sha256sum-compatible sidecar.
+  * Returns TRUE on success and fills szHashOut (65 bytes) with the hex string.
+  * Returns FALSE on file-read error (szHashOut is set to empty string). */
+-BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65]);
++BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65], volatile LONG *pProgressPercent = NULL);
+ 
+ /* WDV-11: Write a sha256sum-compatible sidecar file (.sha256).
+  * szSidecarPath: full path to the .sha256 file.
 diff --git a/DVToolsDlg.cpp b/DVToolsDlg.cpp
-index 0c1b659..5d7f288 100644
+index 0c1b659..3622a63 100644
 --- a/DVToolsDlg.cpp
 +++ b/DVToolsDlg.cpp
 @@ -217,8 +217,10 @@ static struct CtrlProperties {int id; int dx, dw, dy, dh; int tabMask;} ctrlProp
@@ -478,7 +616,15 @@ index 0c1b659..5d7f288 100644
  	// Status / counter row: always visible.
  	{IDC_COUNTER,	 XR, XR,100,100,	TAB_ALL},
  	{IDC_STATUS,	 XL, XR,100,100,	TAB_ALL},
-@@ -325,6 +327,7 @@ BEGIN_MESSAGE_MAP(CDVToolsDlg, CDialog)
+@@ -282,6 +284,7 @@ CDVToolsDlg::CDVToolsDlg(CWnd* pParent /*=NULL*/)
+ 	m_originalRect.right = 0;      // sentinel: 0 means resize data not yet initialised
+ 	m_minWidth = m_minHeight = 1;
+ 	m_exitOnFinish = 0;
++	m_captureFinalizedStatusSticky = false;
+ }
+ 
+ CDVToolsDlg::~CDVToolsDlg()
+@@ -325,6 +328,7 @@ BEGIN_MESSAGE_MAP(CDVToolsDlg, CDialog)
  	ON_BN_CLICKED(IDC_FSRC_SEL, OnFsrcSel)
  	ON_BN_CLICKED(IDC_CONFIG, OnConfig)
  	ON_BN_CLICKED(IDC_CAPTURE, OnCapture)
@@ -486,7 +632,15 @@ index 0c1b659..5d7f288 100644
  	ON_BN_CLICKED(IDC_RECORD, OnRecord)
  	ON_WM_TIMER()
  	ON_BN_CLICKED(IDC_PICTURE, OnPicture)
-@@ -490,11 +493,18 @@ BOOL CDVToolsDlg::OnInitDialog()
+@@ -337,6 +341,7 @@ BEGIN_MESSAGE_MAP(CDVToolsDlg, CDialog)
+ 	ON_MESSAGE(WM_DV_LOWDISKSPACE, OnDVLowDiskSpace)
+ 	ON_MESSAGE(WM_DV_SIGNALLOST, OnDVSignalLost)
+ 	ON_MESSAGE(WM_DV_CHECK_COMPLETE, OnDVCheckComplete)
++	ON_MESSAGE(WM_DV_FINALIZE_PROGRESS, OnDVFinalizeProgress)
+ END_MESSAGE_MAP()
+ 
+ /////////////////////////////////////////////////////////////////////////////
+@@ -490,11 +495,18 @@ BOOL CDVToolsDlg::OnInitDialog()
  	m_video.m_recordPreview = AfxGetApp()->GetProfileInt("Record", "Preview", m_video.m_recordPreview) > 0;
  
  	// Capture options.
@@ -510,7 +664,7 @@ index 0c1b659..5d7f288 100644
  	m_video.m_enableSHA256 = AfxGetApp()->GetProfileInt("Capture", "SHA256", m_video.m_enableSHA256) > 0;
  
  	// Filename date-time format and sequence counter settings.
-@@ -1006,10 +1016,15 @@ HBRUSH CDVToolsDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
+@@ -1006,10 +1018,15 @@ HBRUSH CDVToolsDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
  }
  
  /* OnCancel -- suppress the default Escape/Cancel behaviour that would close the
@@ -527,7 +681,7 @@ index 0c1b659..5d7f288 100644
  	InitVideo();
  }
  
-@@ -1060,11 +1075,13 @@ void CDVToolsDlg::OnClose()
+@@ -1060,11 +1077,13 @@ void CDVToolsDlg::OnClose()
  	m_FDST.GetWindowText(tmp);
  	AfxGetApp()->WriteProfileString("Capture", "File", tmp);
  
@@ -546,7 +700,15 @@ index 0c1b659..5d7f288 100644
  	AfxGetApp()->WriteProfileInt("Capture", "SHA256", m_video.m_enableSHA256);
  
  	AfxGetApp()->WriteProfileString("Capture", "DateTimeFormat", m_DTFormat);
-@@ -1210,7 +1227,7 @@ void CDVToolsDlg::OnFdstSel()
+@@ -1156,6 +1175,7 @@ void CDVToolsDlg::OnVdstSel()
+ void CDVToolsDlg::InitVideo()
+ {
+ 	m_exitOnFinish = 0;
++	m_captureFinalizedStatusSticky = false;
+ 
+ 	KillTimer(1);
+ 	int sel = m_toolTab.GetCurSel();
+@@ -1210,7 +1230,7 @@ void CDVToolsDlg::OnFdstSel()
   *
   * State transitions:
   *   CapturePaused  -> StartCapturing()  (pipeline is built; begin writing frames)
@@ -555,7 +717,15 @@ index 0c1b659..5d7f288 100644
   *   any other      -> InitVideo()       (error recovery / reset)
   *
   * Exceptions from the DirectShow layer are caught, the pipeline is reset to
-@@ -1244,6 +1261,52 @@ void CDVToolsDlg::OnCapture()
+@@ -1218,6 +1238,7 @@ void CDVToolsDlg::OnFdstSel()
+  */
+ void CDVToolsDlg::OnCapture()
+ {
++	m_captureFinalizedStatusSticky = false;
+ 	if (m_video.GetState() == CDV::CapturePaused) {
+ 		TRY {
+ 			CString filename;
+@@ -1244,6 +1265,58 @@ void CDVToolsDlg::OnCapture()
  		InitVideo();
  }
  
@@ -578,7 +748,8 @@ index 0c1b659..5d7f288 100644
 +	if (captureButton) captureButton->EnableWindow(FALSE);
 +	if (endButton) endButton->EnableWindow(FALSE);
 +
-+	m_status.SetWindowText("Ending capture: draining frames, finalizing AVI, verifying index...");
++	m_captureFinalizedStatusSticky = false;
++	m_status.SetWindowText("Ending capture - draining queued DV frames...");
 +	UpdateWindow();
 +
 +	TRY {
@@ -587,8 +758,13 @@ index 0c1b659..5d7f288 100644
 +		BOOL indexOK = r.bValid && r.bHasIndex;
 +
 +		InitVideo();
-+		if (indexOK)
-+			m_status.SetWindowText("Capture ended safely. AVI index verified; ready for next capture.");
++		m_captureFinalizedStatusSticky = true;
++		if (indexOK) {
++			if (m_video.m_enableSHA256)
++				m_status.SetWindowText("Capture safely finalized. AVI/OpenDML index verified; SHA-256 complete; ready for next capture.");
++			else
++				m_status.SetWindowText("Capture safely finalized. AVI/OpenDML index verified; ready for next capture.");
++		}
 +		else {
 +			CString msg;
 +			msg.Format("Capture ended, but AVI verification reported: %s", (LPCSTR)r.sError);
@@ -608,7 +784,7 @@ index 0c1b659..5d7f288 100644
  /* OnRecord -- toggle button handler for the Record tab.
   *
   * State transitions:
-@@ -1341,7 +1404,7 @@ void CDVToolsDlg::OnConfig()
+@@ -1341,7 +1414,7 @@ void CDVToolsDlg::OnConfig()
  		m_video.m_type2AVI  = captureCfg.m_type12 == 1;
  		m_video.m_discontinuityTreshold = captureCfg.m_discontinuityTreshold;
  		m_video.m_maxAVIFrames = captureCfg.m_maxAVIFrames;
@@ -617,7 +793,7 @@ index 0c1b659..5d7f288 100644
  		m_DTFormat = captureCfg.m_dtformat;
  		m_DTFormatHistory = captureCfg.m_dtformathistory;
  		m_nSuffixDigits = captureCfg.m_ndigits;
-@@ -1397,13 +1460,13 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
+@@ -1397,13 +1470,13 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
  	// Build primary status string.
  	switch (m_video.GetState()) {
  	case CDV::Capturing: {
@@ -633,7 +809,7 @@ index 0c1b659..5d7f288 100644
  		break;
  	case CDV::Recording: txt += "Recording...  Press <Record> for pause.";
  		break;
-@@ -1433,17 +1496,9 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
+@@ -1433,17 +1506,9 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
  	// Build queue-load string for states where the queue is actively draining.
  	// WDV-10: Append DV error count and percentage during capture.
  	switch (m_video.GetState()) {
@@ -653,11 +829,83 @@ index 0c1b659..5d7f288 100644
  	case CDV::Recording:
  	case CDV::RecordPaused:
  		txt3.Format(" Q:%i", m_video.GetQueueLoad());
+@@ -1453,7 +1518,8 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
+ 	// unnecessary WM_PAINT messages on every tick.
+ 	CString tmp;
+ 	m_status.GetWindowText(tmp);
+-	if (tmp != txt) m_status.SetWindowText(txt);
++	if (!(m_captureFinalizedStatusSticky && m_video.GetState() == CDV::CapturePaused) && tmp != txt)
++		m_status.SetWindowText(txt);
+ 	m_counter.GetWindowText(tmp);
+ 	if (tmp != txt2) m_counter.SetWindowText(txt2);
+ 	m_status3.GetWindowText(tmp);
+@@ -1513,8 +1579,42 @@ LRESULT CDVToolsDlg::OnDVSignalLost(WPARAM, LPARAM)
+ 	return 0;
+ }
+ 
++
++/* Live, truthful End Capture status. lParam is meaningful only for SHA phase. */
++LRESULT CDVToolsDlg::OnDVFinalizeProgress(WPARAM wParam, LPARAM lParam)
++{
++	CString msg;
++	switch ((LONG)wParam) {
++	case CDV::FinalizeDraining:
++		msg = "Ending capture - draining queued DV frames...";
++		break;
++	case CDV::FinalizeMux:
++		msg = "Finalizing AVI - waiting for AVI mux/index completion...";
++		break;
++	case CDV::FinalizeVerify:
++		msg = "AVI finalized - verifying RIFF/OpenDML index...";
++		break;
++	case CDV::FinalizeHash: {
++		LONG pct = (LONG)lParam;
++		if (pct < 0) pct = 0;
++		if (pct > 100) pct = 100;
++		msg.Format("AVI verification complete - calculating SHA-256... %ld%%", pct);
++		break;
++	}
++	case CDV::FinalizeDone:
++		msg = "Post-capture checks complete - preparing next capture...";
++		break;
++	default:
++		return 0;
++	}
++	m_status.SetWindowText(msg);
++	m_status.UpdateWindow();
++	return 0;
++}
++
+ LRESULT CDVToolsDlg::OnDVCheckComplete(WPARAM wParam, LPARAM)
+ {
++	if (m_captureFinalizedStatusSticky) return 0;
+ 	const AVICheckResult& r = m_video.GetLastCheckResult();
+ 	ErrorStats es = m_video.GetErrorStats();
+ 	CString msg;
 diff --git a/DVToolsDlg.h b/DVToolsDlg.h
-index 64955ca..4517a80 100644
+index 64955ca..faa24a1 100644
 --- a/DVToolsDlg.h
 +++ b/DVToolsDlg.h
-@@ -181,6 +181,7 @@ protected:
+@@ -138,6 +138,9 @@ protected:
+ 	 * once the pipeline reaches CDV::Finished.  Set by the -exit command-line
+ 	 * flag to support unattended capture/record automation. */
+ 	bool m_exitOnFinish;
++	/* Keeps the completed End Capture result visible after InitVideo re-arms
++	 * the capture graph instead of letting the 200 ms timer replace it with Paused. */
++	bool m_captureFinalizedStatusSticky;
+ 
+ 	/* OnCmdTabChange -- handles WM_COMMAND messages in the IDC_TAB_CHANGE
+ 	 * range generated by the invisible tabChangeBtns.  Switches the active
+@@ -160,6 +163,8 @@ protected:
+ 	/* OnDVCheckComplete -- handles WM_DV_CHECK_COMPLETE posted after a
+ 	 * post-capture AVI integrity check. wParam = bValid (1=OK, 0=errors). */
+ 	afx_msg LRESULT OnDVCheckComplete(WPARAM, LPARAM);
++	/* Live End Capture phase/progress, sent synchronously from FinalizeCapturing. */
++	afx_msg LRESULT OnDVFinalizeProgress(WPARAM, LPARAM);
+ 
+ 	// Generated message map functions
+ 	//{{AFX_MSG(CDVToolsDlg)
+@@ -181,6 +186,7 @@ protected:
  	afx_msg void OnFsrcSel();
  	afx_msg void OnConfig();
  	afx_msg void OnCapture();

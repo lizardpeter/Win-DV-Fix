@@ -1815,29 +1815,53 @@ bool CDVQueue::GetWithTimeout(REFERENCE_TIME *duration, BYTE **data, int *len, D
  * On success, writes the 64-char lowercase hex hash to szHashOut and returns TRUE.
  * On failure (file not found, read error), sets szHashOut[0] = '\0' and returns FALSE.
  */
-BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65])
+BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65], volatile LONG *pProgressPercent)
 {
 	szHashOut[0] = '\0';
+	if (pProgressPercent) InterlockedExchange(pProgressPercent, 0);
 
 	HANDLE hFile = CreateFile(szFilePath, GENERIC_READ, FILE_SHARE_READ,
 		NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 	if (hFile == INVALID_HANDLE_VALUE)
 		return FALSE;
 
+	LARGE_INTEGER fileSize;
+	fileSize.QuadPart = 0;
+	GetFileSizeEx(hFile, &fileSize);
+	ULONGLONG bytesReadTotal = 0;
+	LONG lastPercent = -1;
+
 	SHA256_CTX ctx;
 	sha256_init(&ctx);
 
 	BYTE buf[65536];
 	DWORD dwRead;
-	while (ReadFile(hFile, buf, sizeof buf, &dwRead, NULL) && dwRead > 0) {
+	BOOL readOK = TRUE;
+	for (;;) {
+		if (!ReadFile(hFile, buf, sizeof buf, &dwRead, NULL)) { readOK = FALSE; break; }
+		if (dwRead == 0) break;
 		sha256_update(&ctx, buf, dwRead);
+		bytesReadTotal += dwRead;
+		if (pProgressPercent && fileSize.QuadPart > 0) {
+			LONG pct = (LONG)((bytesReadTotal * 100ULL) / (ULONGLONG)fileSize.QuadPart);
+			if (pct > 100) pct = 100;
+			if (pct != lastPercent) {
+				InterlockedExchange(pProgressPercent, pct);
+				lastPercent = pct;
+			}
+		}
 	}
 
 	CloseHandle(hFile);
+	if (!readOK) {
+		if (pProgressPercent) InterlockedExchange(pProgressPercent, 0);
+		return FALSE;
+	}
 
 	unsigned char hash[32];
 	sha256_final(&ctx, hash);
 	sha256_hex(hash, szHashOut);
+	if (pProgressPercent) InterlockedExchange(pProgressPercent, 100);
 
 	return TRUE;
 }
@@ -2012,7 +2036,8 @@ CDV::CDV()
   m_type2AVI(false), m_discontinuityTreshold(0), m_maxAVIFrames(UINT_MAX), m_everyNth(1), m_recordPreview(TRUE),
   m_dropped(0), m_counter(-1), m_time(-1), m_captureTime(0), m_ndigits(0), m_DVctrl(FALSE),
   m_autoStopTimeout(0),
-  m_enableSHA256(true)
+  m_enableSHA256(true),
+  m_finalizePhase(FinalizeNone), m_finalizePercent(0)
 {
 	ResetErrorStats(&m_errorStats);
 }
@@ -2168,6 +2193,8 @@ void CDV::BuildCapturing(LPCSTR vsrc)
 {
 	Destroy();
 	m_finalizedFiles.RemoveAll();
+	InterlockedExchange(&m_finalizePhase, FinalizeNone);
+	InterlockedExchange(&m_finalizePercent, 0);
 	HRESULT hr = S_OK;
 
 	m_dvInput = new CDVInput(vsrc);
@@ -2229,6 +2256,8 @@ void CDV::FinalizeCapturing()
 
 	BOOL writeQueuedFrames = (m_state == Capturing);
 	m_captureTime = 0;
+	InterlockedExchange(&m_finalizePhase, FinalizeDraining);
+	InterlockedExchange(&m_finalizePercent, 0);
 	m_state = writeQueuedFrames ? CaptureFinalizing : Finished;
 
 	/* Stop tape motion first when WinDV owns transport control, then stop the
@@ -2241,11 +2270,34 @@ void CDV::FinalizeCapturing()
 	if (m_queue) m_queue->Put(-1, NULL, 0);
 
 	if (m_thread) {
-		WaitForSingleObject(m_thread->m_hThread, INFINITE);
+		LONG lastPhase = -1, lastPercent = -1;
+		for (;;) {
+			DWORD wait = WaitForSingleObject(m_thread->m_hThread, 100);
+			LONG phase = m_finalizePhase;
+			LONG percent = m_finalizePercent;
+			if (phase != lastPhase || percent != lastPercent) {
+				CWnd *parent = GetParent();
+				if (parent && parent->GetSafeHwnd())
+					parent->SendMessage(WM_DV_FINALIZE_PROGRESS, (WPARAM)phase, (LPARAM)percent);
+				lastPhase = phase;
+				lastPercent = percent;
+			}
+			if (wait == WAIT_OBJECT_0) break;
+			if (wait == WAIT_FAILED) {
+				/* Preserve capture safety if the timed wait itself fails. */
+				WaitForSingleObject(m_thread->m_hThread, INFINITE);
+				break;
+			}
+		}
 		delete m_thread;
 		m_thread = NULL;
 	}
 
+	InterlockedExchange(&m_finalizePhase, FinalizeDone);
+	InterlockedExchange(&m_finalizePercent, 100);
+	CWnd *parent = GetParent();
+	if (parent && parent->GetSafeHwnd())
+		parent->SendMessage(WM_DV_FINALIZE_PROGRESS, FinalizeDone, 100);
 	m_state = Finished;
 }
 
@@ -2340,6 +2392,8 @@ void CDV::StartRecording()
 void CDV::CloseAVIWriter()
 {
 	if (!m_aviWriter) return;
+	if (m_finalizePhase != FinalizeNone)
+		InterlockedExchange(&m_finalizePhase, FinalizeMux);
 	CString p = m_aviWriter->FinalizeFile();
 	if (!p.IsEmpty()) m_finalizedFiles.Add(p);
 	delete m_aviWriter;
@@ -2543,6 +2597,10 @@ void CDV::CapturingThread()
 		}
 
 		/* Verify every exact path actually finalized by CAVIWriter. */
+		if (m_finalizePhase != FinalizeNone) {
+			InterlockedExchange(&m_finalizePhase, FinalizeVerify);
+			InterlockedExchange(&m_finalizePercent, 0);
+		}
 		capStats.bCheckPassed = (m_finalizedFiles.GetSize() > 0);
 		capStats.bCheckIndex = (m_finalizedFiles.GetSize() > 0);
 		capStats.dwCheckDefect = 0;
@@ -2558,8 +2616,10 @@ void CDV::CapturingThread()
 			if (!r.bHasIndex) capStats.bCheckIndex = FALSE;
 			capStats.dwCheckDefect += r.dwDefectFrames;
 			if (m_enableSHA256) {
+				InterlockedExchange(&m_finalizePhase, FinalizeHash);
+				InterlockedExchange(&m_finalizePercent, 0);
 				char hash[65];
-				if (ComputeFileSHA256(f, hash)) {
+				if (ComputeFileSHA256(f, hash, &m_finalizePercent)) {
 					CString bare = f; int sep = bare.ReverseFind('\\');
 					if (sep >= 0) bare = bare.Mid(sep + 1);
 					CString side; side.Format("%s.sha256", (LPCSTR)f);
@@ -2578,6 +2638,9 @@ void CDV::CapturingThread()
 		else logPath = ".\\";
 		logPath += "WinDV_CaptureLog.csv";
 		WriteCaptureLog(logPath, capStats);
+
+		InterlockedExchange(&m_finalizePhase, FinalizeDone);
+		InterlockedExchange(&m_finalizePercent, 100);
 
 		/* Notify the UI about the check result. */
 		GetParent()->PostMessage(WM_DV_CHECK_COMPLETE,

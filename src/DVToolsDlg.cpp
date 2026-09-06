@@ -284,6 +284,7 @@ CDVToolsDlg::CDVToolsDlg(CWnd* pParent /*=NULL*/)
 	m_originalRect.right = 0;      // sentinel: 0 means resize data not yet initialised
 	m_minWidth = m_minHeight = 1;
 	m_exitOnFinish = 0;
+	m_captureFinalizedStatusSticky = false;
 }
 
 CDVToolsDlg::~CDVToolsDlg()
@@ -340,6 +341,7 @@ BEGIN_MESSAGE_MAP(CDVToolsDlg, CDialog)
 	ON_MESSAGE(WM_DV_LOWDISKSPACE, OnDVLowDiskSpace)
 	ON_MESSAGE(WM_DV_SIGNALLOST, OnDVSignalLost)
 	ON_MESSAGE(WM_DV_CHECK_COMPLETE, OnDVCheckComplete)
+	ON_MESSAGE(WM_DV_FINALIZE_PROGRESS, OnDVFinalizeProgress)
 END_MESSAGE_MAP()
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1173,6 +1175,7 @@ void CDVToolsDlg::OnVdstSel()
 void CDVToolsDlg::InitVideo()
 {
 	m_exitOnFinish = 0;
+	m_captureFinalizedStatusSticky = false;
 
 	KillTimer(1);
 	int sel = m_toolTab.GetCurSel();
@@ -1235,6 +1238,7 @@ void CDVToolsDlg::OnFdstSel()
  */
 void CDVToolsDlg::OnCapture()
 {
+	m_captureFinalizedStatusSticky = false;
 	if (m_video.GetState() == CDV::CapturePaused) {
 		TRY {
 			CString filename;
@@ -1280,7 +1284,8 @@ void CDVToolsDlg::OnEndCapture()
 	if (captureButton) captureButton->EnableWindow(FALSE);
 	if (endButton) endButton->EnableWindow(FALSE);
 
-	m_status.SetWindowText("Ending capture: draining frames, finalizing AVI, verifying index...");
+	m_captureFinalizedStatusSticky = false;
+	m_status.SetWindowText("Ending capture - draining queued DV frames...");
 	UpdateWindow();
 
 	TRY {
@@ -1289,8 +1294,13 @@ void CDVToolsDlg::OnEndCapture()
 		BOOL indexOK = r.bValid && r.bHasIndex;
 
 		InitVideo();
-		if (indexOK)
-			m_status.SetWindowText("Capture ended safely. AVI index verified; ready for next capture.");
+		m_captureFinalizedStatusSticky = true;
+		if (indexOK) {
+			if (m_video.m_enableSHA256)
+				m_status.SetWindowText("Capture safely finalized. AVI/OpenDML index verified; SHA-256 complete; ready for next capture.");
+			else
+				m_status.SetWindowText("Capture safely finalized. AVI/OpenDML index verified; ready for next capture.");
+		}
 		else {
 			CString msg;
 			msg.Format("Capture ended, but AVI verification reported: %s", (LPCSTR)r.sError);
@@ -1508,7 +1518,8 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
 	// unnecessary WM_PAINT messages on every tick.
 	CString tmp;
 	m_status.GetWindowText(tmp);
-	if (tmp != txt) m_status.SetWindowText(txt);
+	if (!(m_captureFinalizedStatusSticky && m_video.GetState() == CDV::CapturePaused) && tmp != txt)
+		m_status.SetWindowText(txt);
 	m_counter.GetWindowText(tmp);
 	if (tmp != txt2) m_counter.SetWindowText(txt2);
 	m_status3.GetWindowText(tmp);
@@ -1568,8 +1579,42 @@ LRESULT CDVToolsDlg::OnDVSignalLost(WPARAM, LPARAM)
 	return 0;
 }
 
+
+/* Live, truthful End Capture status. lParam is meaningful only for SHA phase. */
+LRESULT CDVToolsDlg::OnDVFinalizeProgress(WPARAM wParam, LPARAM lParam)
+{
+	CString msg;
+	switch ((LONG)wParam) {
+	case CDV::FinalizeDraining:
+		msg = "Ending capture - draining queued DV frames...";
+		break;
+	case CDV::FinalizeMux:
+		msg = "Finalizing AVI - waiting for AVI mux/index completion...";
+		break;
+	case CDV::FinalizeVerify:
+		msg = "AVI finalized - verifying RIFF/OpenDML index...";
+		break;
+	case CDV::FinalizeHash: {
+		LONG pct = (LONG)lParam;
+		if (pct < 0) pct = 0;
+		if (pct > 100) pct = 100;
+		msg.Format("AVI verification complete - calculating SHA-256... %ld%%", pct);
+		break;
+	}
+	case CDV::FinalizeDone:
+		msg = "Post-capture checks complete - preparing next capture...";
+		break;
+	default:
+		return 0;
+	}
+	m_status.SetWindowText(msg);
+	m_status.UpdateWindow();
+	return 0;
+}
+
 LRESULT CDVToolsDlg::OnDVCheckComplete(WPARAM wParam, LPARAM)
 {
+	if (m_captureFinalizedStatusSticky) return 0;
 	const AVICheckResult& r = m_video.GetLastCheckResult();
 	ErrorStats es = m_video.GetErrorStats();
 	CString msg;

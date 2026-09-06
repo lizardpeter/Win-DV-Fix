@@ -51,6 +51,10 @@
  * The full result is available via CDV::GetLastCheckResult(). */
 #define WM_DV_CHECK_COMPLETE	(WM_USER+204)
 
+/* Sent synchronously by FinalizeCapturing while it polls the capture worker.
+ * wParam = CDV::Finalize* phase, lParam = percentage for hash phase. */
+#define WM_DV_FINALIZE_PROGRESS	(WM_USER+205)
+
 /*
  * CDShowException
  *
@@ -718,6 +722,11 @@ void WriteCaptureLog(LPCSTR szLogPath, const CaptureStats& stats);
 class CDV:public CStatic, CFrameHandler  {
 public:
 	enum {Idle, RecordPaused, Recording, CapturePaused, Capturing, CaptureFinalizing, Finished} m_state;
+	/* End Capture progress is written only by the capture worker/finalizer and
+	 * read by the UI thread. LONG stores are atomic on supported Win32 targets. */
+	enum {FinalizeNone, FinalizeDraining, FinalizeMux, FinalizeVerify, FinalizeHash, FinalizeDone};
+	volatile LONG m_finalizePhase;
+	volatile LONG m_finalizePercent;
 	/* TRUE = write Type-2 AVI (separate audio/video); FALSE = Type-1 (interleaved). */
 	bool m_type2AVI;
 	/* DV timestamp delta (seconds) that triggers a new split file; 0 = disabled. */
@@ -754,6 +763,8 @@ public:
 	CString GetCaptureFilename();
 	/* WDV-10: Returns a snapshot of the current DV error statistics (thread-safe). */
 	ErrorStats GetErrorStats();
+	LONG GetFinalizePhase() const { return m_finalizePhase; }
+	LONG GetFinalizePercent() const { return m_finalizePercent; }
 
 	/* Tears down the entire pipeline and resets state to Idle. */
 	void Destroy();
@@ -843,7 +854,7 @@ CString FormatTime(LPCSTR format, time_t tim);
 /* WDV-11: Compute SHA-256 of a file and write a sha256sum-compatible sidecar.
  * Returns TRUE on success and fills szHashOut (65 bytes) with the hex string.
  * Returns FALSE on file-read error (szHashOut is set to empty string). */
-BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65]);
+BOOL ComputeFileSHA256(LPCSTR szFilePath, char szHashOut[65], volatile LONG *pProgressPercent = NULL);
 
 /* WDV-11: Write a sha256sum-compatible sidecar file (.sha256).
  * szSidecarPath: full path to the .sha256 file.

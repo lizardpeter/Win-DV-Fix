@@ -427,7 +427,8 @@ void CInputGraph::Run(CFrameHandler *handler)
 {
 	m_handler = handler;
 	HRESULT hr = m_MC->Run();
-	CHECK_HR(hr, "Can't start input graph");
+	if (FAILED(hr))
+		ThrowDShowException(CDShowException::error, "Can't start input graph");
 }
 
 /* Stops the graph and clears the handler reference. */
@@ -1401,15 +1402,10 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
 #ifdef DEBUG
 	DumpGraph(m_FG, 0);
 #endif
-	/* Start the graph; fail closed if the writer never reaches Running. */
+	/* Push-source writer may return S_FALSE until its first sample arrives. */
 	hr = m_MC->Run();
-	if (hr != S_OK) {
-		OAFilterState state;
-		hr = m_MC->GetState(1000, &state);
-		CHECK_HR(hr, "Can't start AVI writer");
-		if (state != State_Running)
-			ThrowDShowException(CDShowException::error, "AVI writer did not reach running state");
-	}
+	if (FAILED(hr))
+		ThrowDShowException(CDShowException::error, "Can't start AVI writer");
 }
 
 /*

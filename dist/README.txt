@@ -5,4 +5,4 @@ Live DV error scanner: disabled
 Archive default: Type-1 DV AVI
 Frame decimation: disabled (EveryNth=1)
 End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
-Preview startup: accepts DirectShow S_FALSE asynchronous-success state; only FAILED HRESULTs abort
+DirectShow startup: input, preview, and AVI writer accept S_FALSE asynchronous success; only FAILED HRESULTs abort

@@ -1,8 +1,18 @@
 diff --git a/DShow.cpp b/DShow.cpp
-index ec5e2a3..e81450a 100644
+index ec5e2a3..e3fd99a 100644
 --- a/DShow.cpp
 +++ b/DShow.cpp
-@@ -530,14 +530,19 @@ STDMETHODIMP CInputGraph::CInputFilter::CInputPin::Receive(IMediaSample *pSample
+@@ -427,7 +427,8 @@ void CInputGraph::Run(CFrameHandler *handler)
+ {
+ 	m_handler = handler;
+ 	HRESULT hr = m_MC->Run();
+-	CHECK_HR(hr, "Can't start input graph");
++	if (FAILED(hr))
++		ThrowDShowException(CDShowException::error, "Can't start input graph");
+ }
+ 
+ /* Stops the graph and clears the handler reference. */
+@@ -530,14 +531,19 @@ STDMETHODIMP CInputGraph::CInputFilter::CInputPin::Receive(IMediaSample *pSample
  	HRESULT hr = CBaseInputPin::Receive(pSample);
  	if (hr != NOERROR) return hr;
  
@@ -29,25 +39,20 @@ index ec5e2a3..e81450a 100644
  }
  
  /*
-@@ -1396,8 +1401,15 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
+@@ -1396,8 +1402,10 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
  #ifdef DEBUG
  	DumpGraph(m_FG, 0);
  #endif
 -	/* Start the graph; frames delivered via HandleFrame() will be written immediately. */
 -	m_MC->Run();
-+	/* Start the graph; fail closed if the writer never reaches Running. */
++	/* Push-source writer may return S_FALSE until its first sample arrives. */
 +	hr = m_MC->Run();
-+	if (hr != S_OK) {
-+		OAFilterState state;
-+		hr = m_MC->GetState(1000, &state);
-+		CHECK_HR(hr, "Can't start AVI writer");
-+		if (state != State_Running)
-+			ThrowDShowException(CDShowException::error, "AVI writer did not reach running state");
-+	}
++	if (FAILED(hr))
++		ThrowDShowException(CDShowException::error, "Can't start AVI writer");
  }
  
  /*
-@@ -1410,23 +1422,28 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
+@@ -1410,23 +1418,28 @@ CAVIWriter::CAVIWriter(LPCSTR filename, LPCSTR dtformat, int ndigits, time_t tim
   * to compute the final filename from the same parameters used at construction.
   * MoveFile() performs an atomic rename on the same volume.
   */
@@ -84,7 +89,7 @@ index ec5e2a3..e81450a 100644
  }
  
  /////////////////////////////////////////////////////////////////////////////
-@@ -1474,7 +1491,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
+@@ -1474,7 +1487,8 @@ CMonitor::CMonitor(HWND hWnd, CMediaType *type)
  	CHECK_HR(hr, "Can't set preview window style");
  	Resize();
  	hr = m_MC->Run();
@@ -94,7 +99,7 @@ index ec5e2a3..e81450a 100644
  
  	/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
  	m_thread = AfxBeginThread(::MonitoringThread,this,THREAD_PRIORITY_BELOW_NORMAL,0,CREATE_SUSPENDED);
-@@ -1980,9 +1998,9 @@ static UINT CapturingThread(LPVOID pdv)
+@@ -1980,9 +1994,9 @@ static UINT CapturingThread(LPVOID pdv)
  CDV::CDV()
  : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
    m_thread(NULL),
@@ -106,7 +111,7 @@ index ec5e2a3..e81450a 100644
    m_enableSHA256(true)
  {
  	ResetErrorStats(&m_errorStats);
-@@ -2087,7 +2105,7 @@ void CDV::Destroy()
+@@ -2087,7 +2101,7 @@ void CDV::Destroy()
  		if (m_DVctrl) m_dvInput->CtrlStop();
  		delete(m_dvInput);	m_dvInput = NULL;
  	}
@@ -115,7 +120,7 @@ index ec5e2a3..e81450a 100644
  	if (m_dvOutput) {
  		if (m_DVctrl) m_dvOutput->CtrlStop();
  		delete(m_dvOutput); m_dvOutput = NULL;
-@@ -2138,6 +2156,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
+@@ -2138,6 +2152,7 @@ void CDV::HandleFrame(REFERENCE_TIME duration, BYTE *data, int len)
  void CDV::BuildCapturing(LPCSTR vsrc)
  {
  	Destroy();
@@ -123,7 +128,7 @@ index ec5e2a3..e81450a 100644
  	HRESULT hr = S_OK;
  
  	m_dvInput = new CDVInput(vsrc);
-@@ -2176,6 +2195,49 @@ void CDV::StopCapturing()
+@@ -2176,6 +2191,49 @@ void CDV::StopCapturing()
  	}
  }
  
@@ -173,7 +178,7 @@ index ec5e2a3..e81450a 100644
  /*
   * CDV::StartCapturing
   *
-@@ -2264,6 +2326,16 @@ void CDV::StartRecording()
+@@ -2264,6 +2322,16 @@ void CDV::StartRecording()
  	}
  }
  
@@ -190,7 +195,7 @@ index ec5e2a3..e81450a 100644
  /*
   * CDV::CapturingThread
   *
-@@ -2338,8 +2410,13 @@ void CDV::CapturingThread()
+@@ -2338,8 +2406,13 @@ void CDV::CapturingThread()
  			gotFrame = m_queue->GetWithTimeout(&duration, &buffer, &len, m_autoStopTimeout);
  		else
  			gotFrame = m_queue->Get(&duration, &buffer, &len);
@@ -205,7 +210,7 @@ index ec5e2a3..e81450a 100644
  			capStats.eStopReason = 1; /* SIGNAL_LOST */
  			GetParent()->PostMessage(WM_DV_SIGNALLOST, 0, 0);
  			m_state = Finished;
-@@ -2367,26 +2444,20 @@ void CDV::CapturingThread()
+@@ -2367,26 +2440,20 @@ void CDV::CapturingThread()
  				/* Notify the UI of the new recording timestamp. */
  				GetParent()->PostMessage(WM_DV_TIMECHANGE, 0, dvTime);
  			}
@@ -235,7 +240,7 @@ index ec5e2a3..e81450a 100644
  				}
  				/* Open a new AVI file if none is currently open. */
  				if (!m_aviWriter) {
-@@ -2433,8 +2504,7 @@ void CDV::CapturingThread()
+@@ -2433,8 +2500,7 @@ void CDV::CapturingThread()
  			else {
  				/* Paused or Finished: close any open writer cleanly. */
  				if (m_aviWriter) {
@@ -245,7 +250,7 @@ index ec5e2a3..e81450a 100644
  				}
  				/* Reset the dropped-frame baseline for the next capture segment.
  				 * Do not reset if we just finished (preserve final stats). */
-@@ -2448,12 +2518,9 @@ void CDV::CapturingThread()
+@@ -2448,12 +2514,9 @@ void CDV::CapturingThread()
  		}
  	}
  	/* Close any writer that was open when the loop exited (e.g. on Destroy()). */
@@ -261,7 +266,7 @@ index ec5e2a3..e81450a 100644
  		capStats.sFilename = m_captureFilename;
  		capStats.dwFrameCount = m_counter;
  		capStats.dwDroppedFrames = m_dropped;
-@@ -2464,28 +2531,34 @@ void CDV::CapturingThread()
+@@ -2464,28 +2527,34 @@ void CDV::CapturingThread()
  			capStats.errorStats = m_errorStats;
  		}
  

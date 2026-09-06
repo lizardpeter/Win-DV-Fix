@@ -494,8 +494,15 @@ BOOL CDVToolsDlg::OnInitDialog()
 
 	// Capture options.
 	m_video.m_type2AVI = AfxGetApp()->GetProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI) > 0;
-	m_video.m_discontinuityTreshold = AfxGetApp()->GetProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
-	m_video.m_maxAVIFrames = AfxGetApp()->GetProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
+	m_video.m_discontinuityTreshold = AfxGetApp()->GetProfileInt("Capture", "ArchiveDiscontinuityThreshold", 0);
+	CString archiveMaxFrames = AfxGetApp()->GetProfileString("Capture", "ArchiveMaxAVIFrames", "");
+	if (archiveMaxFrames.IsEmpty()) {
+		m_video.m_maxAVIFrames = UINT_MAX;
+	} else {
+		char *end = NULL;
+		unsigned long parsed = strtoul((LPCSTR)archiveMaxFrames, &end, 10);
+		m_video.m_maxAVIFrames = (end && *end == '\0') ? (UINT)parsed : UINT_MAX;
+	}
 	m_video.m_everyNth = 1; /* ArchiveSafe always preserves every received DV frame. */
 	m_video.m_autoStopTimeout = AfxGetApp()->GetProfileInt("Capture", "ArchiveAutoStopTimeout", m_video.m_autoStopTimeout);
 	m_video.m_enableSHA256 = AfxGetApp()->GetProfileInt("Capture", "SHA256", m_video.m_enableSHA256) > 0;
@@ -1069,8 +1076,10 @@ void CDVToolsDlg::OnClose()
 	AfxGetApp()->WriteProfileString("Capture", "File", tmp);
 
 	AfxGetApp()->WriteProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI);
-	AfxGetApp()->WriteProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
-	AfxGetApp()->WriteProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
+	AfxGetApp()->WriteProfileInt("Capture", "ArchiveDiscontinuityThreshold", m_video.m_discontinuityTreshold);
+	CString archiveMaxFramesOut;
+	archiveMaxFramesOut.Format("%u", m_video.m_maxAVIFrames);
+	AfxGetApp()->WriteProfileString("Capture", "ArchiveMaxAVIFrames", archiveMaxFramesOut);
 	AfxGetApp()->WriteProfileInt("Capture", "ArchiveEveryNth", 1);
 	AfxGetApp()->WriteProfileInt("Capture", "ArchiveAutoStopTimeout", m_video.m_autoStopTimeout);
 	AfxGetApp()->WriteProfileInt("Capture", "SHA256", m_video.m_enableSHA256);

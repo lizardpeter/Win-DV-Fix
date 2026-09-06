@@ -1,5 +1,5 @@
 diff --git a/DShow.cpp b/DShow.cpp
-index ec5e2a3..e3fd99a 100644
+index ec5e2a3..6d2b26c 100644
 --- a/DShow.cpp
 +++ b/DShow.cpp
 @@ -427,7 +427,8 @@ void CInputGraph::Run(CFrameHandler *handler)
@@ -104,7 +104,7 @@ index ec5e2a3..e3fd99a 100644
  : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
    m_thread(NULL),
 -  m_type2AVI(true), m_discontinuityTreshold(1), m_maxAVIFrames(25*60*15), m_everyNth(1), m_recordPreview(TRUE),
-+  m_type2AVI(false), m_discontinuityTreshold(1), m_maxAVIFrames(25*60*15), m_everyNth(1), m_recordPreview(TRUE),
++  m_type2AVI(false), m_discontinuityTreshold(0), m_maxAVIFrames(UINT_MAX), m_everyNth(1), m_recordPreview(TRUE),
    m_dropped(0), m_counter(-1), m_time(-1), m_captureTime(0), m_ndigits(0), m_DVctrl(FALSE),
 -  m_autoStopTimeout(5000),
 +  m_autoStopTimeout(0),
@@ -392,7 +392,7 @@ index 6389af6..c4e83e4 100644
  	void HandleFrame(REFERENCE_TIME duration, BYTE *data, int len);
  
 diff --git a/DVToolsDlg.cpp b/DVToolsDlg.cpp
-index 0c1b659..dc029d5 100644
+index 0c1b659..5d7f288 100644
 --- a/DVToolsDlg.cpp
 +++ b/DVToolsDlg.cpp
 @@ -217,8 +217,10 @@ static struct CtrlProperties {int id; int dx, dw, dy, dh; int tabMask;} ctrlProp
@@ -416,22 +416,31 @@ index 0c1b659..dc029d5 100644
  	ON_BN_CLICKED(IDC_RECORD, OnRecord)
  	ON_WM_TIMER()
  	ON_BN_CLICKED(IDC_PICTURE, OnPicture)
-@@ -490,11 +493,11 @@ BOOL CDVToolsDlg::OnInitDialog()
+@@ -490,11 +493,18 @@ BOOL CDVToolsDlg::OnInitDialog()
  	m_video.m_recordPreview = AfxGetApp()->GetProfileInt("Record", "Preview", m_video.m_recordPreview) > 0;
  
  	// Capture options.
 -	m_video.m_type2AVI = AfxGetApp()->GetProfileInt("Capture", "Type2AVI", m_video.m_type2AVI) > 0;
-+	m_video.m_type2AVI = AfxGetApp()->GetProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI) > 0;
- 	m_video.m_discontinuityTreshold = AfxGetApp()->GetProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
- 	m_video.m_maxAVIFrames = AfxGetApp()->GetProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
+-	m_video.m_discontinuityTreshold = AfxGetApp()->GetProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
+-	m_video.m_maxAVIFrames = AfxGetApp()->GetProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
 -	m_video.m_everyNth = AfxGetApp()->GetProfileInt("Capture", "EveryNth", m_video.m_everyNth);
 -	m_video.m_autoStopTimeout = AfxGetApp()->GetProfileInt("Capture", "AutoStopTimeout", m_video.m_autoStopTimeout);
++	m_video.m_type2AVI = AfxGetApp()->GetProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI) > 0;
++	m_video.m_discontinuityTreshold = AfxGetApp()->GetProfileInt("Capture", "ArchiveDiscontinuityThreshold", 0);
++	CString archiveMaxFrames = AfxGetApp()->GetProfileString("Capture", "ArchiveMaxAVIFrames", "");
++	if (archiveMaxFrames.IsEmpty()) {
++		m_video.m_maxAVIFrames = UINT_MAX;
++	} else {
++		char *end = NULL;
++		unsigned long parsed = strtoul((LPCSTR)archiveMaxFrames, &end, 10);
++		m_video.m_maxAVIFrames = (end && *end == '\0') ? (UINT)parsed : UINT_MAX;
++	}
 +	m_video.m_everyNth = 1; /* ArchiveSafe always preserves every received DV frame. */
 +	m_video.m_autoStopTimeout = AfxGetApp()->GetProfileInt("Capture", "ArchiveAutoStopTimeout", m_video.m_autoStopTimeout);
  	m_video.m_enableSHA256 = AfxGetApp()->GetProfileInt("Capture", "SHA256", m_video.m_enableSHA256) > 0;
  
  	// Filename date-time format and sequence counter settings.
-@@ -1006,10 +1009,15 @@ HBRUSH CDVToolsDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
+@@ -1006,10 +1016,15 @@ HBRUSH CDVToolsDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
  }
  
  /* OnCancel -- suppress the default Escape/Cancel behaviour that would close the
@@ -448,22 +457,26 @@ index 0c1b659..dc029d5 100644
  	InitVideo();
  }
  
-@@ -1060,11 +1068,11 @@ void CDVToolsDlg::OnClose()
+@@ -1060,11 +1075,13 @@ void CDVToolsDlg::OnClose()
  	m_FDST.GetWindowText(tmp);
  	AfxGetApp()->WriteProfileString("Capture", "File", tmp);
  
 -	AfxGetApp()->WriteProfileInt("Capture", "Type2AVI", m_video.m_type2AVI);
-+	AfxGetApp()->WriteProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI);
- 	AfxGetApp()->WriteProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
- 	AfxGetApp()->WriteProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
+-	AfxGetApp()->WriteProfileInt("Capture", "DiscontinuityTreshold", m_video.m_discontinuityTreshold);
+-	AfxGetApp()->WriteProfileInt("Capture", "MaxAVIFrames", m_video.m_maxAVIFrames);
 -	AfxGetApp()->WriteProfileInt("Capture", "EveryNth", m_video.m_everyNth);
 -	AfxGetApp()->WriteProfileInt("Capture", "AutoStopTimeout", m_video.m_autoStopTimeout);
++	AfxGetApp()->WriteProfileInt("Capture", "ArchiveType2AVI", m_video.m_type2AVI);
++	AfxGetApp()->WriteProfileInt("Capture", "ArchiveDiscontinuityThreshold", m_video.m_discontinuityTreshold);
++	CString archiveMaxFramesOut;
++	archiveMaxFramesOut.Format("%u", m_video.m_maxAVIFrames);
++	AfxGetApp()->WriteProfileString("Capture", "ArchiveMaxAVIFrames", archiveMaxFramesOut);
 +	AfxGetApp()->WriteProfileInt("Capture", "ArchiveEveryNth", 1);
 +	AfxGetApp()->WriteProfileInt("Capture", "ArchiveAutoStopTimeout", m_video.m_autoStopTimeout);
  	AfxGetApp()->WriteProfileInt("Capture", "SHA256", m_video.m_enableSHA256);
  
  	AfxGetApp()->WriteProfileString("Capture", "DateTimeFormat", m_DTFormat);
-@@ -1210,7 +1218,7 @@ void CDVToolsDlg::OnFdstSel()
+@@ -1210,7 +1227,7 @@ void CDVToolsDlg::OnFdstSel()
   *
   * State transitions:
   *   CapturePaused  -> StartCapturing()  (pipeline is built; begin writing frames)
@@ -472,7 +485,7 @@ index 0c1b659..dc029d5 100644
   *   any other      -> InitVideo()       (error recovery / reset)
   *
   * Exceptions from the DirectShow layer are caught, the pipeline is reset to
-@@ -1244,6 +1252,52 @@ void CDVToolsDlg::OnCapture()
+@@ -1244,6 +1261,52 @@ void CDVToolsDlg::OnCapture()
  		InitVideo();
  }
  
@@ -525,7 +538,7 @@ index 0c1b659..dc029d5 100644
  /* OnRecord -- toggle button handler for the Record tab.
   *
   * State transitions:
-@@ -1341,7 +1395,7 @@ void CDVToolsDlg::OnConfig()
+@@ -1341,7 +1404,7 @@ void CDVToolsDlg::OnConfig()
  		m_video.m_type2AVI  = captureCfg.m_type12 == 1;
  		m_video.m_discontinuityTreshold = captureCfg.m_discontinuityTreshold;
  		m_video.m_maxAVIFrames = captureCfg.m_maxAVIFrames;
@@ -534,7 +547,7 @@ index 0c1b659..dc029d5 100644
  		m_DTFormat = captureCfg.m_dtformat;
  		m_DTFormatHistory = captureCfg.m_dtformathistory;
  		m_nSuffixDigits = captureCfg.m_ndigits;
-@@ -1397,13 +1451,13 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
+@@ -1397,13 +1460,13 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
  	// Build primary status string.
  	switch (m_video.GetState()) {
  	case CDV::Capturing: {
@@ -550,7 +563,7 @@ index 0c1b659..dc029d5 100644
  		break;
  	case CDV::Recording: txt += "Recording...  Press <Record> for pause.";
  		break;
-@@ -1433,17 +1487,9 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
+@@ -1433,17 +1496,9 @@ void CDVToolsDlg::OnTimer(UINT nIDEvent)
  	// Build queue-load string for states where the queue is actively draining.
  	// WDV-10: Append DV error count and percentage during capture.
  	switch (m_video.GetState()) {

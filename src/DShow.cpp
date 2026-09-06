@@ -1994,7 +1994,7 @@ static UINT CapturingThread(LPVOID pdv)
 CDV::CDV()
 : m_aviJoiner(NULL), m_aviWriter(NULL), m_dvInput(NULL), m_dvOutput(NULL), m_monitor(NULL), m_queue(NULL),
   m_thread(NULL),
-  m_type2AVI(false), m_discontinuityTreshold(1), m_maxAVIFrames(25*60*15), m_everyNth(1), m_recordPreview(TRUE),
+  m_type2AVI(false), m_discontinuityTreshold(0), m_maxAVIFrames(UINT_MAX), m_everyNth(1), m_recordPreview(TRUE),
   m_dropped(0), m_counter(-1), m_time(-1), m_captureTime(0), m_ndigits(0), m_DVctrl(FALSE),
   m_autoStopTimeout(0),
   m_enableSHA256(true)

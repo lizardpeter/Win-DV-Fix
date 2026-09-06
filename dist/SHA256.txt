@@ -1,1 +1,1 @@
-9b7c760045ef16a95a610cfa7aec04bbbec86efee52caa2cf77b7f578fa30f57  WinDV_1.6.0_ArchiveSafe_v2.2_x86.exe
+29758216b2abb3f8b3c0b758102651c4e6c2242a57fd13cb334103a256913493  WinDV_1.6.0_ArchiveSafe_v2.3_x86.exe

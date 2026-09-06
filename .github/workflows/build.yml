@@ -1,0 +1,130 @@
+name: Build WinDV ArchiveSafe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'README.md'
+      - 'UPSTREAM_COMMIT.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone pinned WinDV 1.6.0 source
+        shell: pwsh
+        run: |
+          git clone https://github.com/Wachhund/WinDV.git windv
+          git -C windv checkout f633c456c211a0fb0e05aa43f2b150ec787faab7
+          $actual = (git -C windv rev-parse HEAD).Trim()
+          if ($actual -ne 'f633c456c211a0fb0e05aa43f2b150ec787faab7') { throw "Unexpected upstream commit: $actual" }
+
+      - name: Import temporary ArchiveSafe patch scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools | Out-Null
+          $base = 'https://raw.githubusercontent.com/lizardpeter/destiny-1/windv-end-capture-build-20260906/tools'
+          Invoke-WebRequest "$base/windv_end_capture_patch.py" -OutFile tools/windv_end_capture_patch.py
+          Invoke-WebRequest "$base/windv_archive_safe_hardening.py" -OutFile tools/windv_archive_safe_hardening.py
+          Invoke-WebRequest "$base/windv_archive_safe_finalize_fix.py" -OutFile tools/windv_archive_safe_finalize_fix.py
+
+      - name: Apply ArchiveSafe patches
+        shell: pwsh
+        run: |
+          python tools/windv_end_capture_patch.py windv
+          python tools/windv_archive_safe_hardening.py windv
+          python tools/windv_archive_safe_finalize_fix.py windv
+          git -C windv diff --check
+
+      - name: Verify capture invariants
+        shell: pwsh
+        run: |
+          if (-not (Select-String -Path windv/WinDV.rc -SimpleMatch '"End Capture",IDC_END_CAPTURE')) { throw 'End Capture resource missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'void CDV::FinalizeCapturing()')) { throw 'FinalizeCapturing missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_state == Capturing || m_state == CaptureFinalizing')) { throw 'queue-drain write state missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_dvInput) m_dvInput->Stop();')) { throw 'producer stop missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_queue) m_queue->Put(-1, NULL, 0);')) { throw 'ordered EOS missing' }
+          if (Select-String -Path windv/DShow.cpp -SimpleMatch 'AnalyzeDVFrame(buffer, len)') { throw 'live DV error scanner still active' }
+          if (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'E:%lu') { throw 'DV error scanner UI polling still active' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_type2AVI(false)')) { throw 'Type-1 archive default missing' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveSafe always preserves every received DV frame')) { throw 'frame-decimation lock missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'duration = (len >= 144000) ? 400000 : 333667')) { throw 'DV timing fallback missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'AVI writer did not reach running state')) { throw 'AVI writer run-state check missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'CString CAVIWriter::FinalizeFile()')) { throw 'exact final-file tracking missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_finalizedFiles.GetSize() > 0)')) { throw 'pause-safe verification gate missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_autoStopTimeout(0)')) { throw 'archive-safe auto-stop default missing' }
+          if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveAutoStopTimeout')) { throw 'archive auto-stop registry isolation missing' }
+
+      - name: Configure Win32 Release
+        run: cmake -S windv -B build -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Smoke test
+        shell: cmd
+        run: |
+          build\Release\WinDV.exe --version > version_out.txt 2>&1
+          if %ERRORLEVEL% NEQ 0 exit /b 1
+          type version_out.txt
+          findstr /C:"WinDV" version_out.txt
+          if %ERRORLEVEL% NEQ 0 exit /b 1
+
+      - name: Materialize canonical source and distribution
+        shell: pwsh
+        run: |
+          git -C windv config user.name 'ArchiveSafe Builder'
+          git -C windv config user.email 'actions@users.noreply.github.com'
+          git -C windv add -A
+          git -C windv commit -m 'Apply Win-DV-Fix ArchiveSafe v2.1 patches'
+
+          Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force src | Out-Null
+          git -C windv archive --format=zip HEAD -o ../patched-source.zip
+          Expand-Archive patched-source.zip src -Force
+
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/WinDV.exe dist/WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe
+          Copy-Item windv/LICENSE LICENSE
+          git -C windv diff HEAD^ HEAD -- Resource.h WinDV.rc DShow.h DShow.cpp DVToolsDlg.h DVToolsDlg.cpp | Out-File -Encoding utf8 dist/WinDV_ArchiveSafe_v2.1.patch
+          $hash = (Get-FileHash dist/WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  WinDV_1.6.0_ArchiveSafe_v2.1_x86.exe" | Out-File -Encoding ascii dist/SHA256.txt
+          @"
+          WinDV 1.6.0 ArchiveSafe v2.1
+          Upstream: Wachhund/WinDV f633c456c211a0fb0e05aa43f2b150ec787faab7
+          Build: Windows x86 Release, Visual Studio 2022
+          Live DV error scanner: disabled
+          Archive default: Type-1 DV AVI
+          Frame decimation: disabled (EveryNth=1)
+          End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
+          "@ | Out-File -Encoding utf8 dist/README.txt
+
+      - name: Commit self-contained source, tools, and EXE
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src tools dist LICENSE
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m 'Materialize ArchiveSafe v2.1 source and executable [skip ci]'
+            git push
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinDV-1.6.0-ArchiveSafe-v2.1-x86
+          path: |
+            dist/*
+            tools/*
+          if-no-files-found: error

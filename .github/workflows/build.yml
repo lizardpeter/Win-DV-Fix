@@ -49,13 +49,16 @@ jobs:
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_type2AVI(false)')) { throw 'Type-1 archive default missing' }
           if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveSafe always preserves every received DV frame')) { throw 'frame-decimation lock missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'duration = (len >= 144000) ? 400000 : 333667')) { throw 'DV timing fallback missing' }
-          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'AVI writer did not reach running state')) { throw 'AVI writer run-state check missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'CString CAVIWriter::FinalizeFile()')) { throw 'exact final-file tracking missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'if (m_finalizedFiles.GetSize() > 0)')) { throw 'pause-safe verification gate missing' }
           if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'm_autoStopTimeout(0)')) { throw 'archive-safe auto-stop default missing' }
           if (-not (Select-String -Path windv/DVToolsDlg.cpp -SimpleMatch 'ArchiveAutoStopTimeout')) { throw 'archive auto-stop registry isolation missing' }
+          if (Select-String -Path windv/DShow.cpp -SimpleMatch 'CHECK_HR(hr, "Can''t start input graph")') { throw 'input graph still rejects DirectShow S_FALSE success' }
           if (Select-String -Path windv/DShow.cpp -SimpleMatch 'CHECK_HR(hr, "Can''t start preview graph")') { throw 'preview graph still rejects DirectShow S_FALSE success' }
-          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start preview graph")')) { throw 'preview graph failure handling missing' }
+          if (Select-String -Path windv/DShow.cpp -SimpleMatch 'AVI writer did not reach running state') { throw 'AVI writer still blocks waiting for push-source Running state' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start input graph")')) { throw 'input graph true-failure handling missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start preview graph")')) { throw 'preview graph true-failure handling missing' }
+          if (-not (Select-String -Path windv/DShow.cpp -SimpleMatch 'ThrowDShowException(CDShowException::error, "Can''t start AVI writer")')) { throw 'AVI writer true-failure handling missing' }
 
       - name: Configure Win32 Release
         run: cmake -S windv -B build -G "Visual Studio 17 2022" -A Win32
@@ -100,7 +103,7 @@ jobs:
           Archive default: Type-1 DV AVI
           Frame decimation: disabled (EveryNth=1)
           End Capture: producer stop -> accepted-frame drain -> EOS -> AVI finalization -> verification
-          Preview startup: accepts DirectShow S_FALSE asynchronous-success state; only FAILED HRESULTs abort
+          DirectShow startup: input, preview, and AVI writer accept S_FALSE asynchronous success; only FAILED HRESULTs abort
           "@ | Out-File -Encoding utf8 dist/README.txt
 
       - name: Commit reproducible outputs when changed

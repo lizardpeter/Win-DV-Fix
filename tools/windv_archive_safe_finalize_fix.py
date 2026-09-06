@@ -39,12 +39,20 @@ def main():
 \t\tbreak;
 ''')
 
-    # DirectShow IMediaControl::Run may legitimately return S_FALSE while a
-    # push-source graph is transitioning to Running. The modern fork added a
-    # strict CHECK_HR here, but CHECK_HR treats any non-S_OK code as failure.
-    # Stock WinDV ignored the return value and then started MonitoringThread,
-    # which supplies the first preview samples. Accept every successful HRESULT
-    # and reject only true failures so S_FALSE cannot deadlock startup.
+    # IMediaControl::Run() may return S_FALSE while a graph is successfully
+    # transitioning asynchronously. Stock WinDV allowed this. Reject only
+    # FAILED HRESULTs for the live input, preview push source, and AVI writer.
+    rep(root, "DShow.cpp",
+'''\tm_handler = handler;
+\tHRESULT hr = m_MC->Run();
+\tCHECK_HR(hr, "Can't start input graph");
+''',
+'''\tm_handler = handler;
+\tHRESULT hr = m_MC->Run();
+\tif (FAILED(hr))
+\t\tThrowDShowException(CDShowException::error, "Can't start input graph");
+''')
+
     rep(root, "DShow.cpp",
 '''\thr = m_MC->Run();
 \tCHECK_HR(hr, "Can't start preview graph");
@@ -58,7 +66,24 @@ def main():
 \t/* Start the monitoring thread suspended so we can clear m_bAutoDelete first. */
 ''')
 
-    print("ArchiveSafe final verification + preview startup fixes applied")
+    rep(root, "DShow.cpp",
+'''\t/* Start the graph; fail closed if the writer never reaches Running. */
+\thr = m_MC->Run();
+\tif (hr != S_OK) {
+\t\tOAFilterState state;
+\t\thr = m_MC->GetState(1000, &state);
+\t\tCHECK_HR(hr, "Can't start AVI writer");
+\t\tif (state != State_Running)
+\t\t\tThrowDShowException(CDShowException::error, "AVI writer did not reach running state");
+\t}
+''',
+'''\t/* Push-source writer may return S_FALSE until its first sample arrives. */
+\thr = m_MC->Run();
+\tif (FAILED(hr))
+\t\tThrowDShowException(CDShowException::error, "Can't start AVI writer");
+''')
+
+    print("ArchiveSafe final verification + asynchronous graph startup fixes applied")
     return 0
 
 

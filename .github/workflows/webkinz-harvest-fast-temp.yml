@@ -1,0 +1,70 @@
+name: Temporary Webkinz fast probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fast parallel probe
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out
+
+          cat > /tmp/urls.txt <<'EOF'
+wconf|https://play.webkinz.com/wconf.js.php
+latest|https://downloads.webkinz.com/apps/latest.yml
+playroot|https://play.webkinz.com/
+webkinz_swf|https://www.webkinz.com/Webkinz.swf?v320_181
+main2_swf|https://www.webkinz.com/SWF/main2.swf?v=v320_181
+translist|https://www.webkinz.com/XML/L10N/TransList.xml
+flashpoint_browse|https://ooooooooo.ooo/browse?search=Webkinz
+dbapi_query|https://db-api.unstable.life/search?query=Webkinz
+dbapi_search|https://db-api.unstable.life/search?search=Webkinz
+bluepload_head|https://bluepload.unstable.life/webkinzfiles.7z
+cdx_webkinz|https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/Webkinz.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20
+cdx_main2|https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/SWF/main2.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20
+cdx_jazz|https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/SWF/ARCADE/GAMES/jazz.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20
+EOF
+
+          while IFS='|' read -r name url; do
+            (
+              echo "$url" > "out/$name.url"
+              curl -L -sS --connect-timeout 8 --max-time 20 -A 'Mozilla/5.0'                 -D "out/$name.headers" -o "out/$name.body" "$url"
+              echo $? > "out/$name.exit"
+              wc -c "out/$name.body" > "out/$name.size" 2>/dev/null || true
+              file "out/$name.body" > "out/$name.file" 2>/dev/null || true
+            ) &
+          done < /tmp/urls.txt
+          wait
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          out={}
+          for p in Path("out").glob("*.body"):
+              b=p.read_bytes()
+              name=p.stem
+              out[name]={
+                  "size":len(b),
+                  "head":b[:500].decode("utf-8","replace"),
+                  "urls":sorted(set(x.decode("latin1","ignore") for x in re.findall(rb'https?://[^\x00\s"\'<>]+',b)))[:1000],
+                  "uuids":sorted(set(x.decode() for x in re.findall(rb'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',b))),
+              }
+          Path("out/summary.json").write_text(json.dumps(out,indent=2))
+          PY
+
+      - name: Upload fast probe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkinz-fast-probe
+          path: out/
+          retention-days: 7

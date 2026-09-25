@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, sync::Arc};
 
 use graph::index::falkordb::data_structures::cow_btree::{CowBTree, RangeIter};
 
@@ -145,6 +145,128 @@ impl NativeNumericRangeIndex {
     }
 }
 
+
+/// Native lexicographic string range index.
+///
+/// The upstream native CowBTree is intentionally specialized to u64 numeric
+/// keys. String ordering therefore uses a Rust BTreeMap for correctness first;
+/// the public API mirrors the numeric backend so it can later be replaced by a
+/// compact page format without changing Indexer/Planner integration.
+#[derive(Clone, Default)]
+pub struct NativeStringRangeIndex {
+    by_value: BTreeMap<Arc<str>, BTreeSet<u64>>,
+    by_doc: HashMap<u64, Vec<Arc<str>>>,
+}
+
+impl NativeStringRangeIndex {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert<I, S>(
+        &mut self,
+        doc: u64,
+        values: I,
+    )
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut values: Vec<Arc<str>> = values
+            .into_iter()
+            .map(|value| Arc::<str>::from(value.as_ref()))
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+
+        self.remove_document(doc);
+
+        for value in &values {
+            self.by_value.entry(Arc::clone(value)).or_default().insert(doc);
+        }
+        if !values.is_empty() {
+            self.by_doc.insert(doc, values);
+        }
+    }
+
+    pub fn remove_document(
+        &mut self,
+        doc: u64,
+    ) -> bool {
+        let Some(values) = self.by_doc.remove(&doc) else {
+            return false;
+        };
+
+        for value in values {
+            let remove_key = if let Some(docs) = self.by_value.get_mut(value.as_ref()) {
+                docs.remove(&doc);
+                docs.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.by_value.remove(value.as_ref());
+            }
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn equal(
+        &self,
+        value: &str,
+    ) -> std::vec::IntoIter<u64> {
+        self.by_value
+            .get(value)
+            .map_or_else(Vec::new, |docs| docs.iter().copied().collect())
+            .into_iter()
+    }
+
+    /// Lexicographic UTF-8/Unicode-scalar ordering. Rust String's byte ordering
+    /// is consistent with Unicode scalar ordering for valid UTF-8.
+    #[must_use]
+    pub fn range(
+        &self,
+        min: Option<&str>,
+        max: Option<&str>,
+        include_min: bool,
+        include_max: bool,
+    ) -> std::vec::IntoIter<u64> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        let lower = match min {
+            Some(v) if include_min => Included(v),
+            Some(v) => Excluded(v),
+            None => Unbounded,
+        };
+        let upper = match max {
+            Some(v) if include_max => Included(v),
+            Some(v) => Excluded(v),
+            None => Unbounded,
+        };
+
+        let mut out = Vec::new();
+        for (_, docs) in self.by_value.range::<str, _>((lower, upper)) {
+            out.extend(docs.iter().copied());
+        }
+        out.into_iter()
+    }
+
+    #[must_use]
+    pub fn contains_document(
+        &self,
+        doc: u64,
+    ) -> bool {
+        self.by_doc.contains_key(&doc)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_value.is_empty()
+    }
+}
+
 /// Convert an f64 to a u64 whose ordinary unsigned ordering matches numeric
 /// ordering. -0.0 is canonicalized to +0.0 so Cypher numeric equality does not
 /// distinguish the two IEEE zero encodings.
@@ -217,6 +339,29 @@ mod tests {
         assert!(idx.remove_document(30));
         assert!(!idx.contains_document(30));
         assert_eq!(collect(idx.equal(10.0).unwrap()), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn string_equality_range_upsert_and_remove() {
+        let mut idx = NativeStringRangeIndex::new();
+        idx.upsert(1, ["alpha"]);
+        idx.upsert(2, ["beta", "delta"]);
+        idx.upsert(3, ["gamma"]);
+
+        assert_eq!(idx.equal("beta").collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            idx.range(Some("beta"), Some("gamma"), true, false)
+                .collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+
+        idx.upsert(2, ["epsilon"]);
+        assert!(idx.equal("beta").next().is_none());
+        assert_eq!(idx.equal("epsilon").collect::<Vec<_>>(), vec![2]);
+
+        assert!(idx.remove_document(1));
+        assert!(!idx.contains_document(1));
+        assert!(idx.equal("alpha").next().is_none());
     }
 
     #[test]

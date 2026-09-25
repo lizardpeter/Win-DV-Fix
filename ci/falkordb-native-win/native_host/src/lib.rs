@@ -1,6 +1,7 @@
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
 pub mod api;
+pub mod bulk;
 pub mod property_index;
 pub mod range_index;
 pub mod server;
@@ -21,7 +22,7 @@ use graph::{
     entity_type::EntityType,
     graph::{
         constraint::{ConstraintStatus, ConstraintType},
-        graph::{Plan, NODE_CREATION_BUFFER},
+        graph::{MemoryUsageReport, Plan, NODE_CREATION_BUFFER},
         graphblas::matrix,
         mvcc_graph::MvccGraph,
     },
@@ -180,6 +181,7 @@ impl NativeGraph {
     ) -> Result<Self, String> {
         let wal_path = wal_path.as_ref().to_path_buf();
         let loaded_snapshot = snapshot::load_latest(&wal_path, name)?;
+        let had_snapshot = loaded_snapshot.is_some();
         let snapshot_sequence = loaded_snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.sequence);
@@ -220,7 +222,7 @@ impl NativeGraph {
 
             mvcc.commit(Arc::clone(&private));
             wait_for_recovered_indexes(&mvcc, Duration::from_secs(60))?;
-        } else if snapshot_sequence > 0 {
+        } else if had_snapshot {
             // MvccGraph::from_graph does not perform a commit, so publish the
             // restored graph Arc into its indexers explicitly for subsequent
             // background index work.
@@ -276,6 +278,83 @@ impl NativeGraph {
         std::fs::metadata(wal.path())
             .map(|meta| meta.len())
             .map_err(|e| format!("stat WAL {}: {e}", wal.path().display()))
+    }
+
+
+    pub fn memory_usage_report(&self, samples: usize) -> MemoryUsageReport {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        committed.borrow().memory_usage_report(samples)
+    }
+
+    /// Apply FalkorDB's binary GRAPH.BULK payload directly to a private MVCC
+    /// version. Because bulk writes bypass Cypher EffectsBuffer generation,
+    /// durability is established by atomically checkpointing the private graph
+    /// before publishing it.
+    pub fn bulk_insert(
+        &self,
+        tokens: &[Vec<u8>],
+        node_count: usize,
+        edge_count: usize,
+        node_token_count: usize,
+        rel_token_count: usize,
+    ) -> Result<(), String> {
+        let mut host_guard = self.inner.write();
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+
+        {
+            let mut graph = private.borrow_mut();
+            if !graph.constraints().is_empty() {
+                host_guard.rollback();
+                return Err(
+                    "GRAPH.BULK is refused while graph constraints are active; load data before creating constraints"
+                        .to_string(),
+                );
+            }
+            if let Err(err) = bulk::apply(
+                &mut graph,
+                tokens,
+                node_count,
+                edge_count,
+                node_token_count,
+                rel_token_count,
+            ) {
+                drop(graph);
+                host_guard.rollback();
+                return Err(err);
+            }
+        }
+
+        let checkpoint = if let Some(wal) = &self.wal {
+            let sequence = wal.last_sequence();
+            let path = {
+                let graph = private.borrow();
+                snapshot::write_checkpoint(wal.path(), &self.name, sequence, &graph)?
+            };
+            Some((sequence, path))
+        } else {
+            None
+        };
+
+        host_guard.commit(Arc::clone(&private));
+
+        if let Some((sequence, _path)) = checkpoint
+            && let Some(wal) = &self.wal
+        {
+            // The checkpoint already contains every prior WAL mutation plus
+            // the bulk batch. Failure to compact is non-fatal: keeping the old
+            // WAL only costs disk/replay scanning and future frames still use
+            // the correct absolute next sequence.
+            if let Err(err) = wal.reset_after(sequence) {
+                eprintln!("native host: post-bulk WAL compaction failed: {err}");
+            } else if let Err(err) = snapshot::cleanup_old_checkpoints(wal.path(), 2) {
+                eprintln!("native host: post-bulk checkpoint cleanup failed: {err}");
+            }
+        }
+
+        Ok(())
     }
 
 

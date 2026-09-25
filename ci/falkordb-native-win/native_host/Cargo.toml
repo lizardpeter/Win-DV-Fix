@@ -11,7 +11,7 @@ atomic_refcell = "0.1.14"
 thin-vec = "0.2.18"
 crc32fast = "1.5"
 orx-tree = "2.2.0"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2.2"
 
 [profile.release]

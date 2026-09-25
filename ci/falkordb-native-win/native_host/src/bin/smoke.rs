@@ -1,4 +1,4 @@
-use falkordb_native_host::{Engine, NativeGraph};
+use falkordb_native_host::{Engine, NativeGraph, range_index::NativeNumericRangeIndex};
 
 fn require_contains(haystack: &str, needle: &str, what: &str) -> Result<(), String> {
     if haystack.contains(needle) {
@@ -49,6 +49,33 @@ fn main() -> Result<(), String> {
     require_contains(&traversed.rows[0][0], "1", "relationship source")?;
     require_contains(&traversed.rows[0][1], "7", "relationship property")?;
     require_contains(&traversed.rows[0][2], "2", "relationship destination")?;
+
+    let mut native_idx = NativeNumericRangeIndex::new();
+    native_idx.upsert(101, [10.0])?;
+    native_idx.upsert(102, [20.0, 25.0])?;
+    native_idx.upsert(103, [-5.0])?;
+
+    let eq: Vec<u64> = native_idx.equal(20.0)?.collect();
+    if eq != vec![102] {
+        return Err(format!("native range equality mismatch: {eq:?}"));
+    }
+
+    let ranged: Vec<u64> = native_idx
+        .range(Some(0.0), Some(25.0), true, true)?
+        .collect();
+    if ranged != vec![101, 102, 102] {
+        return Err(format!("native range scan mismatch: {ranged:?}"));
+    }
+
+    let snapshot = native_idx.range(None, None, true, true)?;
+    native_idx.upsert(104, [30.0])?;
+    native_idx.remove_document(103);
+    let snapshot_docs: Vec<u64> = snapshot.collect();
+    if snapshot_docs != vec![103, 101, 102, 102] {
+        return Err(format!("native range snapshot mismatch: {snapshot_docs:?}"));
+    }
+
+    println!("NATIVE_RANGE_INDEX_SMOKE_PASS");
 
     println!("NATIVE_SMOKE_OK");
     Ok(())

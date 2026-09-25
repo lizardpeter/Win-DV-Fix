@@ -1,2 +1,2 @@
 Trigger temporary Webkinz harvest.
-Fast probe revision 3.
+Fast probe revision 4 with concurrency cancellation.

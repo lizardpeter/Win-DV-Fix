@@ -4,6 +4,7 @@ pub mod api;
 pub mod property_index;
 pub mod range_index;
 pub mod server;
+pub mod slowlog;
 pub mod wal;
 pub mod wire;
 
@@ -25,6 +26,7 @@ use graph::{
 };
 use orx_tree::Collection;
 use parking_lot::RwLock;
+use slowlog::{SlowLog, SlowLogEntry};
 use wal::Wal;
 use wire::WireValue;
 
@@ -143,6 +145,7 @@ pub struct NativeGraph {
     import_folder: String,
     result_set_size: i64,
     timeout_ms: Option<u64>,
+    slow_log: SlowLog,
 }
 
 impl NativeGraph {
@@ -154,6 +157,7 @@ impl NativeGraph {
             import_folder: String::new(),
             result_set_size: -1,
             timeout_ms: None,
+            slow_log: SlowLog::new(),
         }
     }
 
@@ -212,10 +216,12 @@ impl NativeGraph {
             import_folder: String::new(),
             result_set_size: -1,
             timeout_ms: None,
+            slow_log: SlowLog::new(),
         })
     }
 
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
+        let wall = Instant::now();
         let (snapshot, first_plan) = {
             let host_guard = self.inner.read();
             let snapshot = host_guard.read();
@@ -226,12 +232,18 @@ impl NativeGraph {
             (snapshot, plan)
         };
 
-        if plan_is_write(&first_plan) {
+        let result = if plan_is_write(&first_plan) {
             drop(snapshot);
             self.execute_write(cypher)
         } else {
             self.execute_read(snapshot, first_plan)
+        };
+
+        if result.is_ok() {
+            self.slow_log
+                .add("GRAPH.QUERY", cypher, wall.elapsed().as_secs_f64() * 1000.0);
         }
+        result
     }
 
     /// Execute a query under the GRAPH.RO_QUERY contract.
@@ -239,6 +251,7 @@ impl NativeGraph {
     /// Write plans are rejected before runtime execution, matching FalkorDB's
     /// read-only network command semantics.
     pub fn query_read_only(&self, cypher: &str) -> Result<QueryOutput, String> {
+        let wall = Instant::now();
         let (snapshot, plan) = {
             let host_guard = self.inner.read();
             let snapshot = host_guard.read();
@@ -253,7 +266,20 @@ impl NativeGraph {
             return Err("Read only query cannot perform writes".to_string());
         }
 
-        self.execute_read(snapshot, plan)
+        let result = self.execute_read(snapshot, plan);
+        if result.is_ok() {
+            self.slow_log
+                .add("GRAPH.RO_QUERY", cypher, wall.elapsed().as_secs_f64() * 1000.0);
+        }
+        result
+    }
+
+    pub fn slowlog_entries(&self) -> Vec<SlowLogEntry> {
+        self.slow_log.entries()
+    }
+
+    pub fn slowlog_reset(&self) {
+        self.slow_log.reset();
     }
 
     pub fn name(&self) -> &str {

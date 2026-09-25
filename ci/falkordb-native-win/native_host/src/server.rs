@@ -280,6 +280,10 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
 }
 
 fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, String> {
+    // Multiple transitive crates can enable more than one rustls provider.
+    // Select ring explicitly so TLS startup is deterministic instead of
+    // relying on rustls feature auto-detection.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut cert_reader = BufReader::new(
         File::open(&tls.cert_path)
             .map_err(|e| format!("open TLS certificate {}: {e}", tls.cert_path.display()))?,

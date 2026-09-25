@@ -17,7 +17,8 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, QueryOutput, native_config, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, QueryOutput, native_config, query_scheduler, udf_store,
+    wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -561,6 +562,8 @@ fn dispatch(
             }
         }
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
+        "GRAPH.INFO" => handle_graph_info(&args),
+        "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
         "GRAPH.UDF" => handle_graph_udf(&args, catalog),
@@ -674,6 +677,185 @@ fn handle_client(args: &[Vec<u8>], state: &mut ConnectionState) -> Resp {
     }
 }
 
+
+fn handle_graph_info(args: &[Vec<u8>]) -> Resp {
+    let all = args.len() == 1;
+    let mut running = all;
+    let mut waiting = all;
+    let mut object_pool = all;
+
+    for arg in args.iter().skip(1) {
+        match ascii_upper(arg).as_str() {
+            "RUNNINGQUERIES" => running = true,
+            "WAITINGQUERIES" => waiting = true,
+            "OBJECTPOOL" => object_pool = true,
+            _ => {}
+        }
+    }
+
+    if !(running || waiting || object_pool) {
+        return bulk("no section found");
+    }
+
+    let now = std::time::Instant::now();
+    let mut out = Vec::new();
+
+    if running {
+        out.push(bulk("# Running queries"));
+        out.push(Resp::Array(
+            query_scheduler::snapshot_running()
+                .into_iter()
+                .map(|q| {
+                    Resp::Array(vec![
+                        bulk("Received at"),
+                        Resp::Int(q.received_at),
+                        bulk("Graph name"),
+                        bulk(q.graph_name),
+                        bulk("Query"),
+                        bulk(q.query),
+                        bulk("Execution duration"),
+                        bulk(format!("{:.6}", now.duration_since(q.start).as_secs_f64() * 1000.0)),
+                        bulk("Replicated command"),
+                        Resp::Int(0),
+                    ])
+                })
+                .collect(),
+        ));
+    }
+
+    if waiting {
+        out.push(bulk("# Waiting queries"));
+        out.push(Resp::Array(
+            query_scheduler::snapshot_waiting()
+                .into_iter()
+                .map(|q| {
+                    Resp::Array(vec![
+                        bulk("Received at"),
+                        Resp::Int(q.received_at),
+                        bulk("Graph name"),
+                        bulk(q.graph_name),
+                        bulk("Query"),
+                        bulk(q.query),
+                        bulk("Wait duration"),
+                        bulk(format!("{:.6}", now.duration_since(q.enqueued).as_secs_f64() * 1000.0)),
+                    ])
+                })
+                .collect(),
+        ));
+    }
+
+    if object_pool {
+        let (count, avg) = graph::runtime::string_pool::global().stats();
+        let avg = if avg.fract() == 0.0 {
+            format!("{}", avg as i64)
+        } else {
+            format!("{avg}")
+        };
+        out.push(bulk("Object Pool"));
+        out.push(Resp::Array(vec![
+            Resp::Array(vec![bulk("Unique Objects in Pool"), Resp::Int(count as i64)]),
+            Resp::Array(vec![bulk("Average References per Object"), bulk(avg)]),
+        ]));
+    }
+
+    Resp::Array(out)
+}
+
+fn handle_graph_memory(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() != 3 && args.len() != 5 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.memory' command".to_string());
+    }
+    if ascii_upper(&args[1]) != "USAGE" {
+        return Resp::Error(
+            "ERR unknown subcommand. Try GRAPH.MEMORY USAGE <key> [SAMPLES <count>]"
+                .to_string(),
+        );
+    }
+
+    let name = match utf8(&args[2], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let graph = match catalog.get(name) {
+        Some(graph) => graph,
+        None => return Resp::Error("ERR Graph does not exist".to_string()),
+    };
+
+    let samples = if args.len() == 5 {
+        if ascii_upper(&args[3]) != "SAMPLES" {
+            return Resp::Error("ERR expected SAMPLES keyword".to_string());
+        }
+        match utf8(&args[4], "SAMPLES count").and_then(|v| {
+            v.parse::<usize>()
+                .map_err(|_| "ERR SAMPLES count must be a positive integer".to_string())
+        }) {
+            Ok(0) => {
+                return Resp::Error("ERR SAMPLES count must be a positive integer".to_string())
+            }
+            Ok(v) => v,
+            Err(err) => return Resp::Error(err),
+        }
+    } else {
+        100
+    };
+
+    const MB: usize = 1 << 20;
+    let report = graph.memory_usage_report(samples);
+    let label_matrices = (report.label_matrices_sz / MB) as i64;
+    let relation_matrices = (report.relation_matrices_sz / MB) as i64;
+    let node_block = (report.node_block_storage_sz / MB) as i64;
+    let unlabeled = (report.unlabeled_node_attr_sz / MB) as i64;
+    let edge_block = (report.edge_block_storage_sz / MB) as i64;
+    let indices = (report.indices_sz / MB) as i64;
+
+    let mut node_attrs = Vec::new();
+    let mut node_attr_sum = 0i64;
+    for (name, bytes) in report.node_attr_by_label {
+        let mb = (bytes / MB) as i64;
+        node_attr_sum += mb;
+        node_attrs.push(bulk(name.as_str()));
+        node_attrs.push(Resp::Int(mb));
+    }
+
+    let mut edge_attrs = Vec::new();
+    let mut edge_attr_sum = 0i64;
+    for (name, bytes) in report.edge_attr_by_type {
+        let mb = (bytes / MB) as i64;
+        edge_attr_sum += mb;
+        edge_attrs.push(bulk(name.as_str()));
+        edge_attrs.push(Resp::Int(mb));
+    }
+
+    let total = label_matrices
+        + relation_matrices
+        + node_block
+        + node_attr_sum
+        + unlabeled
+        + edge_block
+        + edge_attr_sum
+        + indices;
+
+    Resp::Array(vec![
+        bulk("total_graph_sz_mb"),
+        Resp::Int(total),
+        bulk("label_matrices_sz_mb"),
+        Resp::Int(label_matrices),
+        bulk("relation_matrices_sz_mb"),
+        Resp::Int(relation_matrices),
+        bulk("amortized_node_block_sz_mb"),
+        Resp::Int(node_block),
+        bulk("amortized_node_attributes_by_label_sz_mb"),
+        Resp::Array(node_attrs),
+        bulk("amortized_unlabeled_nodes_attributes_sz_mb"),
+        Resp::Int(unlabeled),
+        bulk("amortized_edge_block_sz_mb"),
+        Resp::Int(edge_block),
+        bulk("amortized_edge_attributes_by_type_sz_mb"),
+        Resp::Array(edge_attrs),
+        bulk("indices_sz_mb"),
+        Resp::Int(indices),
+    ])
+}
 
 fn handle_graph_constraint(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
     if args.len() < 9 {

@@ -607,6 +607,93 @@ impl NativeStore {
     }
 }
 
+fn numeric_equal(
+    index: &NumericPostings,
+    field: &str,
+    key: NumericKey,
+) -> BTreeSet<u64> {
+    index
+        .get(field)
+        .and_then(|values| values.get(&key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn numeric_range(
+    index: &NumericPostings,
+    field: &str,
+    min: Option<NumericKey>,
+    max: Option<NumericKey>,
+    include_min: bool,
+    include_max: bool,
+) -> BTreeSet<u64> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let Some(values) = index.get(field) else {
+        return BTreeSet::new();
+    };
+    let lower = match min {
+        Some(value) if include_min => Included(value),
+        Some(value) => Excluded(value),
+        None => Unbounded,
+    };
+    let upper = match max {
+        Some(value) if include_max => Included(value),
+        Some(value) => Excluded(value),
+        None => Unbounded,
+    };
+    if matches!((&lower, &upper), (Included(a) | Excluded(a), Included(b) | Excluded(b)) if a > b) {
+        return BTreeSet::new();
+    }
+
+    values
+        .range((lower, upper))
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect()
+}
+
+fn string_equal(
+    index: &StringPostings,
+    field: &str,
+    value: &str,
+) -> BTreeSet<u64> {
+    index
+        .get(field)
+        .and_then(|values| values.get(value))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn string_range(
+    index: &StringPostings,
+    field: &str,
+    min: Option<&str>,
+    max: Option<&str>,
+    include_min: bool,
+    include_max: bool,
+) -> BTreeSet<u64> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let Some(values) = index.get(field) else {
+        return BTreeSet::new();
+    };
+    let lower = match min {
+        Some(value) if include_min => Included(value.to_string()),
+        Some(value) => Excluded(value.to_string()),
+        None => Unbounded,
+    };
+    let upper = match max {
+        Some(value) if include_max => Included(value.to_string()),
+        Some(value) => Excluded(value.to_string()),
+        None => Unbounded,
+    };
+
+    values
+        .range((lower, upper))
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect()
+}
+
 fn insert_numeric_posting(
     index: &mut NumericPostings,
     field: &str,
@@ -775,78 +862,279 @@ impl Index {
     }
 
     pub fn add_document(&self, doc: &mut Document) {
-        self.store.write().docs.insert(
-            doc.id,
-            NativeDocument {
-                id: doc.id,
-                edge: doc.edge,
-                values: std::mem::take(&mut doc.values),
-            },
-        );
+        let document = NativeDocument {
+            id: doc.id,
+            edge: doc.edge,
+            values: std::mem::take(&mut doc.values),
+        };
+        self.store.write().upsert(document, &self.fields);
     }
 
     pub fn delete_document(&self, id: u64) {
-        self.store.write().docs.remove(&id);
+        self.store.write().remove(id, &self.fields);
     }
 
     pub fn delete_edge_document(&self, _src: u64, _dst: u64, edge_id: u64) {
-        self.store.write().docs.remove(&edge_id);
+        self.store.write().remove(edge_id, &self.fields);
     }
 
     pub fn query(&self, query: IndexQuery<Value>) -> IdIter {
         let store = self.store.read();
-        let mut ids: Vec<u64> = store
-            .docs
-            .values()
-            .filter(|doc| self.matches_query(doc, &query))
-            .map(|doc| doc.id)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        IndexResultsIter::from_vec(ids)
+        let ids = self.query_ids(&store, &query);
+        IndexResultsIter::from_vec(ids.into_iter().collect())
     }
 
     pub fn query_edges(&self, query: IndexQuery<Value>) -> EdgeTripleIter {
         let store = self.store.read();
-        let mut out: Vec<(u64, u64, u64)> = store
-            .docs
-            .values()
-            .filter(|doc| self.matches_query(doc, &query))
-            .filter_map(|doc| doc.edge)
+        let mut out: Vec<(u64, u64, u64)> = self
+            .query_ids(&store, &query)
+            .into_iter()
+            .filter_map(|id| store.docs.get(&id).and_then(|doc| doc.edge))
             .collect();
-        out.sort_unstable_by_key(|t| t.2);
+        out.sort_unstable_by_key(|triple| triple.2);
         EdgeTripleIter::from_vec(out)
     }
 
     pub fn fulltext_query(&self, query: &str) -> Result<ScoredIdIter, String> {
         let store = self.store.read();
-        let mut out: Vec<(u64, f64)> = store
-            .docs
-            .values()
-            .filter_map(|doc| {
-                let score = self.fulltext_score(doc, query);
-                (score > 0.0).then_some((doc.id, score))
-            })
-            .collect();
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal)
-            .then_with(|| a.0.cmp(&b.0)));
+        let scores = self.fulltext_scores(&store, query);
+        let mut out: Vec<(u64, f64)> = scores.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         Ok(IndexResultsIter::from_vec(out))
     }
 
     pub fn fulltext_query_edges(&self, query: &str) -> Result<ScoredEdgeTripleIter, String> {
         let store = self.store.read();
-        let mut out: Vec<(u64, u64, u64, f64)> = store
-            .docs
-            .values()
-            .filter_map(|doc| {
-                let edge = doc.edge?;
-                let score = self.fulltext_score(doc, query);
-                (score > 0.0).then_some((edge.0, edge.1, edge.2, score))
+        let mut out: Vec<(u64, u64, u64, f64)> = self
+            .fulltext_scores(&store, query)
+            .into_iter()
+            .filter_map(|(id, score)| {
+                store
+                    .docs
+                    .get(&id)
+                    .and_then(|doc| doc.edge)
+                    .map(|edge| (edge.0, edge.1, edge.2, score))
             })
             .collect();
-        out.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(CmpOrdering::Equal)
-            .then_with(|| a.2.cmp(&b.2)));
+        out.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3)
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| a.2.cmp(&b.2))
+        });
         Ok(ScoredEdgeTripleIter::from_vec(out))
+    }
+
+    fn query_ids(
+        &self,
+        store: &NativeStore,
+        query: &IndexQuery<Value>,
+    ) -> BTreeSet<u64> {
+        match query {
+            IndexQuery::Equal { key, value } => {
+                let Some(field) = self.range_field_name(key) else {
+                    return BTreeSet::new();
+                };
+                if let Value::String(value) = value {
+                    return string_equal(&store.scalar_string, &field, value.as_str());
+                }
+                if let Some(numeric) = NumericKey::from_value(value) {
+                    return numeric_equal(&store.scalar_numeric, &field, numeric);
+                }
+                if let Value::Point(point) = value {
+                    return store
+                        .points
+                        .get(&field)
+                        .into_iter()
+                        .flat_map(|points| points.iter())
+                        .filter_map(|(&id, actual)| (actual == point).then_some(id))
+                        .collect();
+                }
+                BTreeSet::new()
+            }
+            IndexQuery::Range {
+                key,
+                min,
+                max,
+                include_min,
+                include_max,
+            } => {
+                let Some(field) = self.range_field_name(key) else {
+                    return BTreeSet::new();
+                };
+                if min.as_ref().is_some_and(|v| matches!(v, Value::String(_)))
+                    || max.as_ref().is_some_and(|v| matches!(v, Value::String(_)))
+                {
+                    let min = match min {
+                        Some(Value::String(value)) => Some(value.as_str()),
+                        None => None,
+                        _ => return BTreeSet::new(),
+                    };
+                    let max = match max {
+                        Some(Value::String(value)) => Some(value.as_str()),
+                        None => None,
+                        _ => return BTreeSet::new(),
+                    };
+                    string_range(
+                        &store.scalar_string,
+                        &field,
+                        min,
+                        max,
+                        *include_min,
+                        *include_max,
+                    )
+                } else {
+                    let min = match min {
+                        Some(value) => match NumericKey::from_value(value) {
+                            Some(key) => Some(key),
+                            None => return BTreeSet::new(),
+                        },
+                        None => None,
+                    };
+                    let max = match max {
+                        Some(value) => match NumericKey::from_value(value) {
+                            Some(key) => Some(key),
+                            None => return BTreeSet::new(),
+                        },
+                        None => None,
+                    };
+                    numeric_range(
+                        &store.scalar_numeric,
+                        &field,
+                        min,
+                        max,
+                        *include_min,
+                        *include_max,
+                    )
+                }
+            }
+            IndexQuery::And(children) => {
+                let mut sets: Vec<BTreeSet<u64>> =
+                    children.iter().map(|child| self.query_ids(store, child)).collect();
+                sets.sort_by_key(BTreeSet::len);
+                let Some(mut out) = sets.into_iter().next() else {
+                    return BTreeSet::new();
+                };
+                for rhs in children
+                    .iter()
+                    .skip(1)
+                    .map(|child| self.query_ids(store, child))
+                {
+                    out.retain(|id| rhs.contains(id));
+                    if out.is_empty() {
+                        break;
+                    }
+                }
+                out
+            }
+            IndexQuery::Or(children) => {
+                let mut out = BTreeSet::new();
+                for child in children {
+                    out.extend(self.query_ids(store, child));
+                }
+                out
+            }
+            IndexQuery::Point { key, point, radius } => {
+                let Some(field) = self.range_field_name(key) else {
+                    return BTreeSet::new();
+                };
+                let (Value::Point(center), Some(radius)) = (point, numeric_value(radius)) else {
+                    return BTreeSet::new();
+                };
+                if radius < 0.0 || !radius.is_finite() {
+                    return BTreeSet::new();
+                }
+                store
+                    .points
+                    .get(&field)
+                    .into_iter()
+                    .flat_map(|points| points.iter())
+                    .filter_map(|(&id, actual)| {
+                        (center.distance(actual) <= radius).then_some(id)
+                    })
+                    .collect()
+            }
+            IndexQuery::InList {
+                key,
+                list: Value::List(items),
+            } => {
+                let mut out = BTreeSet::new();
+                for item in items.iter() {
+                    out.extend(self.query_ids(
+                        store,
+                        &IndexQuery::Equal {
+                            key: Arc::clone(key),
+                            value: item.clone(),
+                        },
+                    ));
+                }
+                out
+            }
+            IndexQuery::ArrayContains { key, value } => {
+                let Some(field) = self.range_field_name(key) else {
+                    return BTreeSet::new();
+                };
+                if let Value::String(value) = value {
+                    return string_equal(&store.array_string, &field, value.as_str());
+                }
+                if let Some(numeric) = NumericKey::from_value(value) {
+                    return numeric_equal(&store.array_numeric, &field, numeric);
+                }
+                BTreeSet::new()
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+
+    fn range_field_name(&self, attr: &Arc<String>) -> Option<String> {
+        self.fields
+            .get(attr)?
+            .iter()
+            .find(|field| field.ty == IndexType::Range)
+            .map(|field| field.name.to_string_lossy().into_owned())
+    }
+
+    fn fulltext_scores(
+        &self,
+        store: &NativeStore,
+        query: &str,
+    ) -> HashMap<u64, f64> {
+        let groups = query_groups(query, self.stopwords.as_ref());
+        let mut best = HashMap::<u64, f64>::new();
+
+        for group in groups {
+            let mut terms = group.into_iter();
+            let Some(first) = terms.next() else {
+                continue;
+            };
+            let mut group_scores = store.fulltext_term_scores(&first);
+
+            for term in terms {
+                let rhs = store.fulltext_term_scores(&term);
+                group_scores.retain(|id, score| {
+                    if let Some(rhs_score) = rhs.get(id) {
+                        *score += rhs_score;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if group_scores.is_empty() {
+                    break;
+                }
+            }
+
+            for (id, score) in group_scores {
+                best.entry(id)
+                    .and_modify(|current| *current = current.max(score))
+                    .or_insert(score);
+            }
+        }
+
+        best
     }
 
     pub fn vector_query(

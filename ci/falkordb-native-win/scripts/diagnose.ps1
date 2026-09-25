@@ -99,3 +99,80 @@ if ($IndexedText -notmatch "NATIVE_WAL_INDEX_RESTART_PASS") {
 Write-Host ""
 Write-Host "NATIVE_WINDOWS_FULL_STANDALONE_PASS"
 Write-Host "Logs: $Logs"
+
+
+Write-Host "=== Stage 7: official FalkorDB client network compatibility ==="
+cargo build --manifest-path $HostManifest --bin server --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "08_server_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Network server build failed with exit code $LASTEXITCODE" }
+
+$ServerExe = Join-Path $env:CARGO_TARGET_DIR "release\server.exe"
+if (-not (Test-Path $ServerExe)) {
+    throw "Network server executable was not produced: $ServerExe"
+}
+
+$NetworkData = Join-Path $WorkDir "network-data"
+Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
+$ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
+
+function Wait-NativeServer([int]$Port) {
+    for ($i = 0; $i -lt 100; $i++) {
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $async = $tcp.ConnectAsync("127.0.0.1", $Port)
+            if ($async.Wait(100) -and $tcp.Connected) {
+                $tcp.Dispose()
+                return
+            }
+            $tcp.Dispose()
+        } catch {}
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Native RESP server did not become ready on port $Port"
+}
+
+function Start-NativeServer([string]$Suffix) {
+    $out = Join-Path $Logs ("09_server_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("09_server_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        "--bind", "127.0.0.1:6391",
+        "--data-dir", $NetworkData,
+        "--password", "native-ci-secret"
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6391
+    return $proc
+}
+
+$Server = $null
+try {
+    $Server = Start-NativeServer "first"
+    python $ClientSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_official_client_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB client write/network phase failed with exit code $LASTEXITCODE"
+    }
+
+    # Hard-stop the server to prove committed graph state is recoverable solely
+    # from the native WAL on a fresh process.
+    Stop-Process -Id $Server.Id -Force
+    Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    $Server = $null
+    Start-Sleep -Milliseconds 300
+
+    $Server = Start-NativeServer "restart"
+    python $ClientSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_official_client_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB client restart/network phase failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    if ($null -ne $Server -and -not $Server.HasExited) {
+        Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host ""
+Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
+

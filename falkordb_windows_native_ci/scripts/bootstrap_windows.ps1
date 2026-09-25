@@ -68,6 +68,7 @@ if (-not $SkipNativeDeps) {
     if (Test-Path $GBBuild) { Remove-Item -Recurse -Force $GBBuild }
     cmake -S $GB -B $GBBuild @CMakeGeneratorArgs `
         -DCMAKE_BUILD_TYPE=Release `
+        -DSUITESPARSE_USE_FORTRAN=OFF `
         -DGRAPHBLAS_COMPACT=OFF `
         -DGRAPHBLAS_USE_JIT=OFF `
         -DGRAPHBLAS_USE_OPENMP=ON `
@@ -94,6 +95,7 @@ if (-not $SkipNativeDeps) {
     if (Test-Path $LABuild) { Remove-Item -Recurse -Force $LABuild }
     cmake -S $LA -B $LABuild @CMakeGeneratorArgs `
         -DCMAKE_BUILD_TYPE=Release `
+        -DSUITESPARSE_USE_FORTRAN=OFF `
         -DLAGRAPH_USE_OPENMP=ON `
         -DBUILD_TESTING=OFF `
         -DBUILD_SHARED_LIBS=OFF `

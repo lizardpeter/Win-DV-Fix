@@ -3,6 +3,7 @@
 pub mod property_index;
 pub mod range_index;
 pub mod wal;
+pub mod wire;
 
 use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc};
 
@@ -23,6 +24,7 @@ use graph::{
 use orx_tree::Collection;
 use parking_lot::RwLock;
 use wal::Wal;
+use wire::WireValue;
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
@@ -63,8 +65,12 @@ impl Drop for Engine {
 #[derive(Debug)]
 pub struct QueryOutput {
     pub columns: Vec<String>,
+    /// Human-readable rows retained for diagnostics and internal smoke tests.
     pub rows: Vec<Vec<String>>,
+    /// Typed values used by the RESP/FalkorDB network compatibility layer.
+    pub wire_rows: Vec<Vec<WireValue>>,
     pub stats: OutputStats,
+    pub graph_version: u64,
 }
 
 #[derive(Debug, Default)]
@@ -213,6 +219,32 @@ impl NativeGraph {
         } else {
             self.execute_read(snapshot, first_plan)
         }
+    }
+
+    /// Execute a query under the GRAPH.RO_QUERY contract.
+    ///
+    /// Write plans are rejected before runtime execution, matching FalkorDB's
+    /// read-only network command semantics.
+    pub fn query_read_only(&self, cypher: &str) -> Result<QueryOutput, String> {
+        let (snapshot, plan) = {
+            let host_guard = self.inner.read();
+            let snapshot = host_guard.read();
+            let plan = {
+                let graph_ref = snapshot.borrow();
+                graph_ref.get_plan(cypher)?
+            };
+            (snapshot, plan)
+        };
+
+        if plan_is_write(&plan) {
+            return Err("Read only query cannot perform writes".to_string());
+        }
+
+        self.execute_read(snapshot, plan)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     fn execute_read(
@@ -369,25 +401,35 @@ fn capture_output(runtime: &Runtime<'_>, result: &ResultSummary<'_>) -> QueryOut
         .map(ToString::to_string)
         .collect();
 
+    let graph_version = runtime.g.borrow().version;
     let mut rows = Vec::new();
+    let mut wire_rows = Vec::new();
+
     for batch in &result.result {
         for row_idx in batch.active_indices() {
-            let row = runtime
-                .return_names
-                .iter()
-                .map(|var| {
-                    batch
-                        .value_at(var.id, row_idx)
-                        .map_or_else(|| "Null".to_string(), |v| format!("{v:?}"))
-                })
-                .collect();
+            let mut row = Vec::with_capacity(runtime.return_names.len());
+            let mut wire_row = Vec::with_capacity(runtime.return_names.len());
+
+            for var in &runtime.return_names {
+                if let Some(value) = batch.value_at(var.id, row_idx) {
+                    row.push(format!("{value:?}"));
+                    wire_row.push(WireValue::capture(runtime, &value));
+                } else {
+                    row.push("Null".to_string());
+                    wire_row.push(WireValue::Null);
+                }
+            }
+
             rows.push(row);
+            wire_rows.push(wire_row);
         }
     }
 
     QueryOutput {
         columns,
         rows,
+        wire_rows,
         stats: OutputStats::from(&result.stats),
+        graph_version,
     }
 }

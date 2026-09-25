@@ -67,7 +67,7 @@ jobs:
       - name: Install official FalkorDB Python client
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check --upgrade falkordb
+          python -m pip install --disable-pip-version-check --upgrade falkordb trustme
 
       - name: Compile, link, and run smoke test
         shell: pwsh

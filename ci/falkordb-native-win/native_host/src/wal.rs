@@ -91,6 +91,56 @@ impl Wal {
         self.state.lock().last_error.take().map_or(Ok(()), Err)
     }
 
+
+    pub fn records(&self) -> Result<Vec<WalRecord>, String> {
+        let _guard = self.state.lock();
+        read_records_and_repair_tail(&self.path)
+    }
+
+    pub fn append_payload(
+        &self,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<(), String> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock();
+        let sequence = state.next_sequence;
+        let start = state
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| format!("WAL seek failed: {e}"))?;
+
+        let crc = frame_crc(sequence, key, payload);
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        header.extend_from_slice(&sequence.to_le_bytes());
+        header.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        header.extend_from_slice(&crc.to_le_bytes());
+
+        let result = (|| -> std::io::Result<()> {
+            state.file.write_all(&header)?;
+            state.file.write_all(key)?;
+            state.file.write_all(payload)?;
+            state.file.flush()?;
+            state.file.sync_data()?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = state.file.set_len(start);
+            let _ = state.file.seek(SeekFrom::End(0));
+            return Err(format!("WAL append failed at sequence {sequence}: {e}"));
+        }
+
+        state.next_sequence = sequence.saturating_add(1);
+        Ok(())
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path

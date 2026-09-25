@@ -5,9 +5,11 @@
 Standalone native Windows FalkorDB-derived engine: **WORKING**
 
 Verified Windows CI run:
-- run `36163782345`
-- commit `d99c2761f6b9bbb6952ca54cf50732952587bb47`
-- success marker `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
+- run `36190878880`
+- commit `3989ee1c8ec252bacd7e24fb51416cf7498c1874`
+- standalone marker `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
+- network marker `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
+- official client write/restart markers passed
 
 ## Completed
 
@@ -36,6 +38,14 @@ Verified Windows CI run:
 - [x] Range-index query after restart
 - [x] Full-text query after restart
 - [x] Authoritative Windows integration CI
+- [x] RESP/TCP network server
+- [x] Redis-compatible password authentication
+- [x] Multi-graph network catalog
+- [x] Official `falkordb-py` client connectivity
+- [x] Compact typed Node/Edge wire responses
+- [x] Remote range/full-text index usage
+- [x] Server-process restart + official-client recovery
+- [x] Recovery for indexes created after existing data
 
 ## Not required in standalone mode
 
@@ -57,6 +67,7 @@ Verified Windows CI run:
 - [ ] vector index acceleration beyond correctness-first backend
 - [ ] full-text ranking/tokenization parity tuning if exact upstream behavior is required
 - [ ] installer/service/library packaging
+- [ ] optional direct TLS listener (use private network/VPN meanwhile)
 - [ ] CAS artifact store
 - [ ] universal reversal graph schema/migrations
 - [ ] benchmark native backend vs original Redis/RediSearch deployment
@@ -82,4 +93,6 @@ runner:
 14. verify full-text query
 15. emit `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
 
-Run `36163782345` satisfied that definition.
+Run `36190878880` satisfies the standalone definition and additionally proves
+authenticated TCP/RESP access with the official FalkorDB Python client before
+and after a server-process restart.

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod property_index;
+pub mod query_scheduler;
 pub mod range_index;
 pub mod server;
 pub mod native_config;
@@ -34,6 +35,7 @@ use graph::{
 };
 use orx_tree::{Collection, Dfs, NodeRef};
 use parking_lot::RwLock;
+use query_scheduler::QueryPermit;
 use slowlog::{SlowLog, SlowLogEntry};
 use wal::Wal;
 use wire::WireValue;
@@ -288,6 +290,7 @@ impl NativeGraph {
         cypher: &str,
         per_query_timeout: Option<i64>,
     ) -> Result<QueryOutput, String> {
+        let _permit = QueryPermit::acquire(&self.name, cypher)?;
         let wall = Instant::now();
         let (snapshot, first_plan) = {
             let host_guard = self.inner.read();
@@ -328,6 +331,7 @@ impl NativeGraph {
         cypher: &str,
         per_query_timeout: Option<i64>,
     ) -> Result<QueryOutput, String> {
+        let _permit = QueryPermit::acquire(&self.name, cypher)?;
         let wall = Instant::now();
         let (snapshot, plan) = {
             let host_guard = self.inner.read();
@@ -533,6 +537,7 @@ impl NativeGraph {
     }
 
     pub fn profile(&self, cypher: &str) -> Result<Vec<String>, String> {
+        let _permit = QueryPermit::acquire(&self.name, cypher)?;
         let wall = Instant::now();
         let (snapshot, first_plan) = {
             let host_guard = self.inner.read();

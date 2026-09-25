@@ -25,11 +25,11 @@ $HostManifest = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 
 Write-Host "=== Fast network stage: build native RESP server ==="
-cargo build --manifest-path $HostManifest --bin server --release 2>&1 |
+cargo build --manifest-path $HostManifest --bin server 2>&1 |
     Tee-Object -FilePath (Join-Path $Logs "network_server_build.txt")
 if ($LASTEXITCODE -ne 0) { throw "Network server build failed with exit code $LASTEXITCODE" }
 
-$ServerExe = Join-Path $env:CARGO_TARGET_DIR "release\server.exe"
+$ServerExe = Join-Path $env:CARGO_TARGET_DIR "debug\server.exe"
 if (-not (Test-Path $ServerExe)) {
     throw "Network server executable was not produced: $ServerExe"
 }

@@ -1,14 +1,18 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
 };
 
 use parking_lot::RwLock;
+use rustls::{
+    ServerConfig as TlsServerConfig, ServerConnection, StreamOwned,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 
 use crate::{NativeGraph, OutputStats, QueryOutput, wire::WireValue};
 
@@ -19,6 +23,9 @@ pub struct ServerConfig {
     pub username: String,
     pub password: Option<String>,
     pub allow_unauthenticated_remote: bool,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub allow_insecure_remote: bool,
 }
 
 impl Default for ServerConfig {
@@ -29,21 +36,39 @@ impl Default for ServerConfig {
             username: "default".to_string(),
             password: None,
             allow_unauthenticated_remote: false,
+            tls_cert: None,
+            tls_key: None,
+            allow_insecure_remote: false,
         }
     }
 }
 
 impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err("TLS requires both a certificate and private key".to_string());
+        }
+
         if self.password.is_none()
             && !self.allow_unauthenticated_remote
             && !self.bind.ip().is_loopback()
         {
             return Err(
-                "refusing unauthenticated non-loopback bind; configure --password or                  --allow-unauthenticated-remote"
+                "refusing unauthenticated non-loopback bind; configure --password or --allow-unauthenticated-remote"
                     .to_string(),
             );
         }
+
+        if !self.bind.ip().is_loopback()
+            && self.tls_cert.is_none()
+            && !self.allow_insecure_remote
+        {
+            return Err(
+                "refusing cleartext non-loopback bind; configure --tls-cert/--tls-key or --allow-insecure-remote"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 }
@@ -183,14 +208,16 @@ fn hex(b: u8) -> Option<u8> {
 
 pub fn serve(config: ServerConfig) -> Result<(), String> {
     config.validate()?;
+    let tls = load_tls_config(&config)?;
     let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
     let listener = TcpListener::bind(config.bind)
         .map_err(|e| format!("bind {}: {e}", config.bind))?;
 
     eprintln!(
-        "FalkorDB native RESP server listening on {} (data: {})",
+        "FalkorDB native RESP server listening on {} (data: {}, tls: {})",
         config.bind,
-        config.data_dir.display()
+        config.data_dir.display(),
+        tls.is_some()
     );
 
     let config = Arc::new(config);
@@ -199,8 +226,22 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
             Ok(stream) => {
                 let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
+                let tls = tls.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &catalog, &config) {
+                    let result = if let Some(tls_config) = tls {
+                        match ServerConnection::new(tls_config) {
+                            Ok(conn) => {
+                                let mut stream = StreamOwned::new(conn, stream);
+                                handle_stream(&mut stream, &catalog, &config)
+                            }
+                            Err(err) => Err(format!("create TLS connection: {err}")),
+                        }
+                    } else {
+                        let mut stream = stream;
+                        handle_stream(&mut stream, &catalog, &config)
+                    };
+
+                    if let Err(err) = result {
                         eprintln!("client connection ended with error: {err}");
                     }
                 });
@@ -209,6 +250,31 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn load_tls_config(config: &ServerConfig) -> Result<Option<Arc<TlsServerConfig>>, String> {
+    let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) else {
+        return Ok(None);
+    };
+
+    let cert_iter = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| format!("read TLS certificate {}: {e}", cert_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = cert_iter
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse TLS certificate {}: {e}", cert_path.display()))?;
+    if certs.is_empty() {
+        return Err(format!("TLS certificate file contains no certificates: {}", cert_path.display()));
+    }
+
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| format!("read TLS private key {}: {e}", key_path.display()))?;
+
+    let tls = TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("configure TLS certificate/key: {e}"))?;
+
+    Ok(Some(Arc::new(tls)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,21 +289,14 @@ struct ConnectionState {
     client_name: Option<String>,
 }
 
-fn handle_connection(
-    stream: TcpStream,
+fn handle_stream<S>(
+    stream: &mut S,
     catalog: &GraphCatalog,
     config: &ServerConfig,
-) -> Result<(), String> {
-    let peer = stream.peer_addr().ok();
-    stream
-        .set_nodelay(true)
-        .map_err(|e| format!("set TCP_NODELAY: {e}"))?;
-    let reader_stream = stream
-        .try_clone()
-        .map_err(|e| format!("clone client socket: {e}"))?;
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = stream;
-
+) -> Result<(), String>
+where
+    S: Read + Write,
+{
     let mut state = ConnectionState {
         authenticated: config.password.is_none(),
         protocol: RespProtocol::Resp2,
@@ -245,15 +304,15 @@ fn handle_connection(
     };
 
     loop {
-        let command = match read_command(&mut reader)? {
+        let command = match read_command(stream)? {
             Some(command) => command,
             None => return Ok(()),
         };
 
         let response = dispatch(command, catalog, config, &mut state);
-        write_resp(&mut writer, &response, state.protocol)
-            .map_err(|e| format!("write response to {peer:?}: {e}"))?;
-        writer.flush().map_err(|e| format!("flush response: {e}"))?;
+        write_resp(stream, &response, state.protocol)
+            .map_err(|e| format!("write response: {e}"))?;
+        stream.flush().map_err(|e| format!("flush response: {e}"))?;
     }
 }
 
@@ -773,15 +832,10 @@ fn sanitize_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn read_command(reader: &mut BufReader<TcpStream>) -> Result<Option<Vec<Vec<u8>>>, String> {
-    let mut first = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut first)
-        .map_err(|e| format!("read command: {e}"))?;
-    if read == 0 {
+fn read_command(reader: &mut impl Read) -> Result<Option<Vec<Vec<u8>>>, String> {
+    let Some(first) = read_line(reader)? else {
         return Ok(None);
-    }
-    trim_crlf(&mut first);
+    };
 
     if first.first() == Some(&b'*') {
         let count = parse_len(&first[1..], "array length")?;
@@ -792,7 +846,6 @@ fn read_command(reader: &mut BufReader<TcpStream>) -> Result<Option<Vec<Vec<u8>>
         return Ok(Some(args));
     }
 
-    // Redis inline command compatibility, useful for manual diagnostics.
     let line = std::str::from_utf8(&first)
         .map_err(|_| "inline command is not UTF-8".to_string())?;
     Ok(Some(
@@ -802,15 +855,27 @@ fn read_command(reader: &mut BufReader<TcpStream>) -> Result<Option<Vec<Vec<u8>>
     ))
 }
 
-fn read_bulkish(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
-    let mut header = Vec::new();
-    reader
-        .read_until(b'\n', &mut header)
-        .map_err(|e| format!("read RESP item: {e}"))?;
-    if header.is_empty() {
-        return Err("unexpected EOF inside command".to_string());
+fn read_line(reader: &mut impl Read) -> Result<Option<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) if out.is_empty() => return Ok(None),
+            Ok(0) => return Err("unexpected EOF inside RESP line".to_string()),
+            Ok(_) => {
+                out.push(byte[0]);
+                if byte[0] == b'\n' {
+                    trim_crlf(&mut out);
+                    return Ok(Some(out));
+                }
+            }
+            Err(err) => return Err(format!("read RESP line: {err}")),
+        }
     }
-    trim_crlf(&mut header);
+}
+
+fn read_bulkish(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    let header = read_line(reader)?.ok_or_else(|| "unexpected EOF inside command".to_string())?;
 
     match header.first().copied() {
         Some(b'$') => {
@@ -830,7 +895,10 @@ fn read_bulkish(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
         }
         Some(b'+') => Ok(header[1..].to_vec()),
         Some(b':') => Ok(header[1..].to_vec()),
-        _ => Err(format!("unsupported RESP request item: {}", String::from_utf8_lossy(&header))),
+        _ => Err(format!(
+            "unsupported RESP request item: {}",
+            String::from_utf8_lossy(&header)
+        )),
     }
 }
 

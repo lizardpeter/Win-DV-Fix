@@ -27,7 +27,7 @@ pub fn restore(data_dir: &Path) -> Result<(), String> {
     let source = if primary.exists() {
         Some(primary)
     } else if backup.exists() {
-        Some(backup)
+        Some(backup.clone())
     } else {
         None
     };

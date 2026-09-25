@@ -149,6 +149,35 @@ impl GraphCatalog {
         names
     }
 
+    pub fn copy(&self, source: &str, destination: &str) -> Result<(), String> {
+        if source == destination {
+            return Err("destination key already exists".to_string());
+        }
+
+        let source_graph = {
+            let graphs = self.graphs.read();
+            if graphs.contains_key(destination) || self.wal_path(destination).exists() {
+                return Err("destination key already exists".to_string());
+            }
+            graphs
+                .get(source)
+                .cloned()
+                .ok_or_else(|| "Invalid graph operation on empty key".to_string())?
+        };
+
+        let destination_graph = Arc::new(
+            source_graph.copy_persistent(destination, self.wal_path(destination))?,
+        );
+
+        let mut graphs = self.graphs.write();
+        if graphs.contains_key(destination) {
+            return Err("destination key already exists".to_string());
+        }
+        graphs.insert(destination.to_string(), destination_graph);
+        Ok(())
+    }
+
+
     pub fn contains(&self, name: &str) -> bool {
         self.graphs.read().contains_key(name)
     }
@@ -429,6 +458,23 @@ fn dispatch(
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
         "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
         "GRAPH.PROFILE" => handle_graph_profile(&args, catalog),
+        "GRAPH.COPY" => {
+            if args.len() != 3 {
+                return Resp::Error("ERR wrong number of arguments for 'graph.copy' command".to_string());
+            }
+            let source = match utf8(&args[1], "source graph name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            let destination = match utf8(&args[2], "destination graph name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            match catalog.copy(source, destination) {
+                Ok(()) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
         "GRAPH.DELETE" => {
             if let Err(err) = require_arity(&args, 2) {
                 return Resp::Error(err);

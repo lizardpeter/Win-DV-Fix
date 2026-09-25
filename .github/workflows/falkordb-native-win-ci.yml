@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - chatgpt/falkordb-native-win-ci
+      - chatgpt/falkordb-native-parity-next
     paths:
       - 'ci/falkordb-native-win/**'
       - '.github/workflows/falkordb-native-win-ci.yml'

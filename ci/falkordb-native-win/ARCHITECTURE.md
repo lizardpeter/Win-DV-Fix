@@ -3,10 +3,14 @@
 ## Standalone stack
 
 ```text
-Reverse-engineering applications
+FalkorDB/Redis-compatible clients
+        |
+        | RESP/TCP + AUTH
+        v
+Native Network Server / Graph Catalog
         |
         v
-FalkorDB Native Host (Rust)
+Reverse-engineering applications / Native Host (Rust)
   - graph catalog/lifecycle
   - query entrypoint
   - writer escalation / MVCC integration
@@ -90,3 +94,31 @@ the services required by the graph engine instead of merely removing them.
 The graph engine itself, including Cypher, planner/runtime, MVCC, effects, and
 GraphBLAS integration, is directly hosted in Rust and has been exercised on a
 native Windows runner.
+
+## Network compatibility
+
+The native server speaks the Redis RESP command transport used by FalkorDB
+clients. Graph names are routed by the native catalog to independently durable
+`NativeGraph` instances.
+
+The verified official-client path is:
+
+```text
+falkordb-py
+   -> TCP / RESP2
+   -> AUTH
+   -> GRAPH.QUERY / GRAPH.RO_QUERY
+   -> typed compact FalkorDB response
+   -> native graph engine
+   -> WAL-before-MVCC publication
+```
+
+On startup the catalog discovers graph WAL files, replays deterministic effects,
+publishes the recovered MVCC graph, and waits for replay-created index
+population workers to reach an operational state before accepting the recovered
+graph as ready. This covers the important ordering case where graph data existed
+before its CREATE INDEX DDL.
+
+The listener refuses an unauthenticated non-loopback bind unless explicitly
+overridden. Password authentication is wire-compatible but not encryption;
+public-Internet deployment should add VPN/private networking or TLS termination.

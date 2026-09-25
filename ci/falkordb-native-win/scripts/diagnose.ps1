@@ -115,6 +115,15 @@ $NetworkData = Join-Path $WorkDir "network-data"
 Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
+$TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
+$TlsDir = Join-Path $WorkDir "tls-fixtures"
+Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
+python $TlsGenerator $TlsDir 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "09_tls_fixture_generation.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "TLS fixture generation failed with exit code $LASTEXITCODE"
+}
+$env:FALKORDB_TEST_TLS_DIR = $TlsDir
 
 function Wait-NativeServer([int]$Port) {
     for ($i = 0; $i -lt 100; $i++) {
@@ -138,7 +147,10 @@ function Start-NativeServer([string]$Suffix) {
     $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
         "--bind", "127.0.0.1:6391",
         "--data-dir", $NetworkData,
-        "--password", "native-ci-secret"
+        "--password", "native-ci-secret",
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
     ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     Wait-NativeServer 6391
     return $proc
@@ -151,6 +163,10 @@ try {
         Tee-Object -FilePath (Join-Path $Logs "10_official_client_write.txt")
     if ($LASTEXITCODE -ne 0) {
         throw "Official FalkorDB client write/network phase failed with exit code $LASTEXITCODE"
+    }
+    $WriteText = (Get-Content (Join-Path $Logs "10_official_client_write.txt") -Raw)
+    if ($WriteText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS") {
+        throw "Official FalkorDB client did not prove mTLS write connectivity"
     }
 
     # Hard-stop the server to prove committed graph state is recoverable solely
@@ -166,6 +182,10 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Official FalkorDB client restart/network phase failed with exit code $LASTEXITCODE"
     }
+    $RestartText = (Get-Content (Join-Path $Logs "11_official_client_restart.txt") -Raw)
+    if ($RestartText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS") {
+        throw "Official FalkorDB client did not prove mTLS restart connectivity"
+    }
 } finally {
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
@@ -175,4 +195,5 @@ try {
 
 Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
+Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 

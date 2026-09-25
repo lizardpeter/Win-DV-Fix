@@ -125,7 +125,7 @@ fn create_archive_alias(src: &std::path::Path, dst: &std::path::Path) -> std::io
     } else {
         #[cfg(windows)]
         {
-            let name = std::env::var_os("OPENMP_LIB_NAME").unwrap_or_else(|_| "vcomp".to_string());
+            let name = std::env::var("OPENMP_LIB_NAME").unwrap_or_else(|_| "vcomp".to_string());
             println!("cargo:rerun-if-env-changed=OPENMP_LIB_NAME");
             println!("cargo:rustc-link-lib={name}");
         }

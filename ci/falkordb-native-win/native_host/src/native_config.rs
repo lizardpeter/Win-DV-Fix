@@ -103,6 +103,10 @@ pub fn runtime_config() -> RuntimeConfig {
     }
 }
 
+pub fn max_queued_queries() -> usize {
+    state().read().max_queued_queries.min(usize::MAX as u64) as usize
+}
+
 pub fn effective_timeout(
     per_query_timeout: Option<i64>,
     is_write: bool,

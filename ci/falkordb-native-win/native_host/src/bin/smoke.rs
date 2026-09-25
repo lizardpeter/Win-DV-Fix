@@ -1,4 +1,6 @@
-use falkordb_native_host::{Engine, NativeGraph, range_index::{NativeNumericRangeIndex, NativeStringRangeIndex}};
+use falkordb_native_host::{Engine, NativeGraph, property_index::NativePropertyIndex, range_index::{NativeNumericRangeIndex, NativeStringRangeIndex}};
+use graph::{index::IndexQuery, runtime::value::{Point, Value}};
+use std::sync::Arc;
 
 fn require_contains(haystack: &str, needle: &str, what: &str) -> Result<(), String> {
     if haystack.contains(needle) {
@@ -91,6 +93,84 @@ fn main() -> Result<(), String> {
     }
 
     println!("NATIVE_STRING_RANGE_INDEX_SMOKE_PASS");
+
+    let mut property_idx = NativePropertyIndex::new();
+    let k_address = Arc::new("address".to_string());
+    let k_name = Arc::new("name".to_string());
+    let k_tags = Arc::new("tags".to_string());
+    let k_where = Arc::new("where".to_string());
+
+    property_idx.upsert(301, Arc::clone(&k_address), &Value::Int(100))?;
+    property_idx.upsert(302, Arc::clone(&k_address), &Value::Int(200))?;
+    property_idx.upsert(303, Arc::clone(&k_address), &Value::Int(300))?;
+    property_idx.upsert(
+        301,
+        Arc::clone(&k_name),
+        &Value::String(Arc::new("alpha".to_string())),
+    )?;
+    property_idx.upsert(
+        302,
+        Arc::clone(&k_name),
+        &Value::String(Arc::new("beta".to_string())),
+    )?;
+
+    let mut in_items = thin_vec::ThinVec::new();
+    in_items.push(Value::String(Arc::new("beta".to_string())));
+    let ast = IndexQuery::And(vec![
+        IndexQuery::Range {
+            key: Arc::clone(&k_address),
+            min: Some(Value::Int(100)),
+            max: Some(Value::Int(250)),
+            include_min: true,
+            include_max: true,
+        },
+        IndexQuery::InList {
+            key: Arc::clone(&k_name),
+            list: Value::List(Arc::new(in_items)),
+        },
+    ]);
+    let ast_hits = property_idx.query(ast)?.collect::<Vec<_>>();
+    if ast_hits != vec![302] {
+        return Err(format!("native IndexQuery AST mismatch: {ast_hits:?}"));
+    }
+
+    let mut tag_items = thin_vec::ThinVec::new();
+    tag_items.push(Value::String(Arc::new("shader".to_string())));
+    tag_items.push(Value::Int(42));
+    property_idx.upsert(307, Arc::clone(&k_tags), &Value::List(Arc::new(tag_items)))?;
+    let contains_hits = property_idx
+        .query(IndexQuery::ArrayContains {
+            key: Arc::clone(&k_tags),
+            value: Value::String(Arc::new("shader".to_string())),
+        })?
+        .collect::<Vec<_>>();
+    if contains_hits != vec![307] {
+        return Err(format!("native array contains mismatch: {contains_hits:?}"));
+    }
+
+    property_idx.upsert(
+        309,
+        Arc::clone(&k_where),
+        &Value::Point(Point::new(40.0, -73.0)),
+    )?;
+    property_idx.upsert(
+        310,
+        Arc::clone(&k_where),
+        &Value::Point(Point::new(41.0, -73.0)),
+    )?;
+    let geo_hits = property_idx
+        .query(IndexQuery::Point {
+            key: Arc::clone(&k_where),
+            point: Value::Point(Point::new(40.001, -73.0)),
+            radius: Value::Float(1000.0),
+        })?
+        .collect::<Vec<_>>();
+    if geo_hits != vec![309] {
+        return Err(format!("native geo query mismatch: {geo_hits:?}"));
+    }
+
+    println!("NATIVE_INDEXQUERY_BACKEND_SMOKE_PASS");
+
 
     println!("NATIVE_RANGE_INDEX_SMOKE_PASS");
 

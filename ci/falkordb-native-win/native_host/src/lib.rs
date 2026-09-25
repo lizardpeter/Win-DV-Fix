@@ -1,5 +1,6 @@
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
+pub mod api;
 pub mod property_index;
 pub mod range_index;
 pub mod server;

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
     sync::Arc,
     thread,
 };
@@ -404,10 +404,13 @@ fn run_query(
         return error_response(400, "invalid_query", "Cypher query must not be empty");
     }
 
-    let read_only = request.read_only || scope == AuthScope::ReadOnly;
-    if !read_only && scope != AuthScope::ReadWrite {
+    // Authorize the caller's requested operation before graph lookup. A
+    // read-only credential must never be able to probe graph existence by
+    // submitting a write and observing 404 vs 403 behavior.
+    if !request.read_only && scope != AuthScope::ReadWrite {
         return error_response(403, "read_only_token", "write scope required");
     }
+    let read_only = request.read_only || scope == AuthScope::ReadOnly;
 
     let graph = if read_only {
         match catalog.get(&request.graph) {

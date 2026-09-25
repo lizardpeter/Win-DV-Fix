@@ -13,6 +13,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     OutputStats, QueryOutput,
+    oauth::OAuthVerifier,
     server::{GraphCatalog, TlsConfig, load_tls_config},
     wire::WireValue,
 };
@@ -25,6 +26,7 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     pub read_write_token: Option<String>,
     pub read_only_token: Option<String>,
+    pub oauth: Option<Arc<OAuthVerifier>>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -36,6 +38,7 @@ impl Default for ApiConfig {
             bind: "127.0.0.1:8443".parse().expect("valid default API socket"),
             read_write_token: None,
             read_only_token: None,
+            oauth: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,
@@ -57,6 +60,7 @@ impl ApiConfig {
         if remote
             && self.read_write_token.is_none()
             && self.read_only_token.is_none()
+            && self.oauth.is_none()
             && !self.allow_unauthenticated_remote
         {
             return Err(
@@ -873,7 +877,10 @@ fn empty_response(status: u16) -> HttpResponse {
 }
 
 fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScope {
-    if config.read_write_token.is_none() && config.read_only_token.is_none() {
+    if config.read_write_token.is_none()
+        && config.read_only_token.is_none()
+        && config.oauth.is_none()
+    {
         return AuthScope::ReadWrite;
     }
 
@@ -897,6 +904,17 @@ fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScop
         .is_some_and(|expected| constant_time_eq(expected, token))
     {
         return AuthScope::ReadOnly;
+    }
+
+    if let Some(oauth) = &config.oauth {
+        if let Ok(principal) = oauth.verify(token) {
+            if principal.has_scope(&oauth.config().write_scope) {
+                return AuthScope::ReadWrite;
+            }
+            if principal.has_scope(&oauth.config().read_scope) {
+                return AuthScope::ReadOnly;
+            }
+        }
     }
 
     AuthScope::None

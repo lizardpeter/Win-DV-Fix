@@ -74,6 +74,28 @@ if (($SmokeOutput -join "`n") -notmatch "NATIVE_SMOKE_OK") {
     throw "Native smoke executable did not emit NATIVE_SMOKE_OK"
 }
 
+Write-Host "=== Stage 6: Cypher-visible native index + WAL restart smoke ==="
+cargo build --manifest-path $HostManifest --bin indexed_smoke --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "06_indexed_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Indexed smoke build failed with exit code $LASTEXITCODE" }
+
+$IndexedSmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\indexed_smoke.exe"
+if (-not (Test-Path $IndexedSmokeExe)) {
+    throw "Indexed smoke executable was not produced: $IndexedSmokeExe"
+}
+$IndexedOutput = & $IndexedSmokeExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_indexed_smoke_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Indexed smoke executable failed with exit code $LASTEXITCODE"
+}
+$IndexedText = $IndexedOutput -join "`n"
+if ($IndexedText -notmatch "NATIVE_CYPHER_INDEX_INTEGRATION_PASS") {
+    throw "Indexed smoke did not emit NATIVE_CYPHER_INDEX_INTEGRATION_PASS"
+}
+if ($IndexedText -notmatch "NATIVE_WAL_INDEX_RESTART_PASS") {
+    throw "Indexed smoke did not emit NATIVE_WAL_INDEX_RESTART_PASS"
+}
+
 Write-Host ""
-Write-Host "NATIVE_WINDOWS_CORE_SMOKE_PASS"
+Write-Host "NATIVE_WINDOWS_FULL_STANDALONE_PASS"
 Write-Host "Logs: $Logs"

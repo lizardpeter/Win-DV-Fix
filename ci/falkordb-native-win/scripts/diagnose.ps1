@@ -95,6 +95,9 @@ if ($IndexedText -notmatch "NATIVE_CYPHER_INDEX_INTEGRATION_PASS") {
 if ($IndexedText -notmatch "NATIVE_WAL_INDEX_RESTART_PASS") {
     throw "Indexed smoke did not emit NATIVE_WAL_INDEX_RESTART_PASS"
 }
+if ($IndexedText -notmatch "NATIVE_CHECKPOINT_WAL_ROTATION_PASS") {
+    throw "Indexed smoke did not emit NATIVE_CHECKPOINT_WAL_ROTATION_PASS"
+}
 
 Write-Host ""
 Write-Host "NATIVE_WINDOWS_FULL_STANDALONE_PASS"

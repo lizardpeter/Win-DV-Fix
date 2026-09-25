@@ -116,6 +116,7 @@ Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
+$ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -184,6 +185,16 @@ try {
         throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
     }
 
+    python $ParitySmoke 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_official_client_parity.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB parity gate failed with exit code $LASTEXITCODE"
+    }
+    $ParityText = (Get-Content (Join-Path $Logs "10_official_client_parity.txt") -Raw)
+    if ($ParityText -notmatch "OFFICIAL_FALKORDB_PARITY_GATE_PASS") {
+        throw "Official FalkorDB parity gate did not emit success marker"
+    }
+
     # Hard-stop the server to prove committed graph state is recoverable solely
     # from the native WAL on a fresh process.
     Stop-Process -Id $Server.Id -Force
@@ -222,4 +233,5 @@ Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 

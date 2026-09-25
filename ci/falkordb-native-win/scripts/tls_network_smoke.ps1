@@ -28,11 +28,11 @@ New-Item -ItemType Directory -Force -Path $TlsDir,$NetworkData | Out-Null
 python $CertGen $TlsDir
 if ($LASTEXITCODE -ne 0) { throw "TLS certificate generation failed" }
 
-cargo build --manifest-path $HostManifest --bin server --release 2>&1 |
+cargo build --manifest-path $HostManifest --bin server 2>&1 |
     Tee-Object -FilePath (Join-Path $Logs "tls_server_build.txt")
 if ($LASTEXITCODE -ne 0) { throw "TLS server build failed" }
 
-$ServerExe = Join-Path $env:CARGO_TARGET_DIR "release\server.exe"
+$ServerExe = Join-Path $env:CARGO_TARGET_DIR "debug\server.exe"
 $Cert = Join-Path $TlsDir "cert.pem"
 $Key = Join-Path $TlsDir "key.pem"
 

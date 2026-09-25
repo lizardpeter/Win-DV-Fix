@@ -4,6 +4,7 @@ pub mod api;
 pub mod property_index;
 pub mod range_index;
 pub mod server;
+pub mod native_config;
 pub mod udf_store;
 pub mod snapshot;
 pub mod slowlog;
@@ -279,6 +280,14 @@ impl NativeGraph {
 
 
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
+        self.query_with_timeout(cypher, None)
+    }
+
+    pub fn query_with_timeout(
+        &self,
+        cypher: &str,
+        per_query_timeout: Option<i64>,
+    ) -> Result<QueryOutput, String> {
         let wall = Instant::now();
         let (snapshot, first_plan) = {
             let host_guard = self.inner.read();
@@ -290,11 +299,13 @@ impl NativeGraph {
             (snapshot, plan)
         };
 
-        let result = if plan_is_write(&first_plan) {
+        let is_write = plan_is_write(&first_plan);
+        let timeout_ms = native_config::effective_timeout(per_query_timeout, is_write)?;
+        let result = if is_write {
             drop(snapshot);
-            self.execute_write(cypher)
+            self.execute_write(cypher, timeout_ms)
         } else {
-            self.execute_read(snapshot, first_plan)
+            self.execute_read(snapshot, first_plan, timeout_ms)
         };
 
         if result.is_ok() {
@@ -309,6 +320,14 @@ impl NativeGraph {
     /// Write plans are rejected before runtime execution, matching FalkorDB's
     /// read-only network command semantics.
     pub fn query_read_only(&self, cypher: &str) -> Result<QueryOutput, String> {
+        self.query_read_only_with_timeout(cypher, None)
+    }
+
+    pub fn query_read_only_with_timeout(
+        &self,
+        cypher: &str,
+        per_query_timeout: Option<i64>,
+    ) -> Result<QueryOutput, String> {
         let wall = Instant::now();
         let (snapshot, plan) = {
             let host_guard = self.inner.read();
@@ -324,12 +343,19 @@ impl NativeGraph {
             return Err("Read only query cannot perform writes".to_string());
         }
 
-        let result = self.execute_read(snapshot, plan);
+        let timeout_ms = native_config::effective_timeout(per_query_timeout, false)?;
+        let result = self.execute_read(snapshot, plan, timeout_ms);
         if result.is_ok() {
             self.slow_log
                 .add("GRAPH.RO_QUERY", cypher, wall.elapsed().as_secs_f64() * 1000.0);
         }
         result
+    }
+
+    pub fn schema_version(&self) -> u64 {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        committed.borrow().schema_version
     }
 
     pub fn slowlog_entries(&self) -> Vec<SlowLogEntry> {
@@ -520,9 +546,13 @@ impl NativeGraph {
 
         let result = if plan_is_write(&first_plan) {
             drop(snapshot);
-            self.execute_write_profile(cypher)
+            self.execute_write_profile(cypher, native_config::effective_timeout(None, true)?)
         } else {
-            self.execute_read_profile(snapshot, first_plan)
+            self.execute_read_profile(
+                snapshot,
+                first_plan,
+                native_config::effective_timeout(None, false)?,
+            )
         };
 
         if result.is_ok() {
@@ -540,6 +570,7 @@ impl NativeGraph {
             parameters,
             ..
         }: Plan,
+        timeout_ms: Option<u64>,
     ) -> Result<Vec<String>, String> {
         let lock = ReadOnlyEscalation;
         let runtime = Runtime::new(
@@ -548,11 +579,11 @@ impl NativeGraph {
             false,
             plan,
             false,
-            self.import_folder.clone(),
-            self.result_set_size,
+            native_config::runtime_config().import_folder,
+            native_config::runtime_config().result_set_size,
             true,
-            self.timeout_ms,
-            0,
+            timeout_ms,
+            native_config::runtime_config().query_mem_capacity,
             None,
             &lock,
         );
@@ -560,7 +591,11 @@ impl NativeGraph {
         Ok(format_profile(&runtime))
     }
 
-    fn execute_write_profile(&self, cypher: &str) -> Result<Vec<String>, String> {
+    fn execute_write_profile(
+        &self,
+        cypher: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Vec<String>, String> {
         let mut host_guard = self.inner.write();
 
         let Plan {
@@ -584,11 +619,11 @@ impl NativeGraph {
             true,
             plan,
             false,
-            self.import_folder.clone(),
-            self.result_set_size,
+            native_config::runtime_config().import_folder,
+            native_config::runtime_config().result_set_size,
             true,
-            self.timeout_ms,
-            0,
+            timeout_ms,
+            native_config::runtime_config().query_mem_capacity,
             None,
             &escalation,
         );
@@ -645,6 +680,7 @@ impl NativeGraph {
             parameters,
             ..
         }: Plan,
+        timeout_ms: Option<u64>,
     ) -> Result<QueryOutput, String> {
         let lock = ReadOnlyEscalation;
         let runtime = Runtime::new(
@@ -653,11 +689,11 @@ impl NativeGraph {
             false,
             plan,
             false,
-            self.import_folder.clone(),
-            self.result_set_size,
+            native_config::runtime_config().import_folder,
+            native_config::runtime_config().result_set_size,
             false,
-            self.timeout_ms,
-            0,
+            timeout_ms,
+            native_config::runtime_config().query_mem_capacity,
             None,
             &lock,
         );
@@ -667,7 +703,11 @@ impl NativeGraph {
         Ok(capture_output(&runtime, &result))
     }
 
-    fn execute_write(&self, cypher: &str) -> Result<QueryOutput, String> {
+    fn execute_write(
+        &self,
+        cypher: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<QueryOutput, String> {
         let mut host_guard = self.inner.write();
 
         let Plan {
@@ -697,11 +737,11 @@ impl NativeGraph {
             true,
             plan,
             false,
-            self.import_folder.clone(),
-            self.result_set_size,
+            native_config::runtime_config().import_folder,
+            native_config::runtime_config().result_set_size,
             false,
-            self.timeout_ms,
-            0,
+            timeout_ms,
+            native_config::runtime_config().query_mem_capacity,
             None,
             &escalation,
         );

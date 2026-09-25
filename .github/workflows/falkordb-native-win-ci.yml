@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: falkordb-native-win-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows-native:
     runs-on: windows-2025

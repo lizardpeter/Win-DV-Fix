@@ -9,8 +9,20 @@ use std::{
 };
 
 use rustls::{
-    RootCertStore, ServerConfig as RustlsServerConfig, ServerConnection, StreamOwned,
-    server::WebPkiClientVerifier,
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as RustlsError,
+    RootCertStore, ServerConfig as RustlsServerConfig, ServerConnection, SignatureScheme,
+    StreamOwned,
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, UnixTime},
+    server::{
+        WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
+};
+use x509_parser::{
+    extensions::GeneralName,
+    prelude::FromDer,
+    certificate::X509Certificate,
 };
 
 use parking_lot::RwLock;
@@ -23,6 +35,9 @@ pub struct TlsConfig {
     pub key_path: PathBuf,
     /// When present, require a client certificate chaining to this CA.
     pub client_ca_path: Option<PathBuf>,
+    /// Optional exact DNS SAN required on the validated client leaf
+    /// certificate. This is used for OpenAI-managed connector mTLS.
+    pub client_dns_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +94,16 @@ impl ServerConfig {
                 && !ca.is_file()
             {
                 return Err(format!("TLS client CA not found: {}", ca.display()));
+            }
+            if tls.client_dns_name.is_some() && tls.client_ca_path.is_none() {
+                return Err("TLS client DNS-name verification requires a client CA".to_string());
+            }
+            if tls
+                .client_dns_name
+                .as_ref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err("TLS client DNS name must not be empty".to_string());
             }
         }
 
@@ -286,6 +311,88 @@ pub fn serve_with_catalog(
     Ok(())
 }
 
+
+#[derive(Debug)]
+struct ExactClientDnsVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    expected_dns_name: String,
+}
+
+impl ClientCertVerifier for ExactClientDnsVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+
+        let (_, cert) = X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+        let san = cert
+            .subject_alternative_name()
+            .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+
+        let matches = san.is_some_and(|extension| {
+            extension.value.general_names.iter().any(|name| {
+                matches!(
+                    name,
+                    GeneralName::DNSName(value)
+                        if *value == self.expected_dns_name.as_str()
+                )
+            })
+        });
+
+        if !matches {
+            return Err(RustlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+}
+
 pub(crate) fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, String> {
     // Multiple transitive crates can enable more than one rustls provider.
     // Select ring explicitly so TLS startup is deterministic instead of
@@ -324,6 +431,13 @@ pub(crate) fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, Str
         let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .map_err(|e| format!("build TLS client certificate verifier: {e}"))?;
+        let verifier: Arc<dyn ClientCertVerifier> = match &tls.client_dns_name {
+            Some(expected_dns_name) => Arc::new(ExactClientDnsVerifier {
+                inner: verifier,
+                expected_dns_name: expected_dns_name.clone(),
+            }),
+            None => verifier,
+        };
         RustlsServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)

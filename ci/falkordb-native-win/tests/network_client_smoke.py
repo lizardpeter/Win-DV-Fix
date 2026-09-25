@@ -1,18 +1,39 @@
 import argparse
+import os
+import pathlib
 import sys
 
 from falkordb import FalkorDB
 from falkordb.node import Node
 from falkordb.edge import Edge
-from redis.exceptions import AuthenticationError, ResponseError
+from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 
-HOST = "127.0.0.1"
+HOST = "localhost"
 PORT = 6391
 PASSWORD = "native-ci-secret"
 GRAPH = "network-official-client"
 
+TLS_DIR = pathlib.Path(
+    os.environ.get("FALKORDB_TEST_TLS_DIR", "")
+).resolve() if os.environ.get("FALKORDB_TEST_TLS_DIR") else None
 
-def connect(password=PASSWORD):
+
+def tls_kwargs(with_client_cert=True):
+    if TLS_DIR is None:
+        return {}
+    kwargs = {
+        "ssl": True,
+        "ssl_ca_certs": str(TLS_DIR / "ca.pem"),
+        "ssl_cert_reqs": "required",
+        "ssl_check_hostname": True,
+    }
+    if with_client_cert:
+        kwargs["ssl_certfile"] = str(TLS_DIR / "client-cert.pem")
+        kwargs["ssl_keyfile"] = str(TLS_DIR / "client-key.pem")
+    return kwargs
+
+
+def connect(password=PASSWORD, with_client_cert=True):
     return FalkorDB(
         host=HOST,
         port=PORT,
@@ -20,10 +41,20 @@ def connect(password=PASSWORD):
         socket_connect_timeout=5,
         socket_timeout=10,
         protocol=2,
+        **tls_kwargs(with_client_cert=with_client_cert),
     )
 
 
 def phase_write():
+    # mTLS must actually gate the socket before RESP authentication.
+    if TLS_DIR is not None:
+        try:
+            no_cert = connect(with_client_cert=False)
+            no_cert.list_graphs()
+            raise AssertionError("mTLS connection without a client certificate unexpectedly succeeded")
+        except (ConnectionError, OSError):
+            pass
+
     # Authentication must actually gate commands.
     try:
         bad = connect("definitely-wrong")
@@ -88,6 +119,8 @@ def phase_write():
     assert GRAPH in names, names
     db.close()
     print("OFFICIAL_FALKORDB_CLIENT_WRITE_PASS")
+    if TLS_DIR is not None:
+        print("OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS")
 
 
 def phase_read():
@@ -116,6 +149,8 @@ def phase_read():
     assert GRAPH in db.list_graphs()
     db.close()
     print("OFFICIAL_FALKORDB_CLIENT_RESTART_PASS")
+    if TLS_DIR is not None:
+        print("OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS")
 
 
 if __name__ == "__main__":

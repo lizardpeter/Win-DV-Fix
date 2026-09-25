@@ -10,182 +10,69 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - name: Harvest live and archived Webkinz endpoints
+      - name: Parallel Webkinz endpoint probe
         shell: bash
         run: |
           set +e
-          mkdir -p out/live out/archive out/meta
+          mkdir -p out
 
-          python3 - <<'PY'
-          import json, re, ssl, urllib.request, urllib.parse, pathlib, time, zlib
-          from urllib.error import HTTPError, URLError
-
-          OUT = pathlib.Path("out")
-          LIVE = OUT / "live"
-          ARCH = OUT / "archive"
-          META = OUT / "meta"
-          ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
-          ctx = ssl.create_default_context()
-
-          def fetch(name, url, folder=LIVE, timeout=60, max_bytes=64*1024*1024):
-              folder.mkdir(parents=True, exist_ok=True)
-              info = {"url": url}
-              try:
-                  req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
-                  with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                      info["status"] = getattr(r, "status", None)
-                      info["final_url"] = r.geturl()
-                      info["headers"] = dict(r.headers.items())
-                      data = r.read(max_bytes + 1)
-                      if len(data) > max_bytes:
-                          info["truncated"] = True
-                          data = data[:max_bytes]
-                      (folder / name).write_bytes(data)
-                      info["size"] = len(data)
-              except Exception as e:
-                  info["error"] = repr(e)
-              (META / f"{name}.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
-              return info
-
-          live = {
-              "wconf.js.php": "https://play.webkinz.com/wconf.js.php",
-              "latest.yml": "https://downloads.webkinz.com/apps/latest.yml",
-              "play-root.html": "https://play.webkinz.com/",
-              "webkinz.swf": "https://www.webkinz.com/Webkinz.swf?v320_181",
-              "main2.swf": "https://www.webkinz.com/SWF/main2.swf?v=v320_181",
-              "TransList.xml": "https://www.webkinz.com/XML/L10N/TransList.xml",
-              "flashpoint-browse.html": "https://ooooooooo.ooo/browse?search=Webkinz",
-              "dbapi-query.json": "https://db-api.unstable.life/search?query=Webkinz",
-              "dbapi-search.json": "https://db-api.unstable.life/search?search=Webkinz",
-              "dbapi-title.json": "https://db-api.unstable.life/search?title=Webkinz",
+          fetch() {
+            name="$1"
+            url="$2"
+            (
+              echo "$url" > "out/$name.url"
+              curl -L -sS --connect-timeout 6 --max-time 18                 -A "Mozilla/5.0"                 -D "out/$name.headers"                 -o "out/$name.body"                 "$url"
+              echo $? > "out/$name.exit"
+              wc -c "out/$name.body" > "out/$name.size" 2>/dev/null || true
+              file "out/$name.body" > "out/$name.file" 2>/dev/null || true
+              sha256sum "out/$name.body" > "out/$name.sha256" 2>/dev/null || true
+            ) &
           }
-          live_results = {n: fetch(n,u) for n,u in live.items()}
 
-          # HEAD/range probe the large preservation dump without downloading it.
-          dump_url = "https://bluepload.unstable.life/webkinzfiles.7z"
-          dump = {"url": dump_url}
-          try:
-              req = urllib.request.Request(dump_url, method="HEAD", headers={"User-Agent": ua})
-              with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-                  dump["status"] = getattr(r,"status",None)
-                  dump["final_url"] = r.geturl()
-                  dump["headers"] = dict(r.headers.items())
-          except Exception as e:
-              dump["head_error"] = repr(e)
-          try:
-              req = urllib.request.Request(dump_url, headers={"User-Agent":ua,"Range":"bytes=0-1048575"})
-              with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-                  data = r.read(1048576)
-                  (META/"webkinzfiles.first1m.bin").write_bytes(data)
-                  dump["range_status"] = getattr(r,"status",None)
-                  dump["range_headers"] = dict(r.headers.items())
-                  dump["range_size"] = len(data)
-          except Exception as e:
-              dump["range_error"] = repr(e)
-          (META/"webkinzfiles.7z.json").write_text(json.dumps(dump,indent=2),encoding="utf-8")
+          fetch wconf "https://play.webkinz.com/wconf.js.php"
+          fetch latest "https://downloads.webkinz.com/apps/latest.yml"
+          fetch playroot "https://play.webkinz.com/"
+          fetch webkinz_swf "https://www.webkinz.com/Webkinz.swf?v320_181"
+          fetch main2_swf "https://www.webkinz.com/SWF/main2.swf?v=v320_181"
+          fetch translist "https://www.webkinz.com/XML/L10N/TransList.xml"
+          fetch flashpoint_browse "https://ooooooooo.ooo/browse?search=Webkinz"
+          fetch dbapi_query "https://db-api.unstable.life/search?query=Webkinz"
+          fetch dbapi_search "https://db-api.unstable.life/search?search=Webkinz"
+          fetch cdx_webkinz "https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/Webkinz.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20"
+          fetch cdx_main2 "https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/SWF/main2.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20"
+          fetch cdx_jazz "https://web.archive.org/cdx/search/cdx?url=www.webkinz.com/SWF/ARCADE/GAMES/jazz.swf&output=json&fl=timestamp,original,statuscode,mimetype,digest,length&filter=statuscode:200&limit=20"
+          wait
 
-          # Query the Wayback CDX for high-value Classic bootstrap files and games.
-          targets = {
-              "Webkinz.swf": "http://www.webkinz.com/Webkinz.swf",
-              "main2.swf": "http://www.webkinz.com/SWF/main2.swf",
-              "TransList.xml": "http://www.webkinz.com/XML/L10N/TransList.xml",
-              "jazz.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/jazz.swf",
-              "skaterkat.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/SkaterKat/SkaterKat.swf",
-              "dashingdolphin.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/dashingdolphin.swf",
-              "icecap.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/icecap.swf",
-              "plumpysHairdresser.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/plumpysHairdresser.swf",
-              "bambooBreak.swf": "http://www.webkinz.com/SWF/ARCADE/GAMES/bambooBreak.swf",
-          }
-          cdx_summary = {}
-          for name, original in targets.items():
-              params = urllib.parse.urlencode({
-                  "url": original,
-                  "output": "json",
-                  "fl": "timestamp,original,statuscode,mimetype,digest,length",
-                  "filter": "statuscode:200",
-                  "collapse": "digest",
-                  "from": "2005",
-                  "to": "2021",
-                  "limit": "50",
-              })
-              cdx_url = "https://web.archive.org/cdx/search/cdx?" + params
-              cdx_name = "cdx-" + name + ".json"
-              fetch(cdx_name, cdx_url, META, timeout=90, max_bytes=8*1024*1024)
-              rows = []
-              p = META / cdx_name
-              if p.exists():
-                  try:
-                      obj = json.loads(p.read_text(errors="ignore"))
-                      if isinstance(obj,list) and len(obj)>1:
-                          header=obj[0]
-                          rows=[dict(zip(header,row)) for row in obj[1:] if isinstance(row,list)]
-                  except Exception:
-                      pass
-              cdx_summary[name] = rows
-              if rows:
-                  # newest unique preserved capture
-                  row = rows[-1]
-                  ts = row.get("timestamp")
-                  orig = row.get("original") or original
-                  if ts:
-                      archived = f"https://web.archive.org/web/{ts}id_/{orig}"
-                      fetch("wayback-"+name, archived, ARCH, timeout=120, max_bytes=64*1024*1024)
-              time.sleep(0.4)
-          (OUT/"wayback-captures.json").write_text(json.dumps(cdx_summary,indent=2),encoding="utf-8")
+          curl -I -L -sS --connect-timeout 6 --max-time 18 -A "Mozilla/5.0"             "https://bluepload.unstable.life/webkinzfiles.7z"             > out/bluepload_head.txt 2>&1 || true
 
-          # Normalize compressed SWFs and scan all captured content for resource strings.
-          url_re = re.compile(rb'https?://[^\x00\s\x22\x27<>\\]+', re.I)
-          path_re = re.compile(rb'(?:[A-Za-z0-9_.%+ -]+/)+(?:[A-Za-z0-9_.%+ ?=&-]+\.(?:swf|xml|php|jpg|jpeg|png|gif|mp3|wav|flv|json|js))(?:\?[^\x00\s\x22\x27<>\\]{0,200})?', re.I)
-          all_report = {}
-          all_urls=set(); all_paths=set()
-          for folder in (LIVE,ARCH):
-              for p in sorted(folder.glob("*")):
-                  if not p.is_file(): continue
-                  raw=p.read_bytes()
-                  data=raw
-                  if len(raw)>=8 and raw[:3]==b"CWS":
-                      try:
-                          data=b"FWS"+raw[3:8]+zlib.decompress(raw[8:])
-                          (META/(p.name+".uncompressed.swf")).write_bytes(data)
-                      except Exception:
-                          pass
-                  urls=sorted({m.group().decode("latin1","ignore") for m in url_re.finditer(data)})
-                  paths=sorted({m.group().decode("latin1","ignore").strip() for m in path_re.finditer(data)})
-                  strings=[]
-                  for s in re.findall(rb'[ -~]{6,}',data):
-                      t=s.decode("latin1","ignore")
-                      l=t.lower()
-                      if any(k in l for k in (".swf",".xml",".php","webkinz","arcade","api/","assets","loader","main2","config","pet.types","get_arcade")):
-                          strings.append(t)
-                  all_report[str(p)]={"size":len(raw),"normalized_size":len(data),"urls":urls,"paths":paths,"interesting_strings":strings[:30000]}
-                  all_urls.update(urls); all_paths.update(paths)
-          (OUT/"scan-report.json").write_text(json.dumps(all_report,indent=2),encoding="utf-8")
-          (OUT/"urls.txt").write_text("\n".join(sorted(all_urls))+"\n",encoding="utf-8")
-          (OUT/"paths.txt").write_text("\n".join(sorted(all_paths))+"\n",encoding="utf-8")
+          : > out/all_urls.txt
+          : > out/all_uuids.txt
+          : > out/interesting_strings.txt
+          for f in out/*.body; do
+            [ -f "$f" ] || continue
+            strings -a -n 5 "$f" | grep -Eai 'https?://|webkinz|\.swf|\.xml|\.php|arcade|api/|loader|main2|assets'               >> out/interesting_strings.txt 2>/dev/null || true
+            strings -a -n 8 "$f" | grep -Eao 'https?://[^[:space:]<>"]+'               >> out/all_urls.txt 2>/dev/null || true
+            strings -a "$f" | grep -Eao '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'               >> out/all_uuids.txt 2>/dev/null || true
+          done
+          sort -u -o out/all_urls.txt out/all_urls.txt
+          sort -u -o out/all_uuids.txt out/all_uuids.txt
+          sort -u -o out/interesting_strings.txt out/interesting_strings.txt
 
-          # Extract UUID-like IDs from Flashpoint results for the next stage.
-          uuids=set()
-          for p in LIVE.glob("*"):
-              try: data=p.read_text(errors="ignore")
-              except: continue
-              uuids.update(re.findall(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',data))
-          (OUT/"flashpoint-uuids.txt").write_text("\n".join(sorted(uuids))+"\n",encoding="utf-8")
-
-          summary = {
-              "live": live_results,
-              "dump": dump,
-              "flashpoint_uuids": sorted(uuids),
-              "captured_archive_files": [p.name for p in ARCH.glob("*")],
-              "url_count": len(all_urls),
-              "path_count": len(all_paths),
-          }
-          (OUT/"SUMMARY.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
-          PY
-
-          find out -maxdepth 2 -type f -printf '%p %s bytes\n' | sort > out/file-list.txt
-          exit 0
+          {
+            echo "=== FILES ==="
+            ls -lh out
+            echo
+            echo "=== UUIDS ==="
+            cat out/all_uuids.txt
+            echo
+            echo "=== URLS ==="
+            cat out/all_urls.txt
+            echo
+            echo "=== BLUEPLOAD ==="
+            cat out/bluepload_head.txt
+          } > out/SUMMARY.txt
 
       - name: Upload harvest
         if: always()

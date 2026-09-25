@@ -1,4 +1,4 @@
-use falkordb_native_host::{Engine, NativeGraph, range_index::NativeNumericRangeIndex};
+use falkordb_native_host::{Engine, NativeGraph, range_index::{NativeNumericRangeIndex, NativeStringRangeIndex}};
 
 fn require_contains(haystack: &str, needle: &str, what: &str) -> Result<(), String> {
     if haystack.contains(needle) {
@@ -74,6 +74,23 @@ fn main() -> Result<(), String> {
     if snapshot_docs != vec![103, 101, 102, 102] {
         return Err(format!("native range snapshot mismatch: {snapshot_docs:?}"));
     }
+
+    let mut string_idx = NativeStringRangeIndex::new();
+    string_idx.upsert(201, ["alpha"]);
+    string_idx.upsert(202, ["beta", "delta"]);
+    string_idx.upsert(203, ["gamma"]);
+
+    if string_idx.equal("beta").collect::<Vec<_>>() != vec![202] {
+        return Err("native string equality mismatch".into());
+    }
+    let strings = string_idx
+        .range(Some("beta"), Some("gamma"), true, false)
+        .collect::<Vec<_>>();
+    if strings != vec![202, 202] {
+        return Err(format!("native string range mismatch: {strings:?}"));
+    }
+
+    println!("NATIVE_STRING_RANGE_INDEX_SMOKE_PASS");
 
     println!("NATIVE_RANGE_INDEX_SMOKE_PASS");
 

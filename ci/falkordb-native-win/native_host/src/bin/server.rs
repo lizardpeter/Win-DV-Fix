@@ -48,6 +48,8 @@ fn main() -> Result<(), String> {
         .filter(|v| !v.is_empty());
     let mut api_allow_plaintext_remote = false;
     let mut api_allow_unauthenticated_remote = false;
+    let mut api_openai_mtls_ca: Option<PathBuf> =
+        env::var_os("FALKORDB_API_OPENAI_MTLS_CA").map(PathBuf::from);
 
     let mut oauth_resource = env::var("FALKORDB_OAUTH_RESOURCE").ok().filter(|v| !v.is_empty());
     let mut oauth_issuer = env::var("FALKORDB_OAUTH_ISSUER").ok().filter(|v| !v.is_empty());
@@ -146,6 +148,12 @@ fn main() -> Result<(), String> {
             "--api-allow-unauthenticated-remote" => {
                 api_allow_unauthenticated_remote = true;
             }
+            "--api-openai-mtls-ca" => {
+                api_openai_mtls_ca = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--api-openai-mtls-ca requires a PEM CA path".to_string())?,
+                ));
+            }
             "--oauth-resource" => {
                 oauth_resource = Some(
                     args.next()
@@ -203,6 +211,8 @@ CHATGPT HTTPS API OPTIONS:
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
+  --api-openai-mtls-ca PATH        Require OpenAI connector mTLS using this CA;
+                                   leaf SAN must be mtls.prod.connectors.openai.com
   --oauth-resource URL             Public HTTPS MCP resource identifier
   --oauth-issuer URL               OAuth/OIDC token issuer
   --oauth-audience AUDIENCE        Required access-token audience
@@ -236,6 +246,7 @@ including a ChatGPT custom integration.
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
             client_ca_path: tls_client_ca,
+            client_dns_name: None,
         });
     }
 
@@ -282,9 +293,10 @@ including a ChatGPT custom integration.
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {
                 cert_path: cert_path.clone(),
                 key_path: key_path.clone(),
-                // ChatGPT/custom HTTPS integrations use ordinary server TLS +
-                // Bearer auth, not the RESP listener's optional client cert.
-                client_ca_path: None,
+                client_ca_path: api_openai_mtls_ca,
+                client_dns_name: api_openai_mtls_ca
+                    .as_ref()
+                    .map(|_| "mtls.prod.connectors.openai.com".to_string()),
             }),
         };
         api_config.validate()?;

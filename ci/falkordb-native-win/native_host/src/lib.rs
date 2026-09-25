@@ -286,6 +286,41 @@ impl NativeGraph {
         &self.name
     }
 
+    pub fn copy_persistent(
+        &self,
+        destination_name: &str,
+        destination_wal: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        let _snapshot_guard = self.inner.read();
+        let source_wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| "native host: GRAPH.COPY requires a persistent source graph".to_string())?;
+        let records = source_wal.records()?;
+
+        let destination_wal = destination_wal.as_ref();
+        if destination_wal.exists()
+            && std::fs::metadata(destination_wal)
+                .map_err(|e| format!("inspect destination WAL {}: {e}", destination_wal.display()))?
+                .len()
+                != 0
+        {
+            return Err("destination key already exists".to_string());
+        }
+
+        let (target, existing) = Wal::open(destination_wal)?;
+        if !existing.is_empty() {
+            return Err("destination key already exists".to_string());
+        }
+        for record in records {
+            target.append_payload(destination_name.as_bytes(), &record.payload)?;
+        }
+        drop(target);
+
+        Self::open_persistent(destination_name, destination_wal)
+    }
+
+
     pub fn explain(&self, cypher: &str) -> Result<Vec<String>, String> {
         let host_guard = self.inner.read();
         let snapshot = host_guard.read();

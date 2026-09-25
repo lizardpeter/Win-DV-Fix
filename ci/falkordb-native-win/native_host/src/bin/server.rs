@@ -6,7 +6,7 @@ use std::{
 
 use falkordb_native_host::{
     Engine,
-    server::{ServerConfig, serve},
+    server::{ServerConfig, TlsConfig, serve},
 };
 
 fn main() -> Result<(), String> {
@@ -23,6 +23,11 @@ fn main() -> Result<(), String> {
             config.username = username;
         }
     }
+
+    let mut tls_cert: Option<PathBuf> = env::var_os("FALKORDB_TLS_CERT").map(PathBuf::from);
+    let mut tls_key: Option<PathBuf> = env::var_os("FALKORDB_TLS_KEY").map(PathBuf::from);
+    let mut tls_client_ca: Option<PathBuf> =
+        env::var_os("FALKORDB_TLS_CLIENT_CA").map(PathBuf::from);
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -48,6 +53,24 @@ fn main() -> Result<(), String> {
             "--password" => {
                 config.password = Some(args.next().ok_or_else(|| "--password requires a value".to_string())?);
             }
+            "--tls-cert" => {
+                tls_cert = Some(PathBuf::from(
+                    args.next().ok_or_else(|| "--tls-cert requires a PEM path".to_string())?,
+                ));
+            }
+            "--tls-key" => {
+                tls_key = Some(PathBuf::from(
+                    args.next().ok_or_else(|| "--tls-key requires a PEM path".to_string())?,
+                ));
+            }
+            "--tls-client-ca" => {
+                tls_client_ca = Some(PathBuf::from(
+                    args.next().ok_or_else(|| "--tls-client-ca requires a PEM path".to_string())?,
+                ));
+            }
+            "--allow-plaintext-remote" => {
+                config.allow_plaintext_remote = true;
+            }
             "--allow-unauthenticated-remote" => {
                 config.allow_unauthenticated_remote = true;
             }
@@ -63,11 +86,32 @@ OPTIONS:
   --data-dir PATH                  Persistent graph data directory
   --username USER                  AUTH username (default: default)
   --password PASSWORD              AUTH password (or FALKORDB_PASSWORD)
-  --allow-unauthenticated-remote   Allow non-loopback bind without AUTH
+  --tls-cert PATH                  PEM server certificate/chain (or FALKORDB_TLS_CERT)
+  --tls-key PATH                   PEM private key (or FALKORDB_TLS_KEY)
+  --tls-client-ca PATH             Require mTLS clients signed by this PEM CA
+  --allow-plaintext-remote         Permit non-loopback RESP without TLS
+  --allow-unauthenticated-remote   Permit non-loopback bind without AUTH
 "#);
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+
+    match (tls_cert, tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            config.tls = Some(TlsConfig {
+                cert_path,
+                key_path,
+                client_ca_path: tls_client_ca,
+            });
+        }
+        (None, None) if tls_client_ca.is_none() => {}
+        (None, None) => {
+            return Err("--tls-client-ca requires --tls-cert and --tls-key".to_string());
+        }
+        _ => {
+            return Err("--tls-cert and --tls-key must be provided together".to_string());
         }
     }
 

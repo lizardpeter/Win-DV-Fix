@@ -444,6 +444,7 @@ struct NativeStore {
     /// Values are per-document term scores precomputed at insert/update time.
     fulltext: HashMap<String, HashMap<u64, f64>>,
     vectors: HashMap<String, NativeVectorIndex>,
+    vector_errors: HashMap<String, String>,
 }
 
 impl NativeStore {
@@ -478,6 +479,8 @@ impl NativeStore {
         self.array_string.clear();
         self.points.clear();
         self.fulltext.clear();
+        self.vectors.clear();
+        self.vector_errors.clear();
         for document in &docs {
             self.index_document(document, fields);
         }
@@ -506,12 +509,20 @@ impl NativeStore {
                 IndexType::Vector => {
                     if let Value::VecF32(vector) = value {
                         let key = name.into_owned();
-                        let state = self.vectors.entry(key.clone()).or_insert_with(|| {
-                            NativeVectorIndex::new(field)
-                                .unwrap_or_else(|e| panic!("native HNSW index {key}: {e}"))
-                        });
-                        if let Err(err) = state.upsert(document.id, vector.as_slice()) {
-                            panic!("native HNSW insert {key}/{}: {err}", document.id);
+                        if !self.vectors.contains_key(&key) && !self.vector_errors.contains_key(&key) {
+                            match NativeVectorIndex::new(field) {
+                                Ok(index) => {
+                                    self.vectors.insert(key.clone(), index);
+                                }
+                                Err(err) => {
+                                    self.vector_errors.insert(key.clone(), err);
+                                }
+                            }
+                        }
+                        if let Some(state) = self.vectors.get(&key) {
+                            if let Err(err) = state.upsert(document.id, vector.as_slice()) {
+                                self.vector_errors.insert(key, err);
+                            }
                         }
                     }
                 }
@@ -1255,24 +1266,48 @@ impl Index {
                 vector.len()
             ));
         }
+
         let metric = meta
             .vector_options()
-            .and_then(|o| o.similarity_function.as_deref());
+            .and_then(|options| options.similarity_function.as_deref());
         let field_name = meta.name.to_string_lossy().into_owned();
         let store = self.store.read();
-        let mut out: Vec<(u64, f64)> = store
-            .docs
-            .values()
-            .filter_map(|doc| {
-                let Value::VecF32(candidate) = doc.values.get(&field_name)? else {
-                    return None;
-                };
-                let d = vec_distance::distance(metric, vector.as_slice(), candidate.as_slice())?;
-                Some((doc.id, d))
-            })
-            .collect();
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal)
-            .then_with(|| a.0.cmp(&b.0)));
+
+        if let Some(err) = store.vector_errors.get(&field_name) {
+            return Err(format!("native HNSW index {field_name}: {err}"));
+        }
+        let Some(index) = store.vectors.get(&field_name) else {
+            return Ok(VectorScoredIdIter::empty(vector));
+        };
+        if k == 0 || index.index.size() == 0 {
+            return Ok(VectorScoredIdIter::empty(vector));
+        }
+
+        let matches = index
+            .index
+            .search(vector.as_slice(), k.min(index.index.size()))
+            .map_err(|e| format!("HNSW vector search failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(matches.keys.len());
+        for id in matches.keys {
+            let Some(doc) = store.docs.get(&id) else {
+                continue;
+            };
+            let Some(Value::VecF32(candidate)) = doc.values.get(&field_name) else {
+                continue;
+            };
+            let Some(distance) =
+                vec_distance::distance(metric, vector.as_slice(), candidate.as_slice())
+            else {
+                return Err("Vector distance computation failed".to_string());
+            };
+            out.push((id, distance));
+        }
+        out.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         out.truncate(k);
         Ok(VectorScoredIdIter::from_vec(out, vector))
     }
@@ -1296,25 +1331,51 @@ impl Index {
                 vector.len()
             ));
         }
+
         let metric = meta
             .vector_options()
-            .and_then(|o| o.similarity_function.as_deref());
+            .and_then(|options| options.similarity_function.as_deref());
         let field_name = meta.name.to_string_lossy().into_owned();
         let store = self.store.read();
-        let mut out: Vec<(u64, u64, u64, f64)> = store
-            .docs
-            .values()
-            .filter_map(|doc| {
-                let edge = doc.edge?;
-                let Value::VecF32(candidate) = doc.values.get(&field_name)? else {
-                    return None;
-                };
-                let d = vec_distance::distance(metric, vector.as_slice(), candidate.as_slice())?;
-                Some((edge.0, edge.1, edge.2, d))
-            })
-            .collect();
-        out.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(CmpOrdering::Equal)
-            .then_with(|| a.2.cmp(&b.2)));
+
+        if let Some(err) = store.vector_errors.get(&field_name) {
+            return Err(format!("native HNSW index {field_name}: {err}"));
+        }
+        let Some(index) = store.vectors.get(&field_name) else {
+            return Ok(VectorScoredEdgeTripleIter::empty(vector));
+        };
+        if k == 0 || index.index.size() == 0 {
+            return Ok(VectorScoredEdgeTripleIter::empty(vector));
+        }
+
+        let matches = index
+            .index
+            .search(vector.as_slice(), k.min(index.index.size()))
+            .map_err(|e| format!("HNSW edge vector search failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(matches.keys.len());
+        for id in matches.keys {
+            let Some(doc) = store.docs.get(&id) else {
+                continue;
+            };
+            let Some(edge) = doc.edge else {
+                continue;
+            };
+            let Some(Value::VecF32(candidate)) = doc.values.get(&field_name) else {
+                continue;
+            };
+            let Some(distance) =
+                vec_distance::distance(metric, vector.as_slice(), candidate.as_slice())
+            else {
+                return Err("Vector distance computation failed".to_string());
+            };
+            out.push((edge.0, edge.1, edge.2, distance));
+        }
+        out.sort_by(|a, b| {
+            a.3.partial_cmp(&b.3)
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| a.2.cmp(&b.2))
+        });
         out.truncate(k);
         Ok(VectorScoredEdgeTripleIter::from_vec(out, vector))
     }

@@ -252,13 +252,13 @@ fn max_records(
 }
 
 #[derive(Default)]
-struct BulkIndexDocs {
+pub(crate) struct BulkIndexDocs {
     nodes: FxHashMap<u64, RoaringTreemap>,
     edges: FxHashMap<u64, RoaringTreemap>,
 }
 
 impl BulkIndexDocs {
-    fn publish(&mut self, graph: &mut Graph) {
+    pub(crate) fn publish(&mut self, graph: &mut Graph) {
         if !self.nodes.is_empty() {
             graph.commit_index(&mut self.nodes, &mut FxHashMap::default());
         }
@@ -398,7 +398,7 @@ fn process_edge_token(
     Ok(())
 }
 
-pub fn apply(graph: &mut Graph, request: &BulkRequest) -> Result<(), String> {
+pub(crate) fn apply(graph: &mut Graph, request: &BulkRequest) -> Result<BulkIndexDocs, String> {
     let mut node_space = graph.open_node_id_space();
     let mut rel_space = graph.open_relationship_id_space();
 
@@ -457,8 +457,7 @@ pub fn apply(graph: &mut Graph, request: &BulkRequest) -> Result<(), String> {
     }
 
     graph.flush_for_bulk();
-    docs.publish(graph);
-    Ok(())
+    Ok(docs)
 }
 
 #[cfg(test)]

@@ -181,6 +181,7 @@ struct HttpResponse {
     status: u16,
     body: Vec<u8>,
     content_type: &'static str,
+    headers: Vec<(String, String)>,
 }
 
 fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
@@ -284,18 +285,44 @@ fn route_http(
         return json_response(200, openapi_document());
     }
 
-    let scope = auth_scope(&request.headers, config);
-    if scope == AuthScope::None
-        && (config.read_write_token.is_some() || config.read_only_token.is_some())
+    if request.method == "GET"
+        && matches!(
+            request.target.as_str(),
+            "/.well-known/oauth-protected-resource"
+                | "/.well-known/oauth-protected-resource/mcp"
+        )
     {
-        return error_response(401, "unauthorized", "valid Bearer token required");
+        return match &config.oauth {
+            Some(oauth) => json_response(200, oauth_resource_metadata(oauth)),
+            None => error_response(404, "oauth_not_configured", "OAuth is not configured"),
+        };
     }
 
+    let scope = auth_scope(&request.headers, config);
+    // MCP discovery and tool metadata must remain visible when OAuth is
+    // configured so ChatGPT can discover the required scopes before linking.
     if request.target == "/mcp" {
         if request.method != "POST" {
             return error_response(405, "method_not_allowed", "MCP uses POST on /mcp");
         }
-        return handle_mcp(&request, catalog, scope);
+        if scope == AuthScope::None
+            && config.oauth.is_none()
+            && (config.read_write_token.is_some() || config.read_only_token.is_some())
+        {
+            return error_response(401, "unauthorized", "valid Bearer token required");
+        }
+        return handle_mcp(&request, catalog, config, scope);
+    }
+
+    if scope == AuthScope::None
+        && (config.read_write_token.is_some()
+            || config.read_only_token.is_some()
+            || config.oauth.is_some())
+    {
+        return match &config.oauth {
+            Some(oauth) => oauth_unauthorized_response(oauth, &oauth.config().read_scope),
+            None => error_response(401, "unauthorized", "valid Bearer token required"),
+        };
     }
 
     match (request.method.as_str(), request.target.as_str()) {
@@ -370,6 +397,7 @@ fn route_http(
 fn handle_mcp(
     request: &HttpRequest,
     catalog: &GraphCatalog,
+    config: &ApiConfig,
     scope: AuthScope,
 ) -> HttpResponse {
     let message: JsonValue = match serde_json::from_slice(&request.body) {
@@ -873,6 +901,7 @@ fn empty_response(status: u16) -> HttpResponse {
         status,
         body: Vec::new(),
         content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
     }
 }
 
@@ -1098,7 +1127,41 @@ fn json_response(status: u16, value: JsonValue) -> HttpResponse {
         status,
         body: serde_json::to_vec(&value).expect("JSON value must serialize"),
         content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
     }
+}
+
+fn oauth_resource_metadata(oauth: &OAuthVerifier) -> JsonValue {
+    let config = oauth.config();
+    json!({
+        "resource": config.resource,
+        "authorization_servers": [config.issuer],
+        "scopes_supported": [config.read_scope, config.write_scope],
+        "resource_documentation": format!(
+            "{}/openapi.json",
+            config.resource.trim_end_matches('/')
+        )
+    })
+}
+
+fn oauth_unauthorized_response(oauth: &OAuthVerifier, required_scope: &str) -> HttpResponse {
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource",
+        oauth.config().resource.trim_end_matches('/')
+    );
+    let mut response = error_response(
+        401,
+        "oauth_required",
+        "OAuth access token with the required graph scope is required",
+    );
+    response.headers.push((
+        "WWW-Authenticate".to_string(),
+        format!(
+            "Bearer resource_metadata=\"{}\", scope=\"{}\"",
+            metadata, required_scope
+        ),
+    ));
+    response
 }
 
 fn error_response(status: u16, code: &str, message: &str) -> HttpResponse {
@@ -1127,12 +1190,16 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
 
     write!(
         writer,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
         response.status,
         reason,
         response.content_type,
         response.body.len()
     )?;
+    for (name, value) in &response.headers {
+        write!(writer, "{}: {}\r\n", name, value)?;
+    }
+    writer.write_all(b"\r\n")?;
     writer.write_all(&response.body)
 }
 

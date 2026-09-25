@@ -16,7 +16,7 @@ use rustls::{
 use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
-use crate::{NativeGraph, OutputStats, QueryOutput, wire::WireValue};
+use crate::{NativeGraph, OutputStats, QueryOutput, udf_store, wire::WireValue};
 
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -88,13 +88,18 @@ impl ServerConfig {
 }
 
 pub struct GraphCatalog {
+    data_dir: PathBuf,
     graph_dir: PathBuf,
     graphs: RwLock<HashMap<String, Arc<NativeGraph>>>,
 }
 
 impl GraphCatalog {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, String> {
-        let graph_dir = data_dir.as_ref().join("graphs");
+        let data_dir = data_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("create data directory {}: {e}", data_dir.display()))?;
+        udf_store::restore(&data_dir)?;
+        let graph_dir = data_dir.join("graphs");
         fs::create_dir_all(&graph_dir)
             .map_err(|e| format!("create graph data directory {}: {e}", graph_dir.display()))?;
 
@@ -116,6 +121,7 @@ impl GraphCatalog {
         }
 
         Ok(Self {
+            data_dir,
             graph_dir,
             graphs: RwLock::new(graphs),
         })
@@ -123,6 +129,10 @@ impl GraphCatalog {
 
     fn wal_path(&self, name: &str) -> PathBuf {
         self.graph_dir.join(format!("{}.wal", encode_graph_name(name)))
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<NativeGraph>> {
@@ -551,6 +561,7 @@ fn dispatch(
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
+        "GRAPH.UDF" => handle_graph_udf(&args, catalog),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
     }
 }
@@ -734,6 +745,113 @@ fn handle_graph_constraint(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
     ) {
         Ok(()) => Resp::Simple("OK".to_string()),
         Err(err) => Resp::Error(format!("ERR {err}")),
+    }
+}
+
+fn handle_graph_udf(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 2 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.udf' command".to_string());
+    }
+
+    match ascii_upper(&args[1]).as_str() {
+        "LOAD" => {
+            if !(args.len() == 4 || args.len() == 5) {
+                return Resp::Error(
+                    "ERR wrong number of arguments for 'GRAPH.UDF LOAD' command".to_string(),
+                );
+            }
+
+            let (replace, name_idx, script_idx) = if args.len() == 5 {
+                if ascii_upper(&args[2]) != "REPLACE" {
+                    return Resp::Error(format!(
+                        "ERR Unknown option given: '{}'",
+                        String::from_utf8_lossy(&args[2])
+                    ));
+                }
+                (true, 3usize, 4usize)
+            } else {
+                (false, 2usize, 3usize)
+            };
+
+            let name = match utf8(&args[name_idx], "UDF library name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            let script = match utf8(&args[script_idx], "UDF script") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+
+            match udf_store::load(catalog.data_dir(), name, script, replace) {
+                Ok(_) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
+        "DELETE" => {
+            if args.len() != 3 {
+                return Resp::Error(
+                    "ERR wrong number of arguments for 'GRAPH.UDF DELETE' command".to_string(),
+                );
+            }
+            let name = match utf8(&args[2], "UDF library name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            match udf_store::delete(catalog.data_dir(), name) {
+                Ok(()) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
+        "FLUSH" => {
+            if args.len() != 2 {
+                return Resp::Error(
+                    "ERR wrong number of arguments for 'GRAPH.UDF FLUSH' command".to_string(),
+                );
+            }
+            match udf_store::flush(catalog.data_dir()) {
+                Ok(()) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
+        "LIST" => {
+            let mut filter: Option<&str> = None;
+            let mut with_code = false;
+
+            for arg in args.iter().skip(2) {
+                let value = match utf8(arg, "UDF LIST option") {
+                    Ok(v) => v,
+                    Err(err) => return Resp::Error(err),
+                };
+                if value.eq_ignore_ascii_case("WITHCODE") {
+                    with_code = true;
+                } else if filter.is_none() {
+                    filter = Some(value);
+                } else {
+                    return Resp::Error(format!("ERR Unknown option given: '{value}'"));
+                }
+            }
+
+            let libraries = graph::udf::get_udf_repo().list(filter, with_code);
+            Resp::Array(
+                libraries
+                    .into_iter()
+                    .map(|library| {
+                        let mut fields = vec![
+                            bulk("library_name"),
+                            bulk(library.name),
+                            bulk("functions"),
+                            Resp::Array(library.function_names.into_iter().map(bulk).collect()),
+                        ];
+                        if let Some(code) = library.code {
+                            fields.push(bulk("library_code"));
+                            fields.push(bulk(code));
+                        }
+                        Resp::Array(fields)
+                    })
+                    .collect(),
+            )
+        }
+        subcommand => Resp::Error(format!("ERR Unknown UDF subcommand: {subcommand}")),
     }
 }
 

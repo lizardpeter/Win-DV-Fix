@@ -1,6 +1,7 @@
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
 pub mod api;
+pub mod bulk;
 pub mod property_index;
 pub mod query_scheduler;
 pub mod range_index;
@@ -287,6 +288,101 @@ impl NativeGraph {
         let host_guard = self.inner.read();
         let committed = host_guard.read();
         committed.borrow().memory_usage_report(samples)
+    }
+
+    /// Apply an upstream-compatible GRAPH.BULK batch.
+    ///
+    /// Bulk mutations do not naturally pass through Runtime/Pending, so the
+    /// standalone durability boundary is a staged full checkpoint plus a
+    /// replay-safe no-op WAL marker. The checkpoint is published before the
+    /// private MVCC graph, and index documents are published only after that
+    /// durable boundary exists.
+    pub fn bulk_insert(&self, request: &bulk::BulkRequest) -> Result<String, String> {
+        let _permit = QueryPermit::acquire(&self.name, "GRAPH.BULK")?;
+        let mut host_guard = self.inner.write();
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+
+        let mut docs = {
+            let mut graph = private.borrow_mut();
+            match bulk::apply(&mut graph, request) {
+                Ok(docs) => docs,
+                Err(err) => {
+                    drop(graph);
+                    host_guard.rollback();
+                    return Err(format!("ERR bulk insert failed: {err}"));
+                }
+            }
+        };
+
+        let mut published_checkpoint = None;
+        let mut checkpoint_sequence = None;
+        if let Some(wal) = &self.wal {
+            let sequence = wal.last_sequence().saturating_add(1);
+            let staged = {
+                let graph = private.borrow();
+                match snapshot::stage_checkpoint(wal.path(), &self.name, sequence, &graph) {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        drop(graph);
+                        host_guard.rollback();
+                        return Err(err);
+                    }
+                }
+            };
+
+            let marker_sequence = match wal.append_checkpoint_marker(self.name.as_bytes()) {
+                Ok(sequence) => sequence,
+                Err(err) => {
+                    snapshot::abort_staged_checkpoint(staged);
+                    host_guard.rollback();
+                    return Err(err);
+                }
+            };
+            debug_assert_eq!(marker_sequence, sequence);
+
+            match snapshot::publish_staged_checkpoint(staged) {
+                Ok(path) => {
+                    published_checkpoint = Some(path);
+                    checkpoint_sequence = Some(sequence);
+                }
+                Err(err) => {
+                    // The WAL marker is a valid no-op effects payload, so if
+                    // checkpoint publication fails the private graph can be
+                    // rolled back safely and replay remains continuous.
+                    host_guard.rollback();
+                    return Err(err);
+                }
+            }
+        }
+
+        {
+            let mut graph = private.borrow_mut();
+            docs.publish(&mut graph);
+        }
+        host_guard.commit(Arc::clone(&private));
+
+        if let (Some(wal), Some(sequence)) = (&self.wal, checkpoint_sequence) {
+            // Compaction is an optimization after the durability boundary.
+            // Failure leaves a continuous WAL ending in the no-op marker and
+            // does not invalidate the now-published checkpoint.
+            if let Err(err) = wal.reset_after(sequence) {
+                eprintln!(
+                    "FalkorDB native GRAPH.BULK: WAL compaction after checkpoint failed: {err}"
+                );
+            } else if let Err(err) = snapshot::cleanup_old_checkpoints(wal.path(), 2) {
+                eprintln!(
+                    "FalkorDB native GRAPH.BULK: old checkpoint cleanup failed: {err}"
+                );
+            }
+        }
+
+        let _ = published_checkpoint;
+        Ok(format!(
+            "{} nodes created, {} relations created",
+            request.node_count, request.edge_count
+        ))
     }
 
 

@@ -1,3 +1,5 @@
+pub mod range_index;
+
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
 use std::{cell::Cell, ffi::c_void, sync::Arc};

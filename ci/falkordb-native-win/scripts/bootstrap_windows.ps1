@@ -62,23 +62,29 @@ if (-not $SkipNativeDeps) {
         -DCMAKE_C_FLAGS=/MP `
         -DCMAKE_INSTALL_PREFIX="$Prefix" `
         -DSUITESPARSE_USE_FORTRAN=OFF `
-        -DBUILD_STATIC_LIBS=ON `
-        -DBUILD_SHARED_LIBS=OFF `
-        -DGRAPHBLAS_BUILD_STATIC_LIBS=ON `
+        -DBUILD_STATIC_LIBS=OFF `
+        -DBUILD_SHARED_LIBS=ON `
+        -DGRAPHBLAS_BUILD_STATIC_LIBS=OFF `
         -DGRAPHBLAS_COMPACT=ON `
         -DGRAPHBLAS_USE_OPENMP=OFF `
         -DGRAPHBLAS_USE_JIT=OFF `
         -DBUILD_TESTING=OFF
-    cmake --build $GBBuild --config Release --target GraphBLAS_static --parallel 4
+    cmake --build $GBBuild --config Release --target GraphBLAS --parallel 4
     cmake --install $GBBuild --config Release
 
-    $GBStatic = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas_static.lib |
+    $GBImport = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas.lib |
+        Where-Object { $_.Name -eq "graphblas.lib" } |
         Select-Object -First 1
-    if (-not $GBStatic) {
-        throw "Expected GraphBLAS static library graphblas_static.lib not found below $Prefix"
+    $GBDll = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas.dll |
+        Select-Object -First 1
+    if (-not $GBImport) {
+        throw "Expected GraphBLAS DLL import library graphblas.lib not found below $Prefix"
     }
-    $LibDir = $GBStatic.Directory.FullName
-    Copy-Item -Force $GBStatic.FullName (Join-Path $LibDir "graphblas.lib")
+    if (-not $GBDll) {
+        throw "Expected GraphBLAS runtime DLL graphblas.dll not found below $Prefix"
+    }
+    $LibDir = $GBImport.Directory.FullName
+    $GBDll.Directory.FullName | Set-Content -Path (Join-Path $WorkDir "graphblas-bin-dir.txt") -Encoding Ascii
 
     $LA = Join-Path $Src "LAGraph"
     if (-not (Test-Path $LA)) {

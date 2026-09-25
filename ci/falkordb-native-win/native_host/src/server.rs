@@ -220,6 +220,14 @@ fn hex(b: u8) -> Option<u8> {
 }
 
 pub fn serve(config: ServerConfig) -> Result<(), String> {
+    let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
+    serve_with_catalog(config, catalog)
+}
+
+pub fn serve_with_catalog(
+    config: ServerConfig,
+    catalog: Arc<GraphCatalog>,
+) -> Result<(), String> {
     config.validate()?;
     let tls = config
         .tls
@@ -227,7 +235,6 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
         .map(load_tls_config)
         .transpose()?
         .map(Arc::new);
-    let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
     let listener = TcpListener::bind(config.bind)
         .map_err(|e| format!("bind {}: {e}", config.bind))?;
 
@@ -279,7 +286,7 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, String> {
+pub(crate) fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, String> {
     // Multiple transitive crates can enable more than one rustls provider.
     // Select ring explicitly so TLS startup is deterministic instead of
     // relying on rustls feature auto-detection.

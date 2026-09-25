@@ -1,0 +1,60 @@
+name: FalkorDB native Windows CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - chatgpt/falkordb-native-win-ci
+    paths:
+      - 'ci/falkordb-native-win/**'
+      - '.github/workflows/falkordb-native-win-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          git --version
+          cmake --version
+          python --version
+          rustc -Vv
+          cargo -V
+          Get-Command cl.exe -ErrorAction SilentlyContinue
+          Get-Command link.exe -ErrorAction SilentlyContinue
+
+      - name: Bootstrap native dependencies
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1'
+
+      - name: Compile, link, and run smoke test
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\diagnose.ps1'
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falkordb-native-windows-diagnostics
+          path: ci/falkordb-native-win/build/logs
+          if-no-files-found: ignore

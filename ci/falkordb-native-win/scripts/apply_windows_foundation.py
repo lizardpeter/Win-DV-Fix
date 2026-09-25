@@ -168,18 +168,6 @@ fn create_archive_alias(src: &std::path::Path, dst: &std::path::Path) -> std::io
     if old_lagraph in s:
         s = s.replace(old_lagraph, new_lagraph, 1)
 
-    old_graphblas_link = '''    println!("cargo:rustc-link-lib=static=lagraphx");
-    println!("cargo:rustc-link-lib=static=lagraph");
-    println!("cargo:rustc-link-lib=static=graphblas");'''
-    new_graphblas_link = '''    println!("cargo:rustc-link-lib=static=lagraphx");
-    println!("cargo:rustc-link-lib=static=lagraph");
-    #[cfg(windows)]
-    println!("cargo:rustc-link-lib=dylib=graphblas");
-    #[cfg(not(windows))]
-    println!("cargo:rustc-link-lib=static=graphblas");'''
-    if old_graphblas_link in s:
-        s = s.replace(old_graphblas_link, new_graphblas_link, 1)
-
     old_omp = '''    if libomp_static {
         println!("cargo:rustc-link-lib=static=omp");
     } else {

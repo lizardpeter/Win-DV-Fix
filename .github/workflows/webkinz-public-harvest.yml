@@ -1,0 +1,140 @@
+name: Webkinz public harvest
+
+on:
+  push:
+    branches:
+      - webkinz-harvest
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harvest endpoints
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out/files out/meta
+          echo "runner=$(uname -a)" > out/meta/environment.txt
+          python3 --version >> out/meta/environment.txt 2>&1
+          curl --version | head -n 2 >> out/meta/environment.txt 2>&1
+
+          for h in play.webkinz.com downloads.webkinz.com www.webkinz.com assets.webkinz.com bluepload.unstable.life db-api.unstable.life ooooooooo.ooo; do
+            echo "### $h" >> out/meta/dns.txt
+            getent ahosts "$h" >> out/meta/dns.txt 2>&1 || true
+          done
+
+          fetch() {
+            name="$1"
+            url="$2"
+            echo "$url" > "out/meta/$name.url"
+            curl -L --retry 2 --retry-all-errors --connect-timeout 20 --max-time 180 \
+              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
+              -D "out/meta/$name.headers" \
+              -o "out/files/$name" \
+              "$url" >"out/meta/$name.stdout" 2>"out/meta/$name.stderr"
+            echo "$?" > "out/meta/$name.exit"
+            if [ -f "out/files/$name" ]; then
+              wc -c "out/files/$name" > "out/meta/$name.size"
+              file "out/files/$name" > "out/meta/$name.file" 2>&1 || true
+              sha256sum "out/files/$name" > "out/meta/$name.sha256" 2>&1 || true
+            fi
+            return 0
+          }
+
+          fetch wconf_js_php 'https://play.webkinz.com/wconf.js.php'
+          fetch latest_yml 'https://downloads.webkinz.com/apps/latest.yml'
+          fetch play_root 'https://play.webkinz.com/'
+          fetch webkinz_swf 'https://www.webkinz.com/Webkinz.swf?v320_181'
+          fetch main2_swf 'https://www.webkinz.com/SWF/main2.swf?v=v320_181'
+          fetch translist_xml 'https://www.webkinz.com/XML/L10N/TransList.xml'
+          fetch flashpoint_search 'https://ooooooooo.ooo/browse?search=Webkinz'
+          fetch dbapi_search_query 'https://db-api.unstable.life/search?query=Webkinz'
+          fetch dbapi_search_search 'https://db-api.unstable.life/search?search=Webkinz'
+
+          curl -IL --connect-timeout 20 --max-time 180 -A 'Mozilla/5.0' \
+            'https://bluepload.unstable.life/webkinzfiles.7z' \
+            > out/meta/webkinzfiles_7z_head.txt 2>&1
+          echo "$?" > out/meta/webkinzfiles_7z_head.exit
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re, zlib
+
+          files = Path("out/files")
+          meta = Path("out/meta")
+          report = {}
+          url_re = re.compile(rb'https?://[^\x00\s"\'<>]+', re.I)
+          ext_re = re.compile(rb'[A-Za-z0-9_./%?=&+ -]{2,260}\.(?:swf|xml|php|jpg|jpeg|png|gif|mp3|wav|flv|json|js)(?:\?[^\x00\s"\'<>]{0,200})?', re.I)
+
+          for p in sorted(files.glob("*")):
+              if not p.is_file():
+                  continue
+              raw = p.read_bytes()
+              data = raw
+              if len(raw) >= 8 and raw[:3] == b"CWS":
+                  try:
+                      data = b"FWS" + raw[3:8] + zlib.decompress(raw[8:])
+                      (meta / f"{p.name}.uncompressed.swf").write_bytes(data)
+                  except Exception:
+                      pass
+
+              urls = sorted({m.group().decode("latin1", "ignore") for m in url_re.finditer(data)})
+              paths = sorted({m.group().decode("latin1", "ignore").strip() for m in ext_re.finditer(data)})
+              strings = []
+              for s in re.findall(rb'[ -~]{6,}', data):
+                  t = s.decode("latin1", "ignore")
+                  l = t.lower()
+                  if any(k in l for k in (".swf", ".xml", ".php", "webkinz", "arcade", "api/", "assets", "loader", "main2", "config")):
+                      strings.append(t)
+
+              report[p.name] = {
+                  "size": len(raw),
+                  "urls": urls,
+                  "paths": paths,
+                  "interesting_strings": strings[:20000],
+              }
+
+          Path("out/report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+          Path("out/urls.txt").write_text(
+              "\n".join(sorted({x for v in report.values() for x in v["urls"]})) + "\n",
+              encoding="utf-8",
+          )
+          Path("out/paths.txt").write_text(
+              "\n".join(sorted({x for v in report.values() for x in v["paths"]})) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '# Webkinz public harvest'
+            echo
+            echo '## Files'
+            find out/files -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+            echo
+            echo '## URL candidates'
+            cat out/urls.txt 2>/dev/null || true
+            echo
+            echo '## Path candidates'
+            cat out/paths.txt 2>/dev/null || true
+            echo
+            echo '## webkinzfiles.7z HEAD'
+            cat out/meta/webkinzfiles_7z_head.txt 2>/dev/null || true
+          } > out/SUMMARY.md
+
+      - name: Upload harvest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkinz-public-harvest
+          path: out/
+          if-no-files-found: error
+          retention-days: 7

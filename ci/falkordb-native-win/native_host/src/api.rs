@@ -484,7 +484,7 @@ fn handle_mcp(
         }
         "ping" if !modern => mcp_jsonrpc_result(id, json!({})),
         "tools/list" => {
-            let mut result = json!({"tools": mcp_tools(scope)});
+            let mut result = json!({"tools": mcp_tools(scope, config)});
             if modern {
                 if let Some(object) = result.as_object_mut() {
                     object.insert("ttlMs".to_string(), json!(0));
@@ -508,6 +508,21 @@ fn handle_mcp(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+
+            if let Some(required_scope) = mcp_required_oauth_scope(name, config) {
+                let authorized = match required_scope {
+                    RequiredOAuthScope::Read => {
+                        matches!(scope, AuthScope::ReadOnly | AuthScope::ReadWrite)
+                    }
+                    RequiredOAuthScope::Write => scope == AuthScope::ReadWrite,
+                };
+                if !authorized {
+                    return mcp_jsonrpc_result(
+                        id,
+                        mcp_oauth_tool_error(config, required_scope, modern),
+                    );
+                }
+            }
 
             match mcp_call_tool(name, arguments, catalog, scope) {
                 Ok(structured) => {
@@ -576,7 +591,7 @@ fn mcp_is_modern(request: &HttpRequest, message: &JsonValue) -> bool {
             .is_some_and(|method| method == "server/discover")
 }
 
-fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
+fn mcp_tools(scope: AuthScope, config: &ApiConfig) -> Vec<JsonValue> {
     let mut tools = vec![
         json!({
             "name": "list_graphs",
@@ -587,6 +602,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
                 "properties": {},
                 "additionalProperties": false
             },
+            "securitySchemes": mcp_security_schemes(config, RequiredOAuthScope::Read),
             "annotations": {
                 "title": "List graphs",
                 "readOnlyHint": true,
@@ -608,6 +624,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
                 },
                 "additionalProperties": false
             },
+            "securitySchemes": mcp_security_schemes(config, RequiredOAuthScope::Read),
             "annotations": {
                 "title": "Read graph",
                 "readOnlyHint": true,
@@ -646,6 +663,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
                 },
                 "additionalProperties": false
             },
+            "securitySchemes": mcp_security_schemes(config, RequiredOAuthScope::Write),
             "annotations": {
                 "title": "Batch graph operations",
                 "readOnlyHint": scope != AuthScope::ReadWrite,
@@ -656,7 +674,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
         }),
     ];
 
-    if scope == AuthScope::ReadWrite {
+    if scope == AuthScope::ReadWrite || config.oauth.is_some() {
         tools.push(json!({
             "name": "write_graph",
             "title": "Write graph",
@@ -670,6 +688,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
                 },
                 "additionalProperties": false
             },
+            "securitySchemes": mcp_security_schemes(config, RequiredOAuthScope::Write),
             "annotations": {
                 "title": "Write graph",
                 "readOnlyHint": false,
@@ -690,6 +709,7 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
                 },
                 "additionalProperties": false
             },
+            "securitySchemes": mcp_security_schemes(config, RequiredOAuthScope::Write),
             "annotations": {
                 "title": "Delete graph",
                 "readOnlyHint": false,
@@ -701,6 +721,91 @@ fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
     }
 
     tools
+}
+
+
+#[derive(Clone, Copy)]
+enum RequiredOAuthScope {
+    Read,
+    Write,
+}
+
+fn mcp_required_oauth_scope(
+    name: &str,
+    config: &ApiConfig,
+) -> Option<RequiredOAuthScope> {
+    config.oauth.as_ref()?;
+    match name {
+        "list_graphs" | "read_graph" => Some(RequiredOAuthScope::Read),
+        "batch_graph" | "write_graph" | "delete_graph" => Some(RequiredOAuthScope::Write),
+        _ => None,
+    }
+}
+
+fn mcp_security_schemes(
+    config: &ApiConfig,
+    required: RequiredOAuthScope,
+) -> Vec<JsonValue> {
+    let Some(oauth) = &config.oauth else {
+        // The development/static-token path is intentionally not advertised as
+        // OAuth. In production the OAuth branch supplies an oauth2 scheme.
+        return Vec::new();
+    };
+    let scope = match required {
+        RequiredOAuthScope::Read => &oauth.config().read_scope,
+        RequiredOAuthScope::Write => &oauth.config().write_scope,
+    };
+    vec![json!({
+        "type": "oauth2",
+        "scopes": [scope]
+    })]
+}
+
+fn mcp_oauth_tool_error(
+    config: &ApiConfig,
+    required: RequiredOAuthScope,
+    modern: bool,
+) -> JsonValue {
+    let oauth = config
+        .oauth
+        .as_ref()
+        .expect("OAuth challenge requires configured verifier");
+    let scope = match required {
+        RequiredOAuthScope::Read => &oauth.config().read_scope,
+        RequiredOAuthScope::Write => &oauth.config().write_scope,
+    };
+    let metadata = format!(
+        "{}/.well-known/oauth-protected-resource",
+        oauth.config().resource.trim_end_matches('/')
+    );
+    let challenge = format!(
+        "Bearer resource_metadata=\"{}\", scope=\"{}\", error=\"insufficient_scope\", error_description=\"Authorization with {} is required\"",
+        metadata, scope, scope
+    );
+
+    let mut result = json!({
+        "content": [{
+            "type": "text",
+            "text": format!("Authentication required: missing OAuth scope {scope}.")
+        }],
+        "structuredContent": {
+            "error": {
+                "code": "oauth_required",
+                "message": format!("OAuth scope {scope} is required")
+            }
+        },
+        "_meta": {
+            "mcp/www_authenticate": [challenge]
+        },
+        "isError": true
+    });
+    if modern {
+        result
+            .as_object_mut()
+            .expect("OAuth MCP result is object")
+            .insert("resultType".to_string(), json!("complete"));
+    }
+    result
 }
 
 fn mcp_call_tool(

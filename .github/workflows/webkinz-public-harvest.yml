@@ -1,4 +1,4 @@
-name: Webkinz public harvest
+name: Webkinz path verify
 
 on:
   push:
@@ -10,33 +10,23 @@ permissions:
   contents: read
 
 jobs:
-  harvest:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - name: Harvest endpoints
+      - name: Fetch lazy play chunks and verify source trees
         shell: bash
         run: |
           set +e
-          mkdir -p out/files out/meta
-          echo "runner=$(uname -a)" > out/meta/environment.txt
-          python3 --version >> out/meta/environment.txt 2>&1
-          curl --version | head -n 2 >> out/meta/environment.txt 2>&1
-
-          for h in play.webkinz.com downloads.webkinz.com www.webkinz.com assets.webkinz.com bluepload.unstable.life db-api.unstable.life ooooooooo.ooo; do
-            echo "### $h" >> out/meta/dns.txt
-            getent ahosts "$h" >> out/meta/dns.txt 2>&1 || true
-          done
+          mkdir -p out/files out/meta out/decompiled
 
           fetch() {
-            name="$1"
-            url="$2"
+            name="$1"; url="$2"
             echo "$url" > "out/meta/$name.url"
             curl -L --retry 2 --retry-all-errors --connect-timeout 20 --max-time 180 \
               -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
-              -D "out/meta/$name.headers" \
-              -o "out/files/$name" \
-              "$url" >"out/meta/$name.stdout" 2>"out/meta/$name.stderr"
+              -D "out/meta/$name.headers" -o "out/files/$name" "$url" \
+              >"out/meta/$name.stdout" 2>"out/meta/$name.stderr"
             echo "$?" > "out/meta/$name.exit"
             if [ -f "out/files/$name" ]; then
               wc -c "out/files/$name" > "out/meta/$name.size"
@@ -46,209 +36,115 @@ jobs:
             return 0
           }
 
-          fetch wconf_js_php 'https://play.webkinz.com/wconf.js.php'
-          fetch latest_yml 'https://downloads.webkinz.com/apps/latest.yml'
-          fetch play_root 'https://play.webkinz.com/'
-          fetch webkinz_swf 'https://www.webkinz.com/Webkinz.swf?v320_181'
-          fetch main2_swf 'https://www.webkinz.com/SWF/main2.swf?v=v320_181'
-          fetch translist_xml 'https://www.webkinz.com/XML/L10N/TransList.xml'
-          fetch flashpoint_search 'https://ooooooooo.ooo/browse?search=Webkinz'
-          fetch dbapi_search_query 'https://db-api.unstable.life/search?query=Webkinz'
-          fetch dbapi_search_search 'https://db-api.unstable.life/search?search=Webkinz'
+          # Lazy-loaded Play route: runtime declares chunks [1, 11, 0, 22].
+          fetch play_chunk_1  'https://play.webkinz.com/1.bed31ad6b74769d0989b.js'
+          fetch play_chunk_11 'https://play.webkinz.com/11.b248ee40ed2bc7ca5fb2.js'
+          fetch play_common   'https://play.webkinz.com/common.8cba702ee7ffc4f0306f.js'
+          fetch play_chunk_22 'https://play.webkinz.com/22.6dcadeecc981526283f8.js'
 
-          curl -IL --connect-timeout 20 --max-time 180 -A 'Mozilla/5.0' \
-            'https://bluepload.unstable.life/webkinzfiles.7z' \
-            > out/meta/webkinzfiles_7z_head.txt 2>&1
-          echo "$?" > out/meta/webkinzfiles_7z_head.exit
+          # Classic AS2 tree, resolved relative to SITE_URL / www.webkinz.com.
+          fetch www_arcade        'https://www.webkinz.com/SWF/ARCADE/arcade.swf?v=v390_249'
+          fetch www_tips          'https://www.webkinz.com/SWF/staticdata/tips.swf?v=v390_249'
+          fetch www_views         'https://www.webkinz.com/SWF/staticdata/views.swf?v=v390_249'
+          fetch www_envmain       'https://www.webkinz.com/SWF/staticdata/envMain.swf?v=v390_249'
+          fetch www_webkinz_xml   'https://www.webkinz.com/SWF/server/webkinzXML.swf?v=v390_249'
+          fetch www_as3bridge     'https://www.webkinz.com/SWF/server/as3bridgeService.swf?v=v390_249'
+          fetch www_friendlist    'https://www.webkinz.com/SWF/FRIENDLIST/friendlist_channels_deluxe.swf?v=v390_249'
+          fetch www_bamboo_break  'https://www.webkinz.com/SWF/ARCADE/GAMES/bambooBreak.swf?v=v390_249'
+          fetch www_translist_v   'https://www.webkinz.com/XML/L10N/TransList.xml?v=v390_249'
+          fetch www_l10n_main2    'https://www.webkinz.com/XML/L10N/US_EN/main2.xml'
+          fetch www_main2_xml     'https://www.webkinz.com/main2.xml?v=v390_249'
+
+          # Newer asset domain paths, explicitly constructed by PathSettings/main2.
+          fetch assets_petclasses 'https://assets.webkinz.com/swf/pet/petclasses.swf?v=v390_249'
+          fetch assets_cross      'https://assets.webkinz.com/swf/pet/crossAccess.swf'
+          fetch assets_pet_9018   'https://assets.webkinz.com/swf/pet/9018/emotions.swf'
 
           python3 - <<'PY'
           from pathlib import Path
-          import json, re, zlib
-
-          files = Path("out/files")
-          meta = Path("out/meta")
-          report = {}
-          url_re = re.compile(rb'https?://[^\x00\s"\'<>]+', re.I)
-          ext_re = re.compile(rb'[A-Za-z0-9_./%?=&+ -]{2,260}\.(?:swf|xml|php|jpg|jpeg|png|gif|mp3|wav|flv|json|js)(?:\?[^\x00\s"\'<>]{0,200})?', re.I)
-
-          for p in sorted(files.glob("*")):
-              if not p.is_file():
-                  continue
-              raw = p.read_bytes()
-              data = raw
-              if len(raw) >= 8 and raw[:3] == b"CWS":
-                  try:
-                      data = b"FWS" + raw[3:8] + zlib.decompress(raw[8:])
-                      (meta / f"{p.name}.uncompressed.swf").write_bytes(data)
-                  except Exception:
-                      pass
-
-              urls = sorted({m.group().decode("latin1", "ignore") for m in url_re.finditer(data)})
-              paths = sorted({m.group().decode("latin1", "ignore").strip() for m in ext_re.finditer(data)})
-              strings = []
-              for s in re.findall(rb'[ -~]{6,}', data):
-                  t = s.decode("latin1", "ignore")
-                  l = t.lower()
-                  if any(k in l for k in (".swf", ".xml", ".php", "webkinz", "arcade", "api/", "assets", "loader", "main2", "config")):
-                      strings.append(t)
-
-              report[p.name] = {
-                  "size": len(raw),
-                  "urls": urls,
-                  "paths": paths,
-                  "interesting_strings": strings[:20000],
-              }
-
-          Path("out/report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-          Path("out/urls.txt").write_text(
-              "\n".join(sorted({x for v in report.values() for x in v["urls"]})) + "\n",
-              encoding="utf-8",
-          )
-          Path("out/paths.txt").write_text(
-              "\n".join(sorted({x for v in report.values() for x in v["paths"]})) + "\n",
-              encoding="utf-8",
-          )
+          import json,re
+          root=Path("out/files")
+          report={}
+          needles=(b'Webkinz.swf',b'main2.swf',b'flashVars',b'flashvars',b'service.api.url',
+                   b'service.assets.url',b'service.site.url',b'application.v',b'wconf.js.php',
+                   b'ASSETSDomain',b'SITEDomain',b'WAPIDomain')
+          for p in sorted(root.glob("*")):
+              if not p.is_file(): continue
+              b=p.read_bytes()
+              hdr=(Path("out/meta")/f"{p.name}.headers").read_text(errors="ignore") if (Path("out/meta")/f"{p.name}.headers").exists() else ""
+              status=[]
+              for line in hdr.splitlines():
+                  if line.startswith("HTTP/"): status.append(line)
+              strings=[]
+              if p.name.startswith("play_"):
+                  text=b.decode("utf-8","ignore")
+                  for needle in [x.decode() for x in needles]:
+                      start=0
+                      while True:
+                          i=text.find(needle,start)
+                          if i<0: break
+                          strings.append(text[max(0,i-1000):i+3000])
+                          start=i+len(needle)
+              report[p.name]={"size":len(b),"http":status,"magic":b[:16].hex(),"interesting":strings}
+          Path("out/report.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+          with Path("out/verified.tsv").open("w",encoding="utf-8") as f:
+              f.write("name\tsize\thttp\turl\n")
+              for name,v in report.items():
+                  url=(Path("out/meta")/f"{name}.url").read_text().strip()
+                  f.write(f"{name}\t{v['size']}\t{' | '.join(v['http'])}\t{url}\n")
           PY
+
+      - name: Decompile verified arcade SWF
+        shell: bash
+        run: |
+          set +e
+          if [ -f out/files/www_arcade ] && head -c 3 out/files/www_arcade | grep -Eq 'FWS|CWS|ZWS'; then
+            curl -L --retry 3 --retry-all-errors --connect-timeout 30 --max-time 300 \
+              -o /tmp/ffdec.zip \
+              'https://github.com/jindrapetrik/jpexs-decompiler/releases/download/version26.3.0/ffdec_26.3.0.zip'
+            echo '35f4930eb7c380afe66f2117f90b006deac0631473ad7500bb39c78f68645ecd  /tmp/ffdec.zip' | sha256sum -c -
+            mkdir -p /tmp/ffdec
+            unzip -q /tmp/ffdec.zip -d /tmp/ffdec
+            FFDEC="$(find /tmp/ffdec -name ffdec.jar -print -quit)"
+            java -Xmx4g -Djava.awt.headless=true -jar "$FFDEC" -export script out/decompiled/arcade out/files/www_arcade \
+              >out/meta/arcade_ffdec.stdout 2>out/meta/arcade_ffdec.stderr
+            echo "$?" > out/meta/arcade_ffdec.exit
+            grep -RInaE 'https?://|\.swf|\.xml|\.php|arcade|game|index\.php' out/decompiled/arcade \
+              > out/arcade_hits.txt 2>/dev/null || true
+          fi
 
       - name: Summarize
         if: always()
         shell: bash
         run: |
           {
-            echo '# Webkinz public harvest'
+            echo '# Webkinz path verification'
             echo
-            echo '## Files'
-            find out/files -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+            cat out/verified.tsv 2>/dev/null || true
             echo
-            echo '## URL candidates'
-            cat out/urls.txt 2>/dev/null || true
+            echo '## Lazy chunk hits'
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("out/report.json")
+          if p.exists():
+              d=json.loads(p.read_text())
+              for name,v in d.items():
+                  if v.get("interesting"):
+                      print("\n###",name)
+                      for x in v["interesting"]:
+                          print(x[:5000])
+          PY
             echo
-            echo '## Path candidates'
-            cat out/paths.txt 2>/dev/null || true
-            echo
-            echo '## webkinzfiles.7z HEAD'
-            cat out/meta/webkinzfiles_7z_head.txt 2>/dev/null || true
+            echo '## Arcade decompile hits'
+            head -n 2000 out/arcade_hits.txt 2>/dev/null || true
           } > out/SUMMARY.md
 
-
-      - name: Fetch current play bundles and core assets
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          mkdir -p out/current out/current_meta
-
-          fetch2() {
-            name="$1"
-            url="$2"
-            echo "$url" > "out/current_meta/$name.url"
-            curl -L --retry 2 --retry-all-errors --connect-timeout 20 --max-time 180 \
-              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
-              -D "out/current_meta/$name.headers" \
-              -o "out/current/$name" \
-              "$url" >"out/current_meta/$name.stdout" 2>"out/current_meta/$name.stderr"
-            echo "$?" > "out/current_meta/$name.exit"
-            if [ -f "out/current/$name" ]; then
-              wc -c "out/current/$name" > "out/current_meta/$name.size"
-              file "out/current/$name" > "out/current_meta/$name.file" 2>&1 || true
-              sha256sum "out/current/$name" > "out/current_meta/$name.sha256" 2>&1 || true
-            fi
-            return 0
-          }
-
-          fetch2 play_runtime_js 'https://play.webkinz.com/runtime.4fd09af43b6bc8d95a03.js'
-          fetch2 play_polyfills_js 'https://play.webkinz.com/polyfills.8ae21cca062f6f7f7c29.js'
-          fetch2 play_vendor_js 'https://play.webkinz.com/vendor.f9da5857a20f170f68a7.js'
-          fetch2 play_main_js 'https://play.webkinz.com/main.f0803e1f17ed9e88d9ce.js'
-          fetch2 play_styles_css 'https://play.webkinz.com/styles.f5d1c9eecac4834891da.css'
-
-          fetch2 play_runtime_map 'https://play.webkinz.com/runtime.4fd09af43b6bc8d95a03.js.map'
-          fetch2 play_polyfills_map 'https://play.webkinz.com/polyfills.8ae21cca062f6f7f7c29.js.map'
-          fetch2 play_vendor_map 'https://play.webkinz.com/vendor.f9da5857a20f170f68a7.js.map'
-          fetch2 play_main_map 'https://play.webkinz.com/main.f0803e1f17ed9e88d9ce.js.map'
-
-          fetch2 webkinz_swf_current 'https://www.webkinz.com/Webkinz.swf?v390_249'
-          fetch2 main2_swf_current 'https://www.webkinz.com/SWF/main2.swf?v=v390_249'
-          fetch2 arcade_swf 'https://assets.webkinz.com/SWF/ARCADE/arcade.swf?v=v390_249'
-          fetch2 webkinz_xml_swf 'https://assets.webkinz.com/SWF/server/webkinzXML.swf?v=v390_249'
-          fetch2 as3bridge_swf 'https://assets.webkinz.com/SWF/server/as3bridgeService.swf?v=v390_249'
-          fetch2 envmain_swf 'https://assets.webkinz.com/SWF/staticdata/envMain.swf?v=v390_249'
-          fetch2 tips_swf 'https://assets.webkinz.com/SWF/staticdata/tips.swf?v=v390_249'
-          fetch2 views_swf 'https://assets.webkinz.com/SWF/staticdata/views.swf?v=v390_249'
-          fetch2 items_swf 'https://assets.webkinz.com/items.swf?v=v390_249'
-          fetch2 petclasses_swf 'https://assets.webkinz.com/petclasses.swf?v=v390_249'
-          fetch2 main2_xml 'https://assets.webkinz.com/main2.xml?v=v390_249'
-          fetch2 instance_factory_xml 'https://assets.webkinz.com/XML/InstanceFactory/InstanceFactoryData.xml?v=v390_249'
-          fetch2 translist_current_xml 'https://assets.webkinz.com/XML/L10N/TransList.xml?v=v390_249'
-          fetch2 servers_xml 'https://es4aws.webkinz.com/servers.xml'
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re, json
-
-          root=Path("out/current")
-          report={}
-          url_re=re.compile(rb'https?://[^\x00\s"\'<>]+',re.I)
-          path_re=re.compile(rb'[A-Za-z0-9_./%?=&+ -]{2,300}\.(?:swf|xml|php|jpg|jpeg|png|gif|mp3|wav|flv|json|js)(?:\?[^\x00\s"\'<>]{0,200})?',re.I)
-          for p in sorted(root.glob("*")):
-              if not p.is_file(): continue
-              b=p.read_bytes()
-              urls=sorted({m.group().decode("latin1","ignore") for m in url_re.finditer(b)})
-              paths=sorted({m.group().decode("latin1","ignore").strip() for m in path_re.finditer(b)})
-              report[p.name]={"size":len(b),"urls":urls,"paths":paths}
-          Path("out/current_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
-          Path("out/current_urls.txt").write_text("\n".join(sorted({u for x in report.values() for u in x["urls"]}))+"\n",encoding="utf-8")
-          Path("out/current_paths.txt").write_text("\n".join(sorted({u for x in report.values() for u in x["paths"]}))+"\n",encoding="utf-8")
-          PY
-
-      - name: Decompile core SWFs with FFDec
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          mkdir -p out/decompiled out/decompile_meta /tmp/ffdec
-          curl -L --retry 3 --retry-all-errors --connect-timeout 30 --max-time 300 \
-            -o /tmp/ffdec.zip \
-            'https://github.com/jindrapetrik/jpexs-decompiler/releases/download/version26.3.0/ffdec_26.3.0.zip' \
-            >out/decompile_meta/ffdec_download.stdout 2>out/decompile_meta/ffdec_download.stderr
-          echo "$?" > out/decompile_meta/ffdec_download.exit
-          sha256sum /tmp/ffdec.zip > out/decompile_meta/ffdec_download.sha256 2>&1 || true
-          echo '35f4930eb7c380afe66f2117f90b006deac0631473ad7500bb39c78f68645ecd  /tmp/ffdec.zip' | sha256sum -c - \
-            >out/decompile_meta/ffdec_verify.txt 2>&1
-          unzip -q /tmp/ffdec.zip -d /tmp/ffdec >out/decompile_meta/unzip.stdout 2>out/decompile_meta/unzip.stderr
-          FFDEC="$(find /tmp/ffdec -name ffdec.jar -print -quit)"
-          echo "$FFDEC" > out/decompile_meta/ffdec_jar.txt
-          java -version > out/decompile_meta/java_version.txt 2>&1
-          java -Xmx4g -Djava.awt.headless=true -jar "$FFDEC" -help > out/decompile_meta/ffdec_help.txt 2>&1
-
-          decompile() {
-            name="$1"
-            infile="$2"
-            if [ -f "$infile" ]; then
-              mkdir -p "out/decompiled/$name"
-              java -Xmx4g -Djava.awt.headless=true -jar "$FFDEC" \
-                -export script "out/decompiled/$name" "$infile" \
-                >"out/decompile_meta/$name.stdout" 2>"out/decompile_meta/$name.stderr"
-              echo "$?" > "out/decompile_meta/$name.exit"
-            fi
-            return 0
-          }
-
-          decompile webkinz out/files/webkinz_swf
-          decompile main2 out/files/main2_swf
-          decompile arcade out/current/arcade_swf
-          decompile webkinz_xml out/current/webkinz_xml_swf
-          decompile as3bridge out/current/as3bridge_swf
-
-          find out/decompiled -type f -printf '%p %s bytes\n' | sort > out/decompiled_files.txt 2>/dev/null || true
-          grep -RInaE 'https?://|\.swf|\.xml|\.php|wconf|main2|assets\.webkinz|api\.webkinz|servers\.xml|arcade' out/decompiled \
-            > out/decompiled_hits.txt 2>/dev/null || true
-
-      - name: Upload harvest artifact
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webkinz-public-harvest
+          name: webkinz-path-verify
           path: out/
           if-no-files-found: error
           retention-days: 7

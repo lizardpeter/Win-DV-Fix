@@ -6,7 +6,7 @@ pub mod server;
 pub mod wal;
 pub mod wire;
 
-use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc};
+use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc, time::{Duration, Instant}};
 
 use graph::{
     effects::EffectsPayload,
@@ -189,18 +189,19 @@ impl NativeGraph {
                     })?;
                 }
 
-                // EFFECT_CREATE_INDEX is replayed in WAL order. If an index was
-                // originally created after data already existed, replay creates
-                // the schema after those entity records. In the Redis host that
-                // population is asynchronous; during single-process recovery
-                // there is no published committed graph for that worker to scan.
-                // Once all effects are applied, the graph is fully constructed,
-                // so use FalkorDB's synchronous RDB-load population path before
-                // publishing the recovered MVCC version.
-                graph.populate_indexes_sync();
+                // CREATE INDEX effects intentionally use FalkorDB's normal
+                // generation-safe asynchronous population path. Do not call
+                // populate_indexes_sync() here: the replay-created worker already
+                // owns the population ticket, and acquiring another pre-commit
+                // ticket makes that worker correctly treat the generation as
+                // conflicting and stop.
             }
 
+            // Publication installs the recovered graph Arc into the indexers,
+            // which is the point at which replay-created population workers can
+            // safely scan the fully reconstructed graph.
             mvcc.commit(Arc::clone(&private));
+            wait_for_recovered_indexes(&mvcc, Duration::from_secs(60))?;
         }
 
         Ok(Self {
@@ -374,6 +375,45 @@ impl NativeGraph {
         }
 
         Ok(output)
+    }
+}
+
+fn wait_for_recovered_indexes(
+    mvcc: &MvccGraph,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let snapshot = mvcc.read();
+        let infos = snapshot.borrow().index_info();
+
+        let incomplete: Vec<String> = infos
+            .iter()
+            .filter(|info| info.pending > 0 || (info.total > 0 && info.progress < info.total))
+            .map(|info| {
+                format!(
+                    "{}:{} pending={} progress={}/{}",
+                    info.entity_type, info.label, info.pending, info.progress, info.total
+                )
+            })
+            .collect();
+
+        if incomplete.is_empty() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "native host: timed out waiting for recovered index population: {}",
+                incomplete.join(", ")
+            ));
+        }
+
+        // Drop the graph snapshot before sleeping so population workers can
+        // borrow and update their index stores without unnecessary retention.
+        drop(snapshot);
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

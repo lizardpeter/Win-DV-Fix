@@ -28,16 +28,6 @@ if (Test-Path $LibDirFile) {
 $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
 $env:LAGRAPH_LIB_DIR = $NativeLibDir
 
-$GBBinFile = Join-Path $WorkDir "graphblas-bin-dir.txt"
-if (Test-Path $GBBinFile) {
-    $GraphBLASBinDir = (Get-Content $GBBinFile -Raw).Trim()
-    if (-not (Test-Path (Join-Path $GraphBLASBinDir "graphblas.dll"))) {
-        throw "graphblas.dll not found in recorded runtime directory: $GraphBLASBinDir"
-    }
-    $env:PATH = "$GraphBLASBinDir;$env:PATH"
-    "GraphBLAS runtime directory: $GraphBLASBinDir" |
-        Tee-Object -FilePath (Join-Path $Logs "00_graphblas_runtime_dir.txt")
-}
 $env:FALKORDB_NATIVE_NO_OPENMP = "1"
 $env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
 $env:FALKORDB_SKIP_REDISEARCH = "1"

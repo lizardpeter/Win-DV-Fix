@@ -22,6 +22,7 @@ pub struct WalRecord {
 struct WalState {
     file: File,
     next_sequence: u64,
+    floor_sequence: u64,
     last_error: Option<String>,
 }
 
@@ -35,9 +36,21 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open/validate the WAL. A torn final frame is truncated to the last fully
-    /// fsynced frame; corruption in a complete frame is an error.
+    /// Open/validate a WAL without a checkpoint baseline.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<WalRecord>), String> {
+        Self::open_after(path, 0)
+    }
+
+    /// Open/validate a WAL when a durable checkpoint already contains every
+    /// mutation through `floor_sequence`.
+    ///
+    /// A pre-compaction WAL may still begin at sequence 1; a compacted WAL may
+    /// begin at floor+1. Both are valid, and recovery filters records at or
+    /// below the checkpoint sequence.
+    pub fn open_after(
+        path: impl AsRef<Path>,
+        floor_sequence: u64,
+    ) -> Result<(Self, Vec<WalRecord>), String> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -51,10 +64,15 @@ impl Wal {
                 .map_err(|e| format!("create WAL {}: {e}", path.display()))?;
         }
 
-        let records = read_records_and_repair_tail(&path)?;
+        let records = read_records_and_repair_tail(&path, floor_sequence)?;
         let next_sequence = records
             .last()
-            .map_or(1, |record| record.sequence.saturating_add(1));
+            .map_or(floor_sequence.saturating_add(1), |record| {
+                record
+                    .sequence
+                    .saturating_add(1)
+                    .max(floor_sequence.saturating_add(1))
+            });
 
         let file = OpenOptions::new()
             .read(true)
@@ -69,6 +87,7 @@ impl Wal {
                 state: Mutex::new(WalState {
                     file,
                     next_sequence,
+                    floor_sequence,
                     last_error: None,
                 }),
             },
@@ -93,8 +112,40 @@ impl Wal {
 
 
     pub fn records(&self) -> Result<Vec<WalRecord>, String> {
-        let _guard = self.state.lock();
-        read_records_and_repair_tail(&self.path)
+        let state = self.state.lock();
+        read_records_and_repair_tail(&self.path, state.floor_sequence)
+    }
+
+    #[must_use]
+    pub fn last_sequence(&self) -> u64 {
+        self.state.lock().next_sequence.saturating_sub(1)
+    }
+
+    /// Drop all WAL frames through `sequence` after a checkpoint containing
+    /// those mutations is durable. New frames continue with absolute sequence
+    /// numbers, so a crash before or after truncation is unambiguous.
+    pub fn reset_after(&self, sequence: u64) -> Result<(), String> {
+        let mut state = self.state.lock();
+        state
+            .file
+            .set_len(0)
+            .map_err(|e| format!("truncate checkpointed WAL {}: {e}", self.path.display()))?;
+        state
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek checkpointed WAL {}: {e}", self.path.display()))?;
+        state
+            .file
+            .flush()
+            .map_err(|e| format!("flush checkpointed WAL {}: {e}", self.path.display()))?;
+        state
+            .file
+            .sync_all()
+            .map_err(|e| format!("sync checkpointed WAL {}: {e}", self.path.display()))?;
+        state.floor_sequence = sequence;
+        state.next_sequence = sequence.saturating_add(1);
+        state.last_error = None;
+        Ok(())
     }
 
     pub fn append_payload(
@@ -211,12 +262,12 @@ fn frame_crc(
     h.finalize()
 }
 
-fn read_records_and_repair_tail(path: &Path) -> Result<Vec<WalRecord>, String> {
+fn read_records_and_repair_tail(path: &Path, floor_sequence: u64) -> Result<Vec<WalRecord>, String> {
     let bytes = fs::read(path).map_err(|e| format!("read WAL {}: {e}", path.display()))?;
     let mut records = Vec::new();
     let mut pos = 0usize;
     let mut last_good = 0usize;
-    let mut expected_sequence = 1u64;
+    let mut expected_sequence: Option<u64> = None;
 
     while pos < bytes.len() {
         if bytes.len() - pos < HEADER_LEN {
@@ -240,10 +291,24 @@ fn read_records_and_repair_tail(path: &Path) -> Result<Vec<WalRecord>, String> {
 
         let sequence = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        if sequence != expected_sequence {
-            return Err(format!(
-                "WAL sequence discontinuity at byte {start}: got {sequence}, expected {expected_sequence}"
-            ));
+        if let Some(expected) = expected_sequence {
+            if sequence != expected {
+                return Err(format!(
+                    "WAL sequence discontinuity at byte {start}: got {sequence}, expected {expected}"
+                ));
+            }
+        } else {
+            let compacted_start = floor_sequence.saturating_add(1);
+            let valid_first = if floor_sequence == 0 {
+                sequence == 1
+            } else {
+                sequence == 1 || sequence == compacted_start
+            };
+            if !valid_first {
+                return Err(format!(
+                    "WAL sequence discontinuity at byte {start}: got first sequence {sequence}, expected 1 or {compacted_start}"
+                ));
+            }
         }
 
         let key_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -284,7 +349,7 @@ fn read_records_and_repair_tail(path: &Path) -> Result<Vec<WalRecord>, String> {
             key,
             payload,
         });
-        expected_sequence = expected_sequence.saturating_add(1);
+        expected_sequence = Some(sequence.saturating_add(1));
         last_good = pos;
     }
 
@@ -347,7 +412,7 @@ mod tests {
         bytes.extend_from_slice(&second[..second.len() - 3]);
         fs::write(&path, bytes).unwrap();
 
-        let records = read_records_and_repair_tail(&path).unwrap();
+        let records = read_records_and_repair_tail(&path, 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), first.len() as u64);
 
@@ -355,7 +420,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x80;
         fs::write(&path, corrupt).unwrap();
-        assert!(read_records_and_repair_tail(&path)
+        assert!(read_records_and_repair_tail(&path, 0)
             .unwrap_err()
             .contains("CRC mismatch"));
 

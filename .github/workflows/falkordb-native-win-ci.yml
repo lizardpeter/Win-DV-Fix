@@ -43,7 +43,22 @@ jobs:
           Get-Command cl.exe -ErrorAction SilentlyContinue
           Get-Command link.exe -ErrorAction SilentlyContinue
 
+      - name: Restore native dependency cache
+        id: native-deps
+        uses: actions/cache@v4
+        with:
+          path: ci/falkordb-native-win/build/native-prefix
+          key: falkordb-native-deps-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/scripts/bootstrap_windows.ps1') }}
+
+      - name: Bootstrap source with cached native dependencies
+        if: steps.native-deps.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1' -SkipNativeDeps
+
       - name: Bootstrap native dependencies
+        if: steps.native-deps.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           Set-ExecutionPolicy -Scope Process Bypass

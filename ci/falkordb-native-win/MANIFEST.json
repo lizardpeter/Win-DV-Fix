@@ -4,9 +4,14 @@
   "upstream_commit": "55204c94bb6c8bc1684ada3d712a61f73f324067",
   "target": "x86_64-pc-windows-msvc",
   "verified": true,
-  "verified_run_id": 36190878880,
-  "verified_commit": "3989ee1c8ec252bacd7e24fb51416cf7498c1874",
-  "final_marker": "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS",
+  "verified_run_id": 36198470377,
+  "verified_commit": "833eb680b2335feca473e448a8f845ce699e6100",
+  "standalone_marker": "NATIVE_WINDOWS_FULL_STANDALONE_PASS",
+  "network_markers": [
+    "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS",
+    "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS",
+    "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+  ],
   "redis_required": false,
   "redisearch_required": false,
   "memurai_required": false,
@@ -26,44 +31,57 @@
     "restart_recovery": true,
     "index_recovery": true,
     "resp_tcp_server": true,
-    "authentication": true,
+    "password_authentication": true,
     "official_falkordb_python_client": true,
     "compact_typed_wire_results": true,
     "multi_graph_catalog": true,
     "network_restart_recovery": true,
-    "late_index_recovery": true
+    "late_index_recovery": true,
+    "tls": true,
+    "mutual_tls": true,
+    "https_api": true,
+    "bearer_auth": true,
+    "read_only_api_scope": true,
+    "read_write_api_scope": true,
+    "openapi": true
+  },
+  "network": {
+    "falkordb_client": {
+      "transport": "RESP2 over TLS",
+      "default_port": 6379,
+      "authentication": [
+        "mTLS client certificate",
+        "AUTH password",
+        "AUTH username password"
+      ],
+      "verified_client": "FalkorDB/falkordb-py"
+    },
+    "chatgpt_api": {
+      "transport": "HTTPS JSON",
+      "default_port": 8443,
+      "authentication": "Bearer token",
+      "scopes": [
+        "read-only",
+        "read-write"
+      ],
+      "endpoints": [
+        "GET /healthz",
+        "GET /openapi.json",
+        "GET /v1/capabilities",
+        "GET /v1/graphs",
+        "POST /v1/query",
+        "POST /v1/batch",
+        "POST /v1/graphs/delete"
+      ]
+    }
   },
   "remaining": [
     "snapshot_compaction",
     "wal_rotation",
     "stress_testing",
     "performance_tuning",
-    "packaging",
+    "installer_service_packaging",
     "CAS_integration",
-    "reversal_graph_schema",
-    "optional_native_TLS",
-    "installer_service_packaging"
-  ],
-  "standalone_marker": "NATIVE_WINDOWS_FULL_STANDALONE_PASS",
-  "network": {
-    "protocol": "Redis RESP2-compatible command transport",
-    "default_port": 6379,
-    "auth": [
-      "AUTH password",
-      "AUTH username password"
-    ],
-    "verified_client": "FalkorDB/falkordb-py",
-    "verified_commands": [
-      "GRAPH.QUERY",
-      "GRAPH.RO_QUERY",
-      "GRAPH.LIST",
-      "GRAPH.DELETE",
-      "INFO",
-      "PING",
-      "AUTH",
-      "FLUSHDB",
-      "FLUSHALL"
-    ],
-    "security_note": "Use a private network/VPN or TLS termination for untrusted networks; AUTH alone does not encrypt RESP traffic."
-  }
+    "reversal_graph_schema"
+  ]
 }

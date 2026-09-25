@@ -287,6 +287,13 @@ fn route_http(
         return error_response(401, "unauthorized", "valid Bearer token required");
     }
 
+    if request.target == "/mcp" {
+        if request.method != "POST" {
+            return error_response(405, "method_not_allowed", "MCP uses POST on /mcp");
+        }
+        return handle_mcp(&request, catalog, scope);
+    }
+
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/v1/capabilities") => json_response(200, json!({
             "api_version": 1,
@@ -352,6 +359,516 @@ fn route_http(
             }
         }
         _ => error_response(404, "not_found", "unknown API route"),
+    }
+}
+
+
+fn handle_mcp(
+    request: &HttpRequest,
+    catalog: &GraphCatalog,
+    scope: AuthScope,
+) -> HttpResponse {
+    let message: JsonValue = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(err) => {
+            return mcp_jsonrpc_error(
+                JsonValue::Null,
+                -32700,
+                "Parse error",
+                Some(json!({"detail": err.to_string()})),
+                false,
+            );
+        }
+    };
+
+    let id = message.get("id").cloned().unwrap_or(JsonValue::Null);
+    let Some(method) = message.get("method").and_then(JsonValue::as_str) else {
+        return mcp_jsonrpc_error(
+            id,
+            -32600,
+            "Invalid Request",
+            None,
+            mcp_is_modern(request, &message),
+        );
+    };
+    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    let modern = mcp_is_modern(request, &message);
+
+    // Notifications have no JSON-RPC id and must not receive a JSON-RPC reply.
+    if message.get("id").is_none() {
+        return match method {
+            "notifications/initialized"
+            | "notifications/cancelled"
+            | "notifications/progress" => empty_response(202),
+            _ => empty_response(202),
+        };
+    }
+
+    match method {
+        "server/discover" => {
+            let result = json!({
+                "supportedVersions": ["2026-07-28", "2025-11-25"],
+                "capabilities": {
+                    "tools": {"listChanged": false}
+                },
+                "instructions": "Use list_graphs/read_graph for inspection. Use write_graph only for deliberate graph mutations. Use batch_graph to reduce round trips. delete_graph is destructive.",
+                "ttlMs": 0,
+                "cacheScope": "private",
+                "resultType": "complete",
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "reversalgraph-native",
+                        "title": "ReversalGraph Native",
+                        "version": "1.0.0"
+                    }
+                }
+            });
+            mcp_jsonrpc_result(id, result)
+        }
+        "initialize" => {
+            let requested = params
+                .get("protocolVersion")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("2025-11-25");
+            let negotiated = match requested {
+                "2025-11-25" | "2025-06-18" | "2025-03-26" => requested,
+                _ => "2025-11-25",
+            };
+            mcp_jsonrpc_result(
+                id,
+                json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {"listChanged": false}
+                    },
+                    "serverInfo": {
+                        "name": "reversalgraph-native",
+                        "title": "ReversalGraph Native",
+                        "version": "1.0.0"
+                    },
+                    "instructions": "Use list_graphs/read_graph for inspection. Use write_graph only for deliberate graph mutations. Use batch_graph to reduce round trips. delete_graph is destructive."
+                }),
+            )
+        }
+        "ping" if !modern => mcp_jsonrpc_result(id, json!({})),
+        "tools/list" => {
+            let mut result = json!({"tools": mcp_tools(scope)});
+            if modern {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("ttlMs".to_string(), json!(0));
+                    object.insert("cacheScope".to_string(), json!("private"));
+                    object.insert("resultType".to_string(), json!("complete"));
+                }
+            }
+            mcp_jsonrpc_result(id, result)
+        }
+        "tools/call" => {
+            let Some(name) = params.get("name").and_then(JsonValue::as_str) else {
+                return mcp_jsonrpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: missing tool name",
+                    None,
+                    modern,
+                );
+            };
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            match mcp_call_tool(name, arguments, catalog, scope) {
+                Ok(structured) => {
+                    let mut result = json!({
+                        "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string(&structured)
+                                .unwrap_or_else(|_| "{\"error\":\"serialization\"}".to_string())
+                        }],
+                        "structuredContent": structured,
+                        "isError": false
+                    });
+                    if modern {
+                        result
+                            .as_object_mut()
+                            .expect("tool result is object")
+                            .insert("resultType".to_string(), json!("complete"));
+                    }
+                    mcp_jsonrpc_result(id, result)
+                }
+                Err((code, message, details)) => {
+                    let mut result = json!({
+                        "content": [{
+                            "type": "text",
+                            "text": message
+                        }],
+                        "structuredContent": {
+                            "error": {
+                                "code": code,
+                                "message": message,
+                                "details": details
+                            }
+                        },
+                        "isError": true
+                    });
+                    if modern {
+                        result
+                            .as_object_mut()
+                            .expect("tool error result is object")
+                            .insert("resultType".to_string(), json!("complete"));
+                    }
+                    mcp_jsonrpc_result(id, result)
+                }
+            }
+        }
+        _ => mcp_jsonrpc_error(id, -32601, "Method not found", None, modern),
+    }
+}
+
+fn mcp_is_modern(request: &HttpRequest, message: &JsonValue) -> bool {
+    if request
+        .headers
+        .get("mcp-protocol-version")
+        .is_some_and(|value| value == "2026-07-28")
+    {
+        return true;
+    }
+
+    message
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|value| value == "2026-07-28")
+        || message
+            .get("method")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|method| method == "server/discover")
+}
+
+fn mcp_tools(scope: AuthScope) -> Vec<JsonValue> {
+    let mut tools = vec![
+        json!({
+            "name": "list_graphs",
+            "title": "List graphs",
+            "description": "List persistent graph names available in ReversalGraph Native.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "title": "List graphs",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        }),
+        json!({
+            "name": "read_graph",
+            "title": "Read graph",
+            "description": "Execute read-only Cypher against an existing graph. Use explicit RETURN projections for compact model-friendly results.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["graph", "cypher"],
+                "properties": {
+                    "graph": {"type": "string", "minLength": 1},
+                    "cypher": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            },
+            "annotations": {
+                "title": "Read graph",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        }),
+        json!({
+            "name": "batch_graph",
+            "title": "Batch graph operations",
+            "description": if scope == AuthScope::ReadWrite {
+                "Execute up to 100 Cypher operations sequentially. Mark individual operations read_only=true when they are reads."
+            } else {
+                "Execute up to 100 read-only Cypher operations sequentially."
+            },
+            "inputSchema": {
+                "type": "object",
+                "required": ["queries"],
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_BATCH_QUERIES,
+                        "items": {
+                            "type": "object",
+                            "required": ["graph", "cypher"],
+                            "properties": {
+                                "graph": {"type": "string", "minLength": 1},
+                                "cypher": {"type": "string", "minLength": 1},
+                                "read_only": {"type": "boolean", "default": false}
+                            },
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": {
+                "title": "Batch graph operations",
+                "readOnlyHint": scope != AuthScope::ReadWrite,
+                "destructiveHint": scope == AuthScope::ReadWrite,
+                "idempotentHint": scope != AuthScope::ReadWrite,
+                "openWorldHint": false
+            }
+        }),
+    ];
+
+    if scope == AuthScope::ReadWrite {
+        tools.push(json!({
+            "name": "write_graph",
+            "title": "Write graph",
+            "description": "Execute mutating Cypher against a graph. The graph is created automatically if it does not exist.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["graph", "cypher"],
+                "properties": {
+                    "graph": {"type": "string", "minLength": 1},
+                    "cypher": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            },
+            "annotations": {
+                "title": "Write graph",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        }));
+        tools.push(json!({
+            "name": "delete_graph",
+            "title": "Delete graph",
+            "description": "Delete a graph and its persistent WAL. This is destructive.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["graph"],
+                "properties": {
+                    "graph": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            },
+            "annotations": {
+                "title": "Delete graph",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        }));
+    }
+
+    tools
+}
+
+fn mcp_call_tool(
+    name: &str,
+    arguments: JsonValue,
+    catalog: &GraphCatalog,
+    scope: AuthScope,
+) -> Result<JsonValue, (String, String, JsonValue)> {
+    match name {
+        "list_graphs" => Ok(json!({"graphs": catalog.list()})),
+        "read_graph" => {
+            let payload: QueryRequest = serde_json::from_value(json!({
+                "graph": arguments.get("graph").cloned().unwrap_or(JsonValue::Null),
+                "cypher": arguments.get("cypher").cloned().unwrap_or(JsonValue::Null),
+                "read_only": true
+            }))
+            .map_err(|err| mcp_tool_error("invalid_arguments", err.to_string(), json!({})))?;
+            mcp_query_value(payload, catalog, AuthScope::ReadOnly)
+        }
+        "write_graph" => {
+            if scope != AuthScope::ReadWrite {
+                return Err(mcp_tool_error(
+                    "read_only_token",
+                    "write scope required".to_string(),
+                    json!({}),
+                ));
+            }
+            let payload: QueryRequest = serde_json::from_value(json!({
+                "graph": arguments.get("graph").cloned().unwrap_or(JsonValue::Null),
+                "cypher": arguments.get("cypher").cloned().unwrap_or(JsonValue::Null),
+                "read_only": false
+            }))
+            .map_err(|err| mcp_tool_error("invalid_arguments", err.to_string(), json!({})))?;
+            mcp_query_value(payload, catalog, scope)
+        }
+        "batch_graph" => {
+            let Some(items) = arguments.get("queries").and_then(JsonValue::as_array) else {
+                return Err(mcp_tool_error(
+                    "invalid_arguments",
+                    "queries must be an array".to_string(),
+                    json!({}),
+                ));
+            };
+            if items.is_empty() || items.len() > MAX_BATCH_QUERIES {
+                return Err(mcp_tool_error(
+                    "invalid_arguments",
+                    format!("queries must contain 1..={MAX_BATCH_QUERIES} entries"),
+                    json!({}),
+                ));
+            }
+
+            let mut results = Vec::with_capacity(items.len());
+            for item in items {
+                let mut payload: QueryRequest = serde_json::from_value(item.clone())
+                    .map_err(|err| {
+                        mcp_tool_error("invalid_arguments", err.to_string(), json!({}))
+                    })?;
+                if scope != AuthScope::ReadWrite {
+                    payload.read_only = true;
+                }
+                match mcp_query_value(payload, catalog, scope) {
+                    Ok(value) => results.push(json!({"ok": true, "result": value})),
+                    Err((code, message, details)) => results.push(json!({
+                        "ok": false,
+                        "error": {
+                            "code": code,
+                            "message": message,
+                            "details": details
+                        }
+                    })),
+                }
+            }
+            Ok(json!({"results": results}))
+        }
+        "delete_graph" => {
+            if scope != AuthScope::ReadWrite {
+                return Err(mcp_tool_error(
+                    "read_only_token",
+                    "write scope required".to_string(),
+                    json!({}),
+                ));
+            }
+            let graph = arguments
+                .get("graph")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    mcp_tool_error(
+                        "invalid_arguments",
+                        "graph must be a non-empty string".to_string(),
+                        json!({}),
+                    )
+                })?;
+            catalog
+                .delete(graph)
+                .map(|deleted| json!({"graph": graph, "deleted": deleted}))
+                .map_err(|err| {
+                    mcp_tool_error("graph_delete_failed", err, json!({"graph": graph}))
+                })
+        }
+        _ => Err(mcp_tool_error(
+            "unknown_tool",
+            format!("unknown tool: {name}"),
+            json!({}),
+        )),
+    }
+}
+
+fn mcp_query_value(
+    request: QueryRequest,
+    catalog: &GraphCatalog,
+    scope: AuthScope,
+) -> Result<JsonValue, (String, String, JsonValue)> {
+    let response = run_query(request, catalog, scope);
+    let value: JsonValue = serde_json::from_slice(&response.body).map_err(|err| {
+        mcp_tool_error(
+            "internal_json_error",
+            err.to_string(),
+            json!({"http_status": response.status}),
+        )
+    })?;
+
+    if response.status == 200 {
+        Ok(value)
+    } else {
+        let code = value
+            .pointer("/error/code")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("query_failed")
+            .to_string();
+        let message = value
+            .pointer("/error/message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("query failed")
+            .to_string();
+        Err(mcp_tool_error(
+            &code,
+            message,
+            json!({"http_status": response.status}),
+        ))
+    }
+}
+
+fn mcp_tool_error(
+    code: &str,
+    message: String,
+    details: JsonValue,
+) -> (String, String, JsonValue) {
+    (code.to_string(), message, details)
+}
+
+fn mcp_jsonrpc_result(id: JsonValue, result: JsonValue) -> HttpResponse {
+    json_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }),
+    )
+}
+
+fn mcp_jsonrpc_error(
+    id: JsonValue,
+    code: i64,
+    message: &str,
+    data: Option<JsonValue>,
+    modern: bool,
+) -> HttpResponse {
+    let mut error = json!({
+        "code": code,
+        "message": message
+    });
+    if let Some(data) = data {
+        error
+            .as_object_mut()
+            .expect("JSON-RPC error is object")
+            .insert("data".to_string(), data);
+    }
+    let mut body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": error
+    });
+    if modern {
+        body.as_object_mut()
+            .expect("JSON-RPC envelope is object")
+            .insert(
+                "_meta".to_string(),
+                json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"}),
+            );
+    }
+    json_response(200, body)
+}
+
+fn empty_response(status: u16) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: Vec::new(),
+        content_type: "application/json; charset=utf-8",
     }
 }
 
@@ -578,6 +1095,7 @@ fn error_response(status: u16, code: &str, message: &str) -> HttpResponse {
 fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::io::Result<()> {
     let reason = match response.status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

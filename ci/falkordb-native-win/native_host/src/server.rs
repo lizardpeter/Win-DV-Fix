@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
     thread,

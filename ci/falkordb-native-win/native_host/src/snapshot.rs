@@ -45,12 +45,25 @@ pub struct LoadedSnapshot {
     pub path: PathBuf,
 }
 
-pub fn write_checkpoint(
+#[derive(Debug)]
+pub struct StagedCheckpoint {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+impl StagedCheckpoint {
+    #[must_use]
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+}
+
+pub fn stage_checkpoint(
     wal_path: &Path,
     graph_name: &str,
     sequence: u64,
     graph: &Graph,
-) -> Result<PathBuf, String> {
+) -> Result<StagedCheckpoint, String> {
     let payload = save_graph(graph, graph_name);
     let crc = snapshot_crc(sequence, graph_name.as_bytes(), &payload);
     let final_path = checkpoint_path(wal_path, sequence);
@@ -58,6 +71,8 @@ pub fn write_checkpoint(
         "fgs.tmp.{}",
         std::process::id()
     ));
+
+    let _ = fs::remove_file(&temp_path);
 
     let mut header = Vec::with_capacity(FILE_HEADER_LEN);
     header.extend_from_slice(FILE_MAGIC);
@@ -82,6 +97,18 @@ pub fn write_checkpoint(
             .map_err(|e| format!("sync checkpoint {}: {e}", temp_path.display()))?;
     }
 
+    Ok(StagedCheckpoint {
+        temp_path,
+        final_path,
+    })
+}
+
+pub fn publish_staged_checkpoint(staged: StagedCheckpoint) -> Result<PathBuf, String> {
+    let StagedCheckpoint {
+        temp_path,
+        final_path,
+    } = staged;
+
     fs::rename(&temp_path, &final_path).map_err(|e| {
         let _ = fs::remove_file(&temp_path);
         format!(
@@ -92,6 +119,20 @@ pub fn write_checkpoint(
     })?;
 
     Ok(final_path)
+}
+
+pub fn abort_staged_checkpoint(staged: StagedCheckpoint) {
+    let _ = fs::remove_file(staged.temp_path);
+}
+
+pub fn write_checkpoint(
+    wal_path: &Path,
+    graph_name: &str,
+    sequence: u64,
+    graph: &Graph,
+) -> Result<PathBuf, String> {
+    let staged = stage_checkpoint(wal_path, graph_name, sequence, graph)?;
+    publish_staged_checkpoint(staged)
 }
 
 pub fn load_latest(

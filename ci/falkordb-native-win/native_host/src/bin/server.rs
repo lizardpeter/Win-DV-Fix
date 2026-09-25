@@ -23,6 +23,16 @@ fn main() -> Result<(), String> {
             config.username = username;
         }
     }
+    if let Ok(cert) = env::var("FALKORDB_TLS_CERT") {
+        if !cert.is_empty() {
+            config.tls_cert = Some(PathBuf::from(cert));
+        }
+    }
+    if let Ok(key) = env::var("FALKORDB_TLS_KEY") {
+        if !key.is_empty() {
+            config.tls_key = Some(PathBuf::from(key));
+        }
+    }
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -51,6 +61,17 @@ fn main() -> Result<(), String> {
             "--allow-unauthenticated-remote" => {
                 config.allow_unauthenticated_remote = true;
             }
+            "--allow-insecure-remote" => {
+                config.allow_insecure_remote = true;
+            }
+            "--tls-cert" => {
+                let value = args.next().ok_or_else(|| "--tls-cert requires a PEM path".to_string())?;
+                config.tls_cert = Some(PathBuf::from(value));
+            }
+            "--tls-key" => {
+                let value = args.next().ok_or_else(|| "--tls-key requires a PEM path".to_string())?;
+                config.tls_key = Some(PathBuf::from(value));
+            }
             "--help" | "-h" => {
                 println!(r#"falkordb-native-server
 
@@ -63,7 +84,10 @@ OPTIONS:
   --data-dir PATH                  Persistent graph data directory
   --username USER                  AUTH username (default: default)
   --password PASSWORD              AUTH password (or FALKORDB_PASSWORD)
+  --tls-cert PATH                  PEM certificate (or FALKORDB_TLS_CERT)
+  --tls-key PATH                   PEM private key (or FALKORDB_TLS_KEY)
   --allow-unauthenticated-remote   Allow non-loopback bind without AUTH
+  --allow-insecure-remote          Allow non-loopback plaintext RESP
 "#);
                 return Ok(());
             }

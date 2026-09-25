@@ -69,7 +69,7 @@ if (-not $SkipNativeDeps) {
     cmake -S $GB -B $GBBuild @CMakeGeneratorArgs `
         -DCMAKE_BUILD_TYPE=Release `
         -DSUITESPARSE_USE_FORTRAN=OFF `
-        -DGRAPHBLAS_COMPACT=OFF `
+        -DGRAPHBLAS_COMPACT=ON `
         -DGRAPHBLAS_USE_JIT=OFF `
         -DGRAPHBLAS_USE_OPENMP=ON `
         -DSUITESPARSE_DEMOS=OFF `

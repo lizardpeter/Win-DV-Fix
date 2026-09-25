@@ -1,4 +1,4 @@
-name: Webkinz exhaustive resource verify
+name: Webkinz semantic resource verify
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Verify every TransList resource
+      - name: Verify resources with correct TransList semantics
         shell: bash
         run: |
           set -e
@@ -30,110 +30,50 @@ jobs:
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError
           from urllib.parse import quote
-          import csv, json, xml.etree.ElementTree as ET, hashlib, time
+          import csv, json, xml.etree.ElementTree as ET, hashlib, time, os
 
-          VERSION = "v390_249"
-          ROOT = "https://play.webkinz.com"
+          VERSION="v390_249"
+          ROOT="https://play.webkinz.com"
+          tree=ET.parse("out/TransList.xml")
+          root=tree.getroot()
 
-          xml_path = Path("out/TransList.xml")
-          tree = ET.parse(xml_path)
-          root = tree.getroot()
-
-          pairs = []
-          for elem in root.iter():
-              n = elem.attrib.get("n")
-              tf = elem.attrib.get("tf")
+          pairs=[]
+          for e in root.iter():
+              n=e.attrib.get("n")
+              tf=e.attrib.get("tf")
               if n or tf:
-                  pairs.append({"n": n, "tf": tf})
+                  pairs.append({"n":n,"tf":tf})
 
-          resources = sorted({p["n"].lstrip("/") for p in pairs if p.get("n")})
-          translations = sorted({p["tf"].lstrip("/") for p in pairs if p.get("tf")})
+          names=sorted({p["n"] for p in pairs if p.get("n")})
+          translations=sorted({p["tf"] for p in pairs if p.get("tf")})
 
-          targets = []
-          for rel in resources:
-              enc = quote(rel, safe="/._-~")
-              targets.append({
-                  "kind":"resource",
-                  "relative":rel,
-                  "url":f"{ROOT}/SWF/{enc}?v={VERSION}"
-              })
-          for rel in translations:
-              enc = quote(rel, safe="/._-~")
-              targets.append({
-                  "kind":"translation",
-                  "relative":rel,
-                  "url":f"{ROOT}/XML/L10N/US_EN/{enc}"
-              })
+          targets=[]
+          aliases=[]
+          for n in names:
+              ext=os.path.splitext(n)[1].lower()
+              if ext==".swf":
+                  rel=n.lstrip("/")
+                  url=f"{ROOT}/SWF/{quote(rel,safe='/._-~')}?v={VERSION}"
+                  targets.append({"kind":"swf","relative":n,"url":url,"expected":"application/x-shockwave-flash"})
+              elif ext==".xml":
+                  # Current TransList help entries are absolute-root /XML/HELP/... paths.
+                  rel=n if n.startswith("/") else "/"+n
+                  url=f"{ROOT}{quote(rel,safe='/._-~')}"
+                  targets.append({"kind":"xml_resource","relative":n,"url":url,"expected":"xml"})
+              else:
+                  aliases.append({"kind":"alias","relative":n,"url":"","expected":""})
+
+          for tf in translations:
+              rel=tf.lstrip("/")
+              url=f"{ROOT}/XML/L10N/US_EN/{quote(rel,safe='/._-~')}"
+              targets.append({"kind":"translation","relative":tf,"url":url,"expected":"xml"})
 
           def probe(t):
-              headers = {
-                  "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-                  "Accept":"*/*",
-              }
-              started = time.time()
-              req = Request(t["url"], headers=headers, method="HEAD")
-              try:
-                  with urlopen(req, timeout=20) as r:
-                      status = getattr(r, "status", r.getcode())
-                      return {
-                          **t,
-                          "status":int(status),
-                          "content_type":r.headers.get("Content-Type",""),
-                          "content_length":r.headers.get("Content-Length",""),
-                          "etag":r.headers.get("ETag",""),
-                          "last_modified":r.headers.get("Last-Modified",""),
-                          "effective_url":r.geturl(),
-                          "elapsed_ms":round((time.time()-started)*1000),
-                          "error":"",
-                      }
-              except HTTPError as e:
-                  return {
-                      **t,
-                      "status":int(e.code),
-                      "content_type":e.headers.get("Content-Type","") if e.headers else "",
-                      "content_length":e.headers.get("Content-Length","") if e.headers else "",
-                      "etag":e.headers.get("ETag","") if e.headers else "",
-                      "last_modified":e.headers.get("Last-Modified","") if e.headers else "",
-                      "effective_url":e.geturl() if hasattr(e,"geturl") else t["url"],
-                      "elapsed_ms":round((time.time()-started)*1000),
-                      "error":str(e),
-                  }
-              except Exception as e:
-                  return {
-                      **t,
-                      "status":0,
-                      "content_type":"",
-                      "content_length":"",
-                      "etag":"",
-                      "last_modified":"",
-                      "effective_url":t["url"],
-                      "elapsed_ms":round((time.time()-started)*1000),
-                      "error":repr(e),
-                  }
-
-          results = []
-          with ThreadPoolExecutor(max_workers=32) as ex:
-              futures = [ex.submit(probe,t) for t in targets]
-              for i,fut in enumerate(as_completed(futures),1):
-                  results.append(fut.result())
-                  if i % 100 == 0:
-                      print("completed", i, "of", len(futures), flush=True)
-
-          results.sort(key=lambda x:(x["kind"], x["relative"].lower()))
-
-          retry_indices = [i for i,r in enumerate(results) if r["status"] == 0]
-          for i in retry_indices:
-              t = results[i]
-              req = Request(t["url"], headers={
-                  "User-Agent":"Mozilla/5.0",
-                  "Range":"bytes=0-31",
-                  "Accept":"*/*",
-              }, method="GET")
               started=time.time()
+              req=Request(t["url"],headers={"User-Agent":"Mozilla/5.0","Accept":"*/*"},method="HEAD")
               try:
                   with urlopen(req,timeout=20) as r:
-                      body=r.read(32)
-                      results[i].update({
+                      return {**t,
                           "status":int(getattr(r,"status",r.getcode())),
                           "content_type":r.headers.get("Content-Type",""),
                           "content_length":r.headers.get("Content-Length",""),
@@ -141,85 +81,102 @@ jobs:
                           "last_modified":r.headers.get("Last-Modified",""),
                           "effective_url":r.geturl(),
                           "elapsed_ms":round((time.time()-started)*1000),
-                          "error":"",
-                          "prefix_hex":body.hex(),
-                      })
+                          "error":""}
               except HTTPError as e:
-                  results[i]["status"]=int(e.code)
-                  results[i]["error"]=str(e)
+                  return {**t,
+                      "status":int(e.code),
+                      "content_type":e.headers.get("Content-Type","") if e.headers else "",
+                      "content_length":e.headers.get("Content-Length","") if e.headers else "",
+                      "etag":e.headers.get("ETag","") if e.headers else "",
+                      "last_modified":e.headers.get("Last-Modified","") if e.headers else "",
+                      "effective_url":e.geturl() if hasattr(e,"geturl") else t["url"],
+                      "elapsed_ms":round((time.time()-started)*1000),
+                      "error":str(e)}
               except Exception as e:
-                  results[i]["error"]=repr(e)
+                  return {**t,"status":0,"content_type":"","content_length":"","etag":"",
+                      "last_modified":"","effective_url":t["url"],
+                      "elapsed_ms":round((time.time()-started)*1000),"error":repr(e)}
 
-          counts = {}
-          kind_counts = {}
+          results=[]
+          with ThreadPoolExecutor(max_workers=32) as ex:
+              futs=[ex.submit(probe,t) for t in targets]
+              for i,f in enumerate(as_completed(futs),1):
+                  results.append(f.result())
+                  if i%100==0: print("done",i,"/",len(futs),flush=True)
+          results.sort(key=lambda r:(r["kind"],r["relative"].lower()))
+
+          def classify(r):
+              if not (200 <= r["status"] < 400):
+                  return "missing"
+              ct=(r.get("content_type") or "").lower()
+              if r["kind"]=="swf":
+                  if "shockwave-flash" in ct:
+                      return "live"
+                  if "text/html" in ct:
+                      return "soft_404_html"
+                  return "unexpected_content_type"
+              else:
+                  if "xml" in ct:
+                      return "live"
+                  if "text/html" in ct:
+                      return "soft_404_html"
+                  return "unexpected_content_type"
+
           for r in results:
-              counts[str(r["status"])] = counts.get(str(r["status"]),0)+1
-              kc = kind_counts.setdefault(r["kind"],{})
-              kc[str(r["status"])] = kc.get(str(r["status"]),0)+1
+              r["classification"]=classify(r)
 
-          active = [r for r in results if 200 <= r["status"] < 400]
-          inactive = [r for r in results if not (200 <= r["status"] < 400)]
+          live=[r for r in results if r["classification"]=="live"]
+          dead=[r for r in results if r["classification"]!="live"]
 
-          summary = {
+          from collections import Counter,defaultdict
+          class_counts=Counter(r["classification"] for r in results)
+          by_kind=defaultdict(Counter)
+          for r in results: by_kind[r["kind"]][r["classification"]]+=1
+
+          summary={
               "version":VERSION,
-              "translist_sha256":hashlib.sha256(xml_path.read_bytes()).hexdigest(),
+              "translist_sha256":hashlib.sha256(Path("out/TransList.xml").read_bytes()).hexdigest(),
               "pairs":len(pairs),
-              "unique_resources":len(resources),
-              "unique_translations":len(translations),
-              "total_targets":len(results),
-              "status_counts":counts,
-              "status_counts_by_kind":kind_counts,
-              "active_count":len(active),
-              "inactive_count":len(inactive),
+              "unique_n":len(names),
+              "swf_entries":sum(os.path.splitext(n)[1].lower()==".swf" for n in names),
+              "xml_resource_entries":sum(os.path.splitext(n)[1].lower()==".xml" for n in names),
+              "alias_entries":len(aliases),
+              "translation_entries":len(translations),
+              "network_targets":len(results),
+              "live":len(live),
+              "not_live":len(dead),
+              "classification_counts":dict(class_counts),
+              "by_kind":{k:dict(v) for k,v in by_kind.items()},
           }
 
-          Path("out/verify_summary.json").write_text(json.dumps(summary,indent=2))
-          Path("out/verify_results.json").write_text(json.dumps(results,indent=2))
-          Path("out/active_results.json").write_text(json.dumps(active,indent=2))
-          Path("out/inactive_results.json").write_text(json.dumps(inactive,indent=2))
+          Path("out/summary.json").write_text(json.dumps(summary,indent=2))
+          Path("out/results.json").write_text(json.dumps(results,indent=2))
+          Path("out/live.json").write_text(json.dumps(live,indent=2))
+          Path("out/not_live.json").write_text(json.dumps(dead,indent=2))
+          Path("out/aliases.json").write_text(json.dumps(aliases,indent=2))
 
-          fields = ["kind","relative","status","content_type","content_length","etag","last_modified","elapsed_ms","url","effective_url","error"]
-          for fn, rows in [
-              ("verify_results.csv", results),
-              ("active_results.csv", active),
-              ("inactive_results.csv", inactive),
-          ]:
+          fields=["kind","relative","classification","status","content_type","content_length","etag","last_modified","elapsed_ms","url","effective_url","error"]
+          for fn,rows in [("results.csv",results),("live.csv",live),("not_live.csv",dead)]:
               with open("out/"+fn,"w",newline="",encoding="utf-8") as fh:
                   w=csv.DictWriter(fh,fieldnames=fields,extrasaction="ignore")
-                  w.writeheader()
-                  w.writerows(rows)
+                  w.writeheader(); w.writerows(rows)
 
-          Path("out/active_urls.txt").write_text("\n".join(r["url"] for r in active)+"\n")
-          Path("out/inactive_urls.txt").write_text("\n".join(r["url"] for r in inactive)+"\n")
+          Path("out/live_urls.txt").write_text("\n".join(r["url"] for r in live)+"\n")
+          Path("out/not_live_urls.txt").write_text("\n".join(r["url"] for r in dead)+"\n")
 
-          md = [
-              "# Webkinz live TransList verification",
-              "",
-              f"- Client version: {VERSION}",
-              f"- Unique resource entries: {len(resources)}",
-              f"- Unique translation entries: {len(translations)}",
-              f"- Total targets checked: {len(results)}",
-              f"- Active (2xx/3xx): {len(active)}",
-              f"- Inactive/error: {len(inactive)}",
-              "",
-              "## Status counts",
-              "",
-              json.dumps(kind_counts,indent=2),
-              "",
-              "## Active resources",
-              "",
-          ]
-          for r in active:
-              md.append(f"- [{r['status']}] {r['kind']}: {r['relative']} ({r['content_length'] or '?'} bytes)")
+          md=["# Semantic Webkinz TransList verification","",json.dumps(summary,indent=2),"","## Missing / fallback entries",""]
+          for r in dead:
+              md.append(f"- {r['classification']}: {r['kind']} {r['relative']} -> {r['content_type']} {r['content_length']}")
+          md+=["","## Symbolic aliases",""]
+          for a in aliases: md.append(f"- {a['relative']}")
           Path("out/SUMMARY.md").write_text("\n".join(md),encoding="utf-8")
           print(json.dumps(summary,indent=2))
           PY
 
-      - name: Upload exhaustive verification
+      - name: Upload semantic verification
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webkinz-translist-verify
+          name: webkinz-semantic-verify
           path: out/
-          if-no-files-found: error
           retention-days: 7

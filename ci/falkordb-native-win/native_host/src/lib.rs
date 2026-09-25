@@ -188,6 +188,11 @@ impl NativeGraph {
                         format!("WAL recovery failed at sequence {}: {e}", record.sequence)
                     })?;
                 }
+
+                // Recovery now has the complete graph state. Populate every
+                // pending native index synchronously so index DDL replayed
+                // after pre-existing data is correct before publication.
+                graph.populate_indexes_sync();
             }
 
             mvcc.commit(Arc::clone(&private));

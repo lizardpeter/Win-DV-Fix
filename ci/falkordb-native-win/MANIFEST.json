@@ -1,0 +1,38 @@
+{
+  "project": "FalkorDB Native Windows Standalone",
+  "upstream_repository": "FalkorDB/FalkorDB",
+  "upstream_commit": "55204c94bb6c8bc1684ada3d712a61f73f324067",
+  "target": "x86_64-pc-windows-msvc",
+  "verified": true,
+  "verified_run_id": 36163782345,
+  "verified_commit": "d99c2761f6b9bbb6952ca54cf50732952587bb47",
+  "final_marker": "NATIVE_WINDOWS_FULL_STANDALONE_PASS",
+  "redis_required": false,
+  "redisearch_required": false,
+  "memurai_required": false,
+  "virtualization_required": false,
+  "capabilities": {
+    "cypher_core": true,
+    "mvcc": true,
+    "node_relationship_crud": true,
+    "range_index": true,
+    "string_index": true,
+    "fulltext_node": true,
+    "fulltext_relationship": true,
+    "vector_node": true,
+    "vector_relationship": true,
+    "index_update_delete": true,
+    "wal": true,
+    "restart_recovery": true,
+    "index_recovery": true
+  },
+  "remaining": [
+    "snapshot_compaction",
+    "wal_rotation",
+    "stress_testing",
+    "performance_tuning",
+    "packaging",
+    "CAS_integration",
+    "reversal_graph_schema"
+  ]
+}

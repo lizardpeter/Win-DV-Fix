@@ -8,12 +8,14 @@ This directory contains the native Windows standalone FalkorDB-derived graph bac
 
 Current verified Windows CI evidence:
 
-- Workflow run: `36190878880`
-- Verified network-capable commit: `3989ee1c8ec252bacd7e24fb51416cf7498c1874`
+- Workflow run: `36198470377`
+- Verified network-capable commit: `833eb680b2335feca473e448a8f845ce699e6100`
 - Standalone marker: `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
 - Official-client write marker: `OFFICIAL_FALKORDB_CLIENT_WRITE_PASS`
 - Official-client restart marker: `OFFICIAL_FALKORDB_CLIENT_RESTART_PASS`
 - Final network marker: `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
+- mTLS marker: `NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS`
+- ChatGPT HTTPS API marker: `NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS`
 
 The successful run compiled the FalkorDB `graph` crate and the native host with
 `FALKORDB_SKIP_REDISEARCH=1`, passed the standalone Cypher/index/WAL suite,
@@ -158,11 +160,7 @@ graph.query("CREATE (:Project {name:'T6'})")
 print(graph.query("MATCH (n:Project) RETURN n.name").result_set)
 ```
 
-The server refuses an unauthenticated non-loopback bind by default. RESP
-password authentication does not itself encrypt traffic, so an Internet-facing
-deployment should use a private network/VPN or an encrypted transport in front
-of the listener. Do not expose plaintext RESP/AUTH directly to the public
-Internet.
+The server refuses an unauthenticated non-loopback bind by default. Remote deployment now supports TLS directly, including mutual TLS for the FalkorDB/RESP listener. The verified CI path requires a trusted client certificate plus Redis-style AUTH. A separate HTTPS JSON API with Bearer-token read-only/read-write scopes is available for ChatGPT/tool access.
 
 ## Design direction for the reversal graph
 
@@ -194,3 +192,25 @@ performance work, including:
 - optional native TLS termination (private-network/VPN deployment is supported now)
 - benchmarking against the original FalkorDB/RediSearch deployment
 - stress/crash/fuzz testing
+
+
+## ChatGPT HTTPS API
+
+The native server also exposes an authenticated HTTPS JSON API intended for ChatGPT/tool access without requiring a Redis protocol client.
+
+Verified behavior includes:
+
+- TLS
+- Bearer authentication
+- separate read-only and read-write tokens
+- authorization before graph lookup for write attempts
+- `GET /healthz`
+- `GET /openapi.json`
+- `GET /v1/capabilities`
+- `GET /v1/graphs`
+- `POST /v1/query`
+- `POST /v1/batch`
+- `POST /v1/graphs/delete`
+- hard server-process restart followed by WAL-backed query recovery
+
+The same Windows CI run proves both the official FalkorDB client over mTLS and the HTTPS API against the same persistent graph backend.

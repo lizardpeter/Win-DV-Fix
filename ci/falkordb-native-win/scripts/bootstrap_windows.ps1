@@ -57,34 +57,61 @@ if (-not $SkipNativeDeps) {
             https://github.com/DrTimothyAldenDavis/GraphBLAS.git $GB
     }
 
+    # MSVC rejects three duplicate public Zstd symbols that GraphBLAS
+    # intentionally leaves un-namespaced on Unix. Namespace only those three
+    # inside the GraphBLAS amalgamated translation unit.
+    $GBZstdHeader = Join-Path $GB "Source\zstd_wrapper\GB_zstd.h"
+    $GBZstdCommon = Join-Path $GB "zstd\zstd_subset\common\zstd_common.c"
+
+    $HeaderText = Get-Content -Path $GBZstdHeader -Raw
+    $OldZstdComment = "// not renamed: ZSTD_isError, FSE_isError, HUF_isError"
+    if ($HeaderText.Contains($OldZstdComment)) {
+        $HeaderText = $HeaderText.Replace(
+            $OldZstdComment,
+            @"
+// MSVC static linking into FalkorDB also links Rust zstd-sys, so these
+// three public error helpers must be namespaced too.
+#define ZSTD_isError GBZSTD (ZSTD_isError)
+#define FSE_isError  GBZSTD (FSE_isError)
+#define HUF_isError  GBZSTD (HUF_isError)
+"@
+        )
+        Set-Content -Path $GBZstdHeader -Value $HeaderText -Encoding UTF8
+    }
+
+    $CommonText = Get-Content -Path $GBZstdCommon -Raw
+    $OldUndef = "#undef ZSTD_isError   /* defined within zstd_internal.h */"
+    $NewUndef = @"
+#undef ZSTD_isError   /* defined within zstd_internal.h */
+#define ZSTD_isError GBZSTD (ZSTD_isError)
+"@
+    if ($CommonText.Contains($OldUndef) -and -not $CommonText.Contains($NewUndef)) {
+        $CommonText = $CommonText.Replace($OldUndef, $NewUndef)
+        Set-Content -Path $GBZstdCommon -Value $CommonText -Encoding UTF8
+    }
+
     $GBBuild = Join-Path $WorkDir "graphblas-build"
     cmake -S $GB -B $GBBuild -G "$VSGenerator" -A x64 `
         -DCMAKE_C_FLAGS=/MP `
         -DCMAKE_INSTALL_PREFIX="$Prefix" `
         -DSUITESPARSE_USE_FORTRAN=OFF `
-        -DBUILD_STATIC_LIBS=OFF `
-        -DBUILD_SHARED_LIBS=ON `
-        -DGRAPHBLAS_BUILD_STATIC_LIBS=OFF `
+        -DBUILD_STATIC_LIBS=ON `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DGRAPHBLAS_BUILD_STATIC_LIBS=ON `
         -DGRAPHBLAS_COMPACT=ON `
         -DGRAPHBLAS_USE_OPENMP=OFF `
         -DGRAPHBLAS_USE_JIT=OFF `
         -DBUILD_TESTING=OFF
-    cmake --build $GBBuild --config Release --target GraphBLAS --parallel 4
+    cmake --build $GBBuild --config Release --target GraphBLAS_static --parallel 4
     cmake --install $GBBuild --config Release
 
-    $GBImport = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas.lib |
-        Where-Object { $_.Name -eq "graphblas.lib" } |
+    $GBStatic = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas_static.lib |
         Select-Object -First 1
-    $GBDll = Get-ChildItem -Path $Prefix -Recurse -Filter graphblas.dll |
-        Select-Object -First 1
-    if (-not $GBImport) {
-        throw "Expected GraphBLAS DLL import library graphblas.lib not found below $Prefix"
+    if (-not $GBStatic) {
+        throw "Expected GraphBLAS static library graphblas_static.lib not found below $Prefix"
     }
-    if (-not $GBDll) {
-        throw "Expected GraphBLAS runtime DLL graphblas.dll not found below $Prefix"
-    }
-    $LibDir = $GBImport.Directory.FullName
-    $GBDll.Directory.FullName | Set-Content -Path (Join-Path $WorkDir "graphblas-bin-dir.txt") -Encoding Ascii
+    $LibDir = $GBStatic.Directory.FullName
+    Copy-Item -Force $GBStatic.FullName (Join-Path $LibDir "graphblas.lib")
 
     $LA = Join-Path $Src "LAGraph"
     if (-not (Test-Path $LA)) {

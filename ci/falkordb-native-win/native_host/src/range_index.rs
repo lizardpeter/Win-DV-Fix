@@ -16,7 +16,7 @@ pub struct NativeNumericRangeIndex {
 }
 
 pub enum NativeRangeIter {
-    Tree(RangeIter),
+    Tree(RangeIter<256, 256>),
     Empty,
 }
 

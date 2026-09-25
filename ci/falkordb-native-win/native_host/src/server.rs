@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -8,9 +8,22 @@ use std::{
     thread,
 };
 
+use rustls::{
+    RootCertStore, ServerConfig as RustlsServerConfig, ServerConnection, StreamOwned,
+    server::WebPkiClientVerifier,
+};
+
 use parking_lot::RwLock;
 
 use crate::{NativeGraph, OutputStats, QueryOutput, wire::WireValue};
+
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// When present, require a client certificate chaining to this CA.
+    pub client_ca_path: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -19,6 +32,8 @@ pub struct ServerConfig {
     pub username: String,
     pub password: Option<String>,
     pub allow_unauthenticated_remote: bool,
+    pub allow_plaintext_remote: bool,
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for ServerConfig {
@@ -29,21 +44,44 @@ impl Default for ServerConfig {
             username: "default".to_string(),
             password: None,
             allow_unauthenticated_remote: false,
+            allow_plaintext_remote: false,
+            tls: None,
         }
     }
 }
 
 impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.password.is_none()
-            && !self.allow_unauthenticated_remote
-            && !self.bind.ip().is_loopback()
-        {
+        let remote = !self.bind.ip().is_loopback();
+
+        if remote && self.tls.is_none() && !self.allow_plaintext_remote {
+            return Err(
+                "refusing plaintext non-loopback bind; configure TLS or explicitly pass                  --allow-plaintext-remote"
+                    .to_string(),
+            );
+        }
+
+        if self.password.is_none() && !self.allow_unauthenticated_remote && remote {
             return Err(
                 "refusing unauthenticated non-loopback bind; configure --password or                  --allow-unauthenticated-remote"
                     .to_string(),
             );
         }
+
+        if let Some(tls) = &self.tls {
+            if !tls.cert_path.is_file() {
+                return Err(format!("TLS certificate not found: {}", tls.cert_path.display()));
+            }
+            if !tls.key_path.is_file() {
+                return Err(format!("TLS private key not found: {}", tls.key_path.display()));
+            }
+            if let Some(ca) = &tls.client_ca_path
+                && !ca.is_file()
+            {
+                return Err(format!("TLS client CA not found: {}", ca.display()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -183,12 +221,19 @@ fn hex(b: u8) -> Option<u8> {
 
 pub fn serve(config: ServerConfig) -> Result<(), String> {
     config.validate()?;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(load_tls_config)
+        .transpose()?
+        .map(Arc::new);
     let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
     let listener = TcpListener::bind(config.bind)
         .map_err(|e| format!("bind {}: {e}", config.bind))?;
 
     eprintln!(
-        "FalkorDB native RESP server listening on {} (data: {})",
+        "FalkorDB native RESP{} server listening on {} (data: {})",
+        if tls.is_some() { "/TLS" } else { "" },
         config.bind,
         config.data_dir.display()
     );
@@ -199,8 +244,31 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
             Ok(stream) => {
                 let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
+                let tls = tls.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &catalog, &config) {
+                    let peer = stream.peer_addr().ok();
+                    let result = if let Some(tls) = tls {
+                        stream
+                            .set_nodelay(true)
+                            .map_err(|e| format!("set TCP_NODELAY: {e}"))
+                            .and_then(|_| {
+                                let conn = ServerConnection::new(tls)
+                                    .map_err(|e| format!("create TLS server connection: {e}"))?;
+                                handle_connection_io(
+                                    StreamOwned::new(conn, stream),
+                                    &catalog,
+                                    &config,
+                                    peer,
+                                )
+                            })
+                    } else {
+                        stream
+                            .set_nodelay(true)
+                            .map_err(|e| format!("set TCP_NODELAY: {e}"))
+                            .and_then(|_| handle_connection_io(stream, &catalog, &config, peer))
+                    };
+
+                    if let Err(err) = result {
                         eprintln!("client connection ended with error: {err}");
                     }
                 });
@@ -209,6 +277,52 @@ pub fn serve(config: ServerConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn load_tls_config(tls: &TlsConfig) -> Result<RustlsServerConfig, String> {
+    let mut cert_reader = BufReader::new(
+        File::open(&tls.cert_path)
+            .map_err(|e| format!("open TLS certificate {}: {e}", tls.cert_path.display()))?,
+    );
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse TLS certificate {}: {e}", tls.cert_path.display()))?;
+    if certs.is_empty() {
+        return Err(format!("TLS certificate file contains no certificates: {}", tls.cert_path.display()));
+    }
+
+    let mut key_reader = BufReader::new(
+        File::open(&tls.key_path)
+            .map_err(|e| format!("open TLS private key {}: {e}", tls.key_path.display()))?,
+    );
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| format!("parse TLS private key {}: {e}", tls.key_path.display()))?
+        .ok_or_else(|| format!("TLS private key file contains no key: {}", tls.key_path.display()))?;
+
+    if let Some(client_ca_path) = &tls.client_ca_path {
+        let mut ca_reader = BufReader::new(
+            File::open(client_ca_path)
+                .map_err(|e| format!("open TLS client CA {}: {e}", client_ca_path.display()))?,
+        );
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_reader) {
+            roots
+                .add(cert.map_err(|e| format!("parse TLS client CA {}: {e}", client_ca_path.display()))?)
+                .map_err(|e| format!("add TLS client CA {}: {e}", client_ca_path.display()))?;
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("build TLS client certificate verifier: {e}"))?;
+        RustlsServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("configure TLS certificate/key: {e}"))
+    } else {
+        RustlsServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("configure TLS certificate/key: {e}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,20 +337,13 @@ struct ConnectionState {
     client_name: Option<String>,
 }
 
-fn handle_connection(
-    stream: TcpStream,
+fn handle_connection_io<S: Read + Write>(
+    io: S,
     catalog: &GraphCatalog,
     config: &ServerConfig,
+    peer: Option<SocketAddr>,
 ) -> Result<(), String> {
-    let peer = stream.peer_addr().ok();
-    stream
-        .set_nodelay(true)
-        .map_err(|e| format!("set TCP_NODELAY: {e}"))?;
-    let reader_stream = stream
-        .try_clone()
-        .map_err(|e| format!("clone client socket: {e}"))?;
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = stream;
+    let mut reader = BufReader::new(io);
 
     let mut state = ConnectionState {
         authenticated: config.password.is_none(),
@@ -251,9 +358,12 @@ fn handle_connection(
         };
 
         let response = dispatch(command, catalog, config, &mut state);
-        write_resp(&mut writer, &response, state.protocol)
+        write_resp(reader.get_mut(), &response, state.protocol)
             .map_err(|e| format!("write response to {peer:?}: {e}"))?;
-        writer.flush().map_err(|e| format!("flush response: {e}"))?;
+        reader
+            .get_mut()
+            .flush()
+            .map_err(|e| format!("flush response: {e}"))?;
     }
 }
 
@@ -773,7 +883,7 @@ fn sanitize_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn read_command(reader: &mut BufReader<TcpStream>) -> Result<Option<Vec<Vec<u8>>>, String> {
+fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, String> {
     let mut first = Vec::new();
     let read = reader
         .read_until(b'\n', &mut first)
@@ -802,7 +912,7 @@ fn read_command(reader: &mut BufReader<TcpStream>) -> Result<Option<Vec<Vec<u8>>
     ))
 }
 
-fn read_bulkish(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
+fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     let mut header = Vec::new();
     reader
         .read_until(b'\n', &mut header)
@@ -863,6 +973,17 @@ mod tests {
     fn remote_unauthenticated_bind_is_rejected() {
         let config = ServerConfig {
             bind: "0.0.0.0:6379".parse().unwrap(),
+            allow_plaintext_remote: true,
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn remote_plaintext_bind_is_rejected() {
+        let config = ServerConfig {
+            bind: "0.0.0.0:6379".parse().unwrap(),
+            password: Some("secret".to_string()),
             ..ServerConfig::default()
         };
         assert!(config.validate().is_err());

@@ -116,6 +116,7 @@ Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
+$McpSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_smoke.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -184,6 +185,16 @@ try {
         throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
     }
 
+    python $McpSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_chatgpt_mcp_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT MCP write phase failed with exit code $LASTEXITCODE"
+    }
+    $McpWriteText = (Get-Content (Join-Path $Logs "10_chatgpt_mcp_write.txt") -Raw)
+    if ($McpWriteText -notmatch "CHATGPT_MCP_WRITE_PASS") {
+        throw "Official MCP SDK did not prove MCP read/write connectivity"
+    }
+
     # Hard-stop the server to prove committed graph state is recoverable solely
     # from the native WAL on a fresh process.
     Stop-Process -Id $Server.Id -Force
@@ -211,6 +222,16 @@ try {
     if ($ApiRestartText -notmatch "CHATGPT_HTTPS_API_RESTART_PASS") {
         throw "ChatGPT HTTPS API did not prove restart/WAL recovery"
     }
+
+    python $McpSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_chatgpt_mcp_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT MCP restart phase failed with exit code $LASTEXITCODE"
+    }
+    $McpRestartText = (Get-Content (Join-Path $Logs "11_chatgpt_mcp_restart.txt") -Raw)
+    if ($McpRestartText -notmatch "CHATGPT_MCP_RESTART_PASS") {
+        throw "Official MCP SDK did not prove MCP restart/WAL recovery"
+    }
 } finally {
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
@@ -222,4 +243,5 @@ Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+Write-Host "NATIVE_WINDOWS_CHATGPT_MCP_PASS"
 

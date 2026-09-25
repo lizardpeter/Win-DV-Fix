@@ -1,0 +1,39 @@
+name: FalkorDB native Windows CI v2
+
+on:
+  push:
+    branches:
+      - falkordb-windows-native-ci
+    paths:
+      - 'falkordb_windows_native_ci/**'
+      - '.github/workflows/falkordb_windows_native_ci_v2.yml'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install native build tools
+        shell: pwsh
+        run: |
+          choco install ninja llvm -y
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Native build and smoke
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          .\falkordb_windows_native_ci\scripts\build_and_smoke_windows.ps1
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falkordb-windows-native-diagnostics-v2
+          path: falkordb_windows_native_ci/build/logs

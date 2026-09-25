@@ -158,7 +158,7 @@ pub fn get(name: &str) -> Result<ConfigValue, String> {
         "NODE_CREATION_BUFFER" => ConfigValue::Int(
             NODE_CREATION_BUFFER.load(std::sync::atomic::Ordering::Relaxed) as i64,
         ),
-        "CMD_INFO" => ConfigValue::Int(i64::from(state.cmd_info)),
+        "CMD_INFO" => ConfigValue::Int(if state.cmd_info { 1 } else { 0 }),
         "MAX_INFO_QUERIES" => ConfigValue::Int(state.max_info_queries),
         "EFFECTS_COMPRESSION" => ConfigValue::Int(
             graph::effects::EFFECTS_COMPRESSION
@@ -166,7 +166,7 @@ pub fn get(name: &str) -> Result<ConfigValue, String> {
         ),
         "EFFECTS_THRESHOLD" => ConfigValue::Int(state.effects_threshold),
         "BOLT_PORT" => ConfigValue::Int(65535),
-        "DELAY_INDEXING" => ConfigValue::Int(i64::from(state.delay_indexing)),
+        "DELAY_INDEXING" => ConfigValue::Int(if state.delay_indexing { 1 } else { 0 }),
         "IMPORT_FOLDER" => ConfigValue::Text(state.import_folder.clone()),
         "TEMP_FOLDER" => ConfigValue::Text(state.temp_folder.clone()),
         "JS_HEAP_SIZE" => ConfigValue::Int(state.js_heap_size),

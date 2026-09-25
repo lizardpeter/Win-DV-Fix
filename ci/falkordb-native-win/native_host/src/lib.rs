@@ -2,6 +2,7 @@
 
 pub mod property_index;
 pub mod range_index;
+pub mod server;
 pub mod wal;
 pub mod wire;
 

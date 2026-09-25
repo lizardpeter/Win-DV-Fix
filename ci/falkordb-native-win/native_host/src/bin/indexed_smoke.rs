@@ -176,6 +176,39 @@ fn main() -> Result<(), String> {
     }
     let _ = std::fs::remove_file(&wal_path);
 
+    // Regression: data may predate index DDL. WAL replay sees the entity
+    // records before CREATE INDEX, so recovery must synchronously backfill
+    // indexes after the full effects stream has been reconstructed.
+    let late_index_wal: PathBuf = std::env::temp_dir().join(format!(
+        "falkordb-native-late-index-restart-{}.wal",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&late_index_wal);
+    {
+        let persistent = NativeGraph::open_persistent("late-index-restart", &late_index_wal)?;
+        must_query(
+            &persistent,
+            "CREATE (:LateIdx {age:40,name:'Alice'}), (:LateIdx {age:30,name:'Bob'})",
+        )?;
+        must_query(&persistent, "CREATE INDEX FOR (n:LateIdx) ON (n.age)")?;
+        must_query(&persistent, "CREATE FULLTEXT INDEX FOR (n:LateIdx) ON (n.name)")?;
+    }
+    {
+        let recovered = NativeGraph::open_persistent("late-index-restart", &late_index_wal)?;
+        let out = must_query(
+            &recovered,
+            "MATCH (n:LateIdx) WHERE n.age >= 35 RETURN n.name",
+        )?;
+        require_contains(&out, "Alice", "late-created range index recovery")?;
+        let out = must_query(
+            &recovered,
+            "CALL db.idx.fulltext.queryNodes('LateIdx','Alice') YIELD node RETURN node.age",
+        )?;
+        require_contains(&out, "40", "late-created fulltext index recovery")?;
+    }
+    let _ = std::fs::remove_file(&late_index_wal);
+
+    println!("NATIVE_LATE_INDEX_RESTART_PASS");
     println!("NATIVE_WAL_INDEX_RESTART_PASS");
     Ok(())
 }

@@ -92,6 +92,14 @@ def patch_graphblas_matrix():
 
     p.write_text(s, encoding="utf-8")
 
+def install_native_index():
+    source = Path(__file__).resolve().parent.parent / "patches" / "native_index_mod.rs"
+    if not source.exists():
+        raise RuntimeError(f"native index module not found: {source}")
+    target = root / "graph/src/index/mod.rs"
+    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    print("installed pure-Rust native graph index backend")
+
 def patch_graph_build():
     p = root / "graph/build.rs"
     s = p.read_text(encoding="utf-8")
@@ -190,4 +198,5 @@ patch_module_init()
 patch_graphblas_bindings()
 patch_graphblas_matrix()
 patch_graph_build()
+install_native_index()
 print("Windows foundation patches applied")

@@ -14,7 +14,7 @@ use rustls::{
 };
 
 use parking_lot::RwLock;
-use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
+use graph::{entity_type::EntityType, graph::constraint::ConstraintType, runtime::string_pool};
 
 use crate::{
     NativeGraph, OutputStats, QueryOutput, native_config, udf_store, wire::WireValue,
@@ -537,6 +537,9 @@ fn dispatch(
         }
         "COMMAND" => Resp::Array(Vec::new()),
         "GRAPH.LIST" => Resp::Array(catalog.list().into_iter().map(bulk).collect()),
+        "GRAPH.INFO" => handle_graph_info(&args),
+        "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
+        "GRAPH.BULK" => handle_graph_bulk(&args, catalog),
         "GRAPH.QUERY" => handle_graph_query(&args, catalog, false),
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
         "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
@@ -610,6 +613,228 @@ fn dispatch(
         "GRAPH.CONFIG" => handle_graph_config(&args),
         "GRAPH.UDF" => handle_graph_udf(&args, catalog),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
+    }
+}
+
+
+fn handle_graph_info(args: &[Vec<u8>]) -> Resp {
+    let all = args.len() == 1;
+    let mut want_running = all;
+    let mut want_waiting = all;
+    let mut want_pool = all;
+
+    for arg in args.iter().skip(1) {
+        match ascii_upper(arg).as_str() {
+            "RUNNINGQUERIES" => want_running = true,
+            "WAITINGQUERIES" => want_waiting = true,
+            "OBJECTPOOL" => want_pool = true,
+            _ => {}
+        }
+    }
+
+    if !(want_running || want_waiting || want_pool) {
+        return bulk("no section found");
+    }
+
+    let mut out = Vec::new();
+    if want_running {
+        out.push(bulk("# Running queries"));
+        // The standalone host executes each accepted network request directly
+        // on its connection thread; there is no Redis blocked-client queue.
+        out.push(Resp::Array(Vec::new()));
+    }
+    if want_waiting {
+        out.push(bulk("# Waiting queries"));
+        out.push(Resp::Array(Vec::new()));
+    }
+    if want_pool {
+        let (count, avg) = string_pool::global().stats();
+        out.push(bulk("Object Pool"));
+        out.push(Resp::Array(vec![
+            Resp::Array(vec![bulk("Unique Objects in Pool"), Resp::Int(count as i64)]),
+            Resp::Array(vec![
+                bulk("Average References per Object"),
+                bulk(if avg.fract() == 0.0 {
+                    format!("{}", avg as i64)
+                } else {
+                    format!("{avg}")
+                }),
+            ]),
+        ]));
+    }
+    Resp::Array(out)
+}
+
+fn handle_graph_memory(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() != 3 && args.len() != 5 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.memory' command".to_string());
+    }
+    if ascii_upper(&args[1]) != "USAGE" {
+        return Resp::Error(
+            "ERR unknown subcommand. Try GRAPH.MEMORY USAGE <key> [SAMPLES <count>]"
+                .to_string(),
+        );
+    }
+
+    let graph_name = match utf8(&args[2], "graph name") {
+        Ok(value) => value,
+        Err(err) => return Resp::Error(err),
+    };
+    let samples = if args.len() == 5 {
+        if ascii_upper(&args[3]) != "SAMPLES" {
+            return Resp::Error("ERR expected SAMPLES keyword".to_string());
+        }
+        match utf8(&args[4], "sample count")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(value) if value > 0 => value,
+            _ => {
+                return Resp::Error(
+                    "ERR SAMPLES count must be a positive integer".to_string(),
+                );
+            }
+        }
+    } else {
+        100
+    };
+
+    let Some(graph) = catalog.get(graph_name) else {
+        return Resp::Error("ERR Graph does not exist".to_string());
+    };
+    let report = graph.memory_usage_report(samples);
+    const MB: usize = 1 << 20;
+
+    let label_matrices = (report.label_matrices_sz / MB) as i64;
+    let relation_matrices = (report.relation_matrices_sz / MB) as i64;
+    let node_block = (report.node_block_storage_sz / MB) as i64;
+    let unlabeled = (report.unlabeled_node_attr_sz / MB) as i64;
+    let edge_block = (report.edge_block_storage_sz / MB) as i64;
+    let indices = (report.indices_sz / MB) as i64;
+
+    let mut node_attrs = Vec::new();
+    let mut node_attr_total = 0i64;
+    for (name, bytes) in report.node_attr_by_label {
+        let mb = (bytes / MB) as i64;
+        node_attr_total += mb;
+        node_attrs.push(bulk(name.as_str()));
+        node_attrs.push(Resp::Int(mb));
+    }
+
+    let mut edge_attrs = Vec::new();
+    let mut edge_attr_total = 0i64;
+    for (name, bytes) in report.edge_attr_by_type {
+        let mb = (bytes / MB) as i64;
+        edge_attr_total += mb;
+        edge_attrs.push(bulk(name.as_str()));
+        edge_attrs.push(Resp::Int(mb));
+    }
+
+    let total = label_matrices
+        + relation_matrices
+        + node_block
+        + node_attr_total
+        + unlabeled
+        + edge_block
+        + edge_attr_total
+        + indices;
+
+    Resp::Array(vec![
+        bulk("total_graph_sz_mb"), Resp::Int(total),
+        bulk("label_matrices_sz_mb"), Resp::Int(label_matrices),
+        bulk("relation_matrices_sz_mb"), Resp::Int(relation_matrices),
+        bulk("amortized_node_block_sz_mb"), Resp::Int(node_block),
+        bulk("amortized_node_attributes_by_label_sz_mb"), Resp::Array(node_attrs),
+        bulk("amortized_unlabeled_nodes_attributes_sz_mb"), Resp::Int(unlabeled),
+        bulk("amortized_edge_block_sz_mb"), Resp::Int(edge_block),
+        bulk("amortized_edge_attributes_by_type_sz_mb"), Resp::Array(edge_attrs),
+        bulk("indices_sz_mb"), Resp::Int(indices),
+    ])
+}
+
+fn handle_graph_bulk(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 7 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.bulk' command".to_string());
+    }
+    let graph_name = match utf8(&args[1], "graph name") {
+        Ok(value) => value,
+        Err(err) => return Resp::Error(err),
+    };
+
+    let mut cursor = 2usize;
+    let begin = args
+        .get(cursor)
+        .is_some_and(|value| ascii_upper(value) == "BEGIN");
+    if begin {
+        cursor += 1;
+    }
+
+    let parse = |idx: usize, label: &str| -> Result<usize, Resp> {
+        let value = args
+            .get(idx)
+            .ok_or_else(|| Resp::Error(format!("ERR missing {label}")))?;
+        let value = utf8(value, label).map_err(Resp::Error)?;
+        crate::bulk::parse_count(value)
+            .ok_or_else(|| Resp::Error(format!("ERR Error parsing {label}.")))
+    };
+
+    let node_count = match parse(cursor, "node count") {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let edge_count = match parse(cursor + 1, "relation count") {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let node_token_count = match parse(cursor + 2, "node token count") {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let rel_token_count = match parse(cursor + 3, "relation token count") {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    cursor += 4;
+
+    let tokens: Vec<Vec<u8>> = args[cursor..].to_vec();
+    if tokens.len() != node_token_count.saturating_add(rel_token_count) {
+        return Resp::Error("ERR Bulk insert format error, token count mismatch.".to_string());
+    }
+
+    let graph = if begin {
+        match catalog.create_for_bulk(graph_name) {
+            Ok(graph) => graph,
+            Err(err) => return Resp::Error(format!("ERR {err}")),
+        }
+    } else {
+        match catalog.get(graph_name) {
+            Some(graph) => graph,
+            None => {
+                return Resp::Error("ERR Invalid graph operation on empty key".to_string());
+            }
+        }
+    };
+
+    match graph.bulk_insert(
+        &tokens,
+        node_count,
+        edge_count,
+        node_token_count,
+        rel_token_count,
+    ) {
+        Ok(()) => Resp::Simple(format!(
+            "{node_count} nodes created, {edge_count} relations created"
+        )),
+        Err(err) => {
+            if begin {
+                if let Err(cleanup_err) = catalog.delete(graph_name) {
+                    return Resp::Error(format!(
+                        "ERR bulk insert failed: {err}; cleanup failed: {cleanup_err}"
+                    ));
+                }
+            }
+            Resp::Error(format!("ERR bulk insert failed: {err}"))
+        }
     }
 }
 

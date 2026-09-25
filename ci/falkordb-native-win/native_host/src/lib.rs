@@ -1,11 +1,13 @@
+pub mod wal;
 pub mod property_index;
 pub mod range_index;
 
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
-use std::{cell::Cell, ffi::c_void, sync::Arc};
+use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc};
 
 use graph::{
+    effects::EffectsPayload,
     graph::{
         graph::{Plan, NODE_CREATION_BUFFER},
         graphblas::matrix,
@@ -20,6 +22,7 @@ use graph::{
 };
 use orx_tree::Collection;
 use parking_lot::RwLock;
+use wal::Wal;
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
@@ -127,6 +130,8 @@ impl WriteEscalation for PrelockedWriteEscalation {
 
 pub struct NativeGraph {
     inner: RwLock<MvccGraph>,
+    name: String,
+    wal: Option<Wal>,
     import_folder: String,
     result_set_size: i64,
     timeout_ms: Option<u64>,
@@ -136,10 +141,59 @@ impl NativeGraph {
     pub fn new(name: &str) -> Self {
         Self {
             inner: RwLock::new(MvccGraph::new(16_384, 16_384, 25, name)),
+            name: name.to_string(),
+            wal: None,
             import_folder: String::new(),
             result_set_size: -1,
             timeout_ms: None,
         }
+    }
+
+    /// Open a standalone graph backed by a durable effects WAL.
+    ///
+    /// Recovery replays FalkorDB's deterministic GRAPH.EFFECT payloads rather
+    /// than re-running Cypher text, so transaction-time/random expressions are
+    /// not re-evaluated after restart.
+    pub fn open_persistent(
+        name: &str,
+        wal_path: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        let (wal, records) = Wal::open(wal_path)?;
+        let mut mvcc = MvccGraph::new(16_384, 16_384, 25, name);
+
+        if !records.is_empty() {
+            let private = mvcc
+                .write()
+                .ok_or_else(|| "native host: failed to claim MVCC writer during recovery".to_string())?;
+
+            {
+                let mut graph = private.borrow_mut();
+                for record in &records {
+                    if record.key.as_slice() != name.as_bytes() {
+                        return Err(format!(
+                            "WAL sequence {} belongs to graph {:?}, expected {:?}",
+                            record.sequence,
+                            String::from_utf8_lossy(&record.key),
+                            name
+                        ));
+                    }
+                    EffectsPayload::apply(&mut graph, &record.payload).map_err(|e| {
+                        format!("WAL recovery failed at sequence {}: {e}", record.sequence)
+                    })?;
+                }
+            }
+
+            mvcc.commit(Arc::clone(&private));
+        }
+
+        Ok(Self {
+            inner: RwLock::new(mvcc),
+            name: name.to_string(),
+            wal: Some(wal),
+            import_folder: String::new(),
+            result_set_size: -1,
+            timeout_ms: None,
+        })
     }
 
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
@@ -230,7 +284,7 @@ impl NativeGraph {
             None,
             &escalation,
         );
-        runtime.build_effects.set(false);
+        runtime.build_effects.set(self.wal.is_some());
 
         let mut result = match runtime.query() {
             Ok(result) => result,
@@ -245,9 +299,32 @@ impl NativeGraph {
         };
 
         result.stats.cached = cached;
+        let modified = query_modified(&runtime, &result.stats);
         let output = capture_output(&runtime, &result);
+        drop(result);
 
         if escalation.crossed() {
+            // Durability order is WAL first, MVCC publication second. A crash
+            // can therefore lose an unpublished private version, but can never
+            // expose a graph mutation that was not durable.
+            if modified
+                && let Some(wal) = &self.wal
+            {
+                let effects = runtime
+                    .effects_buffer
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| "native host: modified write produced no effects buffer".to_string())?;
+
+                if let Err(err) = wal.append_effects(effects, self.name.as_bytes()) {
+                    let committed = host_guard.read();
+                    runtime.resync_published_indexes(&committed);
+                    drop(committed);
+                    host_guard.rollback();
+                    return Err(err);
+                }
+            }
+
             host_guard.commit(Arc::clone(&private));
         } else {
             host_guard.rollback();
@@ -255,6 +332,25 @@ impl NativeGraph {
 
         Ok(output)
     }
+}
+
+fn query_modified(
+    runtime: &Runtime<'_>,
+    stats: &QueryStatistics,
+) -> bool {
+    // Same predicate used by FalkorDB's Redis host when deciding whether a
+    // write query produced durable/replicable state.
+    stats.nodes_created > 0
+        || stats.nodes_deleted > 0
+        || stats.relationships_created > 0
+        || stats.relationships_deleted > 0
+        || stats.properties_set > 0
+        || stats.properties_removed > 0
+        || stats.labels_added > 0
+        || stats.labels_removed > 0
+        || stats.indexes_created > 0
+        || stats.indexes_dropped > 0
+        || runtime.effects_count.get() > 0
 }
 
 fn plan_is_write(plan: &Plan) -> bool {

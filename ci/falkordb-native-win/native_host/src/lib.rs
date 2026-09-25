@@ -337,13 +337,6 @@ impl NativeGraph {
         destination_name: &str,
         destination_wal: impl AsRef<Path>,
     ) -> Result<Self, String> {
-        let _snapshot_guard = self.inner.read();
-        let source_wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| "native host: GRAPH.COPY requires a persistent source graph".to_string())?;
-        let records = source_wal.records()?;
-
         let destination_wal = destination_wal.as_ref();
         if destination_wal.exists()
             && std::fs::metadata(destination_wal)
@@ -354,14 +347,28 @@ impl NativeGraph {
             return Err("destination key already exists".to_string());
         }
 
-        let (target, existing) = Wal::open(destination_wal)?;
-        if !existing.is_empty() {
-            return Err("destination key already exists".to_string());
+        let source_wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| "native host: GRAPH.COPY requires a persistent source graph".to_string())?;
+        let sequence = source_wal.last_sequence();
+
+        // Copy the current committed graph, not merely the current WAL. The WAL
+        // may have been compacted after a checkpoint, so its remaining frames
+        // are not necessarily the graph's full history.
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        {
+            let graph = committed.borrow();
+            snapshot::write_checkpoint(
+                destination_wal,
+                destination_name,
+                sequence,
+                &graph,
+            )?;
         }
-        for record in records {
-            target.append_payload(destination_name.as_bytes(), &record.payload)?;
-        }
-        drop(target);
+        drop(committed);
+        drop(host_guard);
 
         Self::open_persistent(destination_name, destination_wal)
     }

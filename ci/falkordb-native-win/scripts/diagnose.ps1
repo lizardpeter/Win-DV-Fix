@@ -44,12 +44,14 @@ cargo check -p graph 2>&1 | Tee-Object -FilePath (Join-Path $Logs "01_graph_chec
 Pop-Location
 
 Write-Host "=== Stage 2: native host type-check ==="
-$Host = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
-cargo check --manifest-path $Host 2>&1 | Tee-Object -FilePath (Join-Path $Logs "02_host_check.txt")
+$HostManifest = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
+cargo check --manifest-path $HostManifest 2>&1 | Tee-Object -FilePath (Join-Path $Logs "02_host_check.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native host cargo check failed with exit code $LASTEXITCODE" }
 
 Write-Host "=== Stage 3: native smoke executable link ==="
-cargo build --manifest-path $Host --bin smoke --release 2>&1 |
+cargo build --manifest-path $HostManifest --bin smoke --release 2>&1 |
     Tee-Object -FilePath (Join-Path $Logs "03_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native smoke build failed with exit code $LASTEXITCODE" }
 
 Write-Host "=== Stage 4: native smoke execution ==="
 $SmokeExe = Join-Path $PSScriptRoot "..\native_host\target\release\smoke.exe"

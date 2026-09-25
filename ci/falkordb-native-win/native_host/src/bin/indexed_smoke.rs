@@ -1,4 +1,5 @@
 use falkordb_native_host::{Engine, NativeGraph};
+use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 use std::path::PathBuf;
 
 fn must_query(graph: &NativeGraph, q: &str) -> Result<falkordb_native_host::QueryOutput, String> {
@@ -210,5 +211,123 @@ fn main() -> Result<(), String> {
 
     println!("NATIVE_LATE_INDEX_RESTART_PASS");
     println!("NATIVE_WAL_INDEX_RESTART_PASS");
+
+    // Full graph checkpoint + WAL rotation. This verifies the checkpoint owns
+    // graph data, range/fulltext/vector index metadata, and constraints, while
+    // post-checkpoint mutations continue in the absolute-sequence WAL.
+    let checkpoint_wal: PathBuf = std::env::temp_dir().join(format!(
+        "falkordb-native-checkpoint-{}.wal",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&checkpoint_wal);
+    for entry in std::fs::read_dir(std::env::temp_dir())
+        .map_err(|e| format!("scan temp dir for checkpoint cleanup: {e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!(
+            "{}.snapshot.",
+            checkpoint_wal.file_name().unwrap().to_string_lossy()
+        )) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    {
+        let persistent = NativeGraph::open_persistent("checkpoint-smoke", &checkpoint_wal)?;
+        must_query(
+            &persistent,
+            "CREATE INDEX FOR (n:Checkpoint) ON (n.id)",
+        )?;
+        must_query(
+            &persistent,
+            "CREATE FULLTEXT INDEX FOR (n:Checkpoint) ON (n.text)",
+        )?;
+        must_query(
+            &persistent,
+            "CREATE VECTOR INDEX FOR (n:Checkpoint) ON (n.emb) OPTIONS {dimension:2, similarityFunction:'euclidean', M:16, efConstruction:200, efRuntime:10}",
+        )?;
+        must_query(
+            &persistent,
+            "CREATE (:Checkpoint {id:1,text:'before checkpoint',emb:vecf32([0.0,0.0])})",
+        )?;
+        persistent.mutate_constraint(
+            true,
+            ConstraintType::Unique,
+            EntityType::Node,
+            "Checkpoint",
+            &["id".to_string()],
+        )?;
+
+        let snapshot = persistent.checkpoint()?;
+        if !snapshot.exists() {
+            return Err(format!("checkpoint file was not created: {}", snapshot.display()));
+        }
+        let wal_len = std::fs::metadata(&checkpoint_wal)
+            .map_err(|e| format!("stat compacted WAL: {e}"))?
+            .len();
+        if wal_len != 0 {
+            return Err(format!("checkpoint did not compact WAL to zero bytes: {wal_len}"));
+        }
+
+        must_query(
+            &persistent,
+            "CREATE (:Checkpoint {id:2,text:'after checkpoint',emb:vecf32([10.0,10.0])})",
+        )?;
+        let wal_len_after = std::fs::metadata(&checkpoint_wal)
+            .map_err(|e| format!("stat post-checkpoint WAL: {e}"))?
+            .len();
+        if wal_len_after == 0 {
+            return Err("post-checkpoint mutation did not append WAL data".to_string());
+        }
+    }
+
+    {
+        let recovered = NativeGraph::open_persistent("checkpoint-smoke", &checkpoint_wal)?;
+        let out = must_query(
+            &recovered,
+            "MATCH (n:Checkpoint) RETURN n.id ORDER BY n.id",
+        )?;
+        if out.rows.len() != 2 {
+            return Err(format!("checkpoint recovery expected 2 rows, got {:?}", out.rows));
+        }
+        require_contains(&out, "1", "checkpoint pre-snapshot row")?;
+        require_contains(&out, "2", "checkpoint post-snapshot WAL row")?;
+
+        let out = must_query(
+            &recovered,
+            "CALL db.idx.fulltext.queryNodes('Checkpoint','before') YIELD node RETURN node.id",
+        )?;
+        require_contains(&out, "1", "checkpoint fulltext recovery")?;
+
+        let out = must_query(
+            &recovered,
+            "CALL db.idx.vector.queryNodes('Checkpoint','emb',1,vecf32([0.1,0.1])) YIELD node RETURN node.id",
+        )?;
+        require_contains(&out, "1", "checkpoint vector recovery")?;
+
+        if recovered
+            .query("CREATE (:Checkpoint {id:1,text:'duplicate',emb:vecf32([1.0,1.0])})")
+            .is_ok()
+        {
+            return Err("checkpoint-recovered UNIQUE constraint accepted duplicate id".to_string());
+        }
+    }
+
+    let _ = std::fs::remove_file(&checkpoint_wal);
+    for entry in std::fs::read_dir(std::env::temp_dir())
+        .map_err(|e| format!("scan temp dir for checkpoint cleanup: {e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!(
+            "{}.snapshot.",
+            checkpoint_wal.file_name().unwrap().to_string_lossy()
+        )) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    println!("NATIVE_CHECKPOINT_WAL_ROTATION_PASS");
     Ok(())
 }

@@ -564,6 +564,7 @@ fn dispatch(
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
         "GRAPH.INFO" => handle_graph_info(&args),
         "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
+        "GRAPH.BULK" => handle_graph_bulk(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
         "GRAPH.UDF" => handle_graph_udf(&args, catalog),
@@ -677,6 +678,58 @@ fn handle_client(args: &[Vec<u8>], state: &mut ConnectionState) -> Resp {
     }
 }
 
+
+fn handle_graph_bulk(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 6 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.bulk' command".to_string());
+    }
+
+    let name = match utf8(&args[1], "graph name") {
+        Ok(v) => v.to_string(),
+        Err(err) => return Resp::Error(err),
+    };
+    let request = match crate::bulk::parse_request(&args[2..]) {
+        Ok(request) => request,
+        Err(err) => return Resp::Error(format!("ERR {err}")),
+    };
+
+    let existed = catalog.contains(&name);
+    if request.begin && existed {
+        return Resp::Error(format!(
+            "ERR Graph with name '{name}' cannot be created, as key '{name}' already exists."
+        ));
+    }
+    if !request.begin && !existed {
+        return Resp::Error("ERR Invalid graph operation on empty key".to_string());
+    }
+
+    let graph = if existed {
+        match catalog.get(&name) {
+            Some(graph) => graph,
+            None => return Resp::Error("ERR Invalid graph operation on empty key".to_string()),
+        }
+    } else {
+        match catalog.get_or_create(&name) {
+            Ok(graph) => graph,
+            Err(err) => return Resp::Error(format!("ERR {err}")),
+        }
+    };
+
+    match graph.bulk_insert(&request) {
+        Ok(reply) => Resp::Simple(reply),
+        Err(err) => {
+            drop(graph);
+            if request.begin {
+                let _ = catalog.delete(&name);
+            }
+            Resp::Error(if err.starts_with("ERR ") {
+                err
+            } else {
+                format!("ERR {err}")
+            })
+        }
+    }
+}
 
 fn handle_graph_info(args: &[Vec<u8>]) -> Resp {
     let all = args.len() == 1;

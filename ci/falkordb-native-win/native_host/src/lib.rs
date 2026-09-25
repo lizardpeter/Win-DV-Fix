@@ -266,6 +266,17 @@ impl NativeGraph {
     }
 
 
+    pub fn wal_len(&self) -> Result<u64, String> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| "native host: WAL length requires a persistent graph".to_string())?;
+        std::fs::metadata(wal.path())
+            .map(|meta| meta.len())
+            .map_err(|e| format!("stat WAL {}: {e}", wal.path().display()))
+    }
+
+
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
         let wall = Instant::now();
         let (snapshot, first_plan) = {

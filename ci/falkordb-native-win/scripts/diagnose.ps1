@@ -115,6 +115,7 @@ $NetworkData = Join-Path $WorkDir "network-data"
 Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
+$ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -150,9 +151,13 @@ function Start-NativeServer([string]$Suffix) {
         "--password", "native-ci-secret",
         "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
         "--tls-key", (Join-Path $TlsDir "server-key.pem"),
-        "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem"),
+        "--api-bind", "127.0.0.1:8443",
+        "--api-token", "native-api-write-secret",
+        "--api-read-token", "native-api-read-secret"
     ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     Wait-NativeServer 6391
+    Wait-NativeServer 8443
     return $proc
 }
 
@@ -167,6 +172,16 @@ try {
     $WriteText = (Get-Content (Join-Path $Logs "10_official_client_write.txt") -Raw)
     if ($WriteText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS") {
         throw "Official FalkorDB client did not prove mTLS write connectivity"
+    }
+
+    python $ApiSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_chatgpt_api_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT HTTPS API write phase failed with exit code $LASTEXITCODE"
+    }
+    $ApiWriteText = (Get-Content (Join-Path $Logs "10_chatgpt_api_write.txt") -Raw)
+    if ($ApiWriteText -notmatch "CHATGPT_HTTPS_API_WRITE_PASS") {
+        throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
     }
 
     # Hard-stop the server to prove committed graph state is recoverable solely
@@ -186,6 +201,16 @@ try {
     if ($RestartText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS") {
         throw "Official FalkorDB client did not prove mTLS restart connectivity"
     }
+
+    python $ApiSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_chatgpt_api_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT HTTPS API restart phase failed with exit code $LASTEXITCODE"
+    }
+    $ApiRestartText = (Get-Content (Join-Path $Logs "11_chatgpt_api_restart.txt") -Raw)
+    if ($ApiRestartText -notmatch "CHATGPT_HTTPS_API_RESTART_PASS") {
+        throw "ChatGPT HTTPS API did not prove restart/WAL recovery"
+    }
 } finally {
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
@@ -196,4 +221,5 @@ try {
 Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
+Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 

@@ -150,6 +150,31 @@ impl GraphCatalog {
         names
     }
 
+    pub fn checkpoint_large_wals(
+        &self,
+        threshold_bytes: u64,
+    ) -> Vec<(String, Result<PathBuf, String>)> {
+        let graphs: Vec<(String, Arc<NativeGraph>)> = self
+            .graphs
+            .read()
+            .iter()
+            .map(|(name, graph)| (name.clone(), Arc::clone(graph)))
+            .collect();
+
+        let mut results = Vec::new();
+        for (name, graph) in graphs {
+            match graph.wal_len() {
+                Ok(len) if len >= threshold_bytes => {
+                    results.push((name, graph.checkpoint()));
+                }
+                Ok(_) => {}
+                Err(err) => results.push((name, Err(err))),
+            }
+        }
+        results
+    }
+
+
     pub fn copy(&self, source: &str, destination: &str) -> Result<(), String> {
         if source == destination {
             return Err("destination key already exists".to_string());

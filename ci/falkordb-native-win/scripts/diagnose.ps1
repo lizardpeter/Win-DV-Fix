@@ -245,3 +245,90 @@ Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_MCP_PASS"
 
+
+
+Write-Host ""
+Write-Host "=== Stage 8: OAuth-scoped MCP resource-server compatibility ==="
+
+$OAuthFixture = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\oauth_fixture_server.py"))
+$OAuthSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\oauth_mcp_smoke.py"))
+$OAuthDir = Join-Path $WorkDir "oauth-fixtures"
+$OAuthData = Join-Path $WorkDir "oauth-network-data"
+Remove-Item -Recurse -Force $OAuthDir -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $OAuthData -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $OAuthDir | Out-Null
+New-Item -ItemType Directory -Force -Path $OAuthData | Out-Null
+$env:FALKORDB_TEST_OAUTH_DIR = $OAuthDir
+
+$PythonExe = (Get-Command python).Source
+$OAuthIssuerOut = Join-Path $Logs "12_oauth_issuer_stdout.txt"
+$OAuthIssuerErr = Join-Path $Logs "12_oauth_issuer_stderr.txt"
+$OAuthIssuer = Start-Process -FilePath $PythonExe -ArgumentList @(
+    $OAuthFixture,
+    $OAuthDir
+) -PassThru -RedirectStandardOutput $OAuthIssuerOut -RedirectStandardError $OAuthIssuerErr
+
+function Start-OAuthNativeServer([string]$Suffix) {
+    $out = Join-Path $Logs ("12_oauth_server_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("12_oauth_server_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        "--bind", "127.0.0.1:6392",
+        "--data-dir", $OAuthData,
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--api-bind", "127.0.0.1:8443",
+        "--oauth-resource", "https://localhost:8443/mcp",
+        "--oauth-issuer", "http://127.0.0.1:8765",
+        "--oauth-audience", "https://localhost:8443/mcp",
+        "--oauth-jwks-url", "http://127.0.0.1:8765/jwks.json",
+        "--oauth-read-scope", "graph:read",
+        "--oauth-write-scope", "graph:write"
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6392
+    Wait-NativeServer 8443
+    return $proc
+}
+
+$OAuthServer = $null
+try {
+    Wait-NativeServer 8765
+
+    $OAuthServer = Start-OAuthNativeServer "first"
+    python $OAuthSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "13_oauth_mcp_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "OAuth MCP write/scopes phase failed with exit code $LASTEXITCODE"
+    }
+    $OAuthWriteText = (Get-Content (Join-Path $Logs "13_oauth_mcp_write.txt") -Raw)
+    if ($OAuthWriteText -notmatch "CHATGPT_OAUTH_MCP_WRITE_PASS") {
+        throw "OAuth MCP did not prove signed-token read/write scope enforcement"
+    }
+
+    Stop-Process -Id $OAuthServer.Id -Force
+    Wait-Process -Id $OAuthServer.Id -ErrorAction SilentlyContinue
+    $OAuthServer = $null
+    Start-Sleep -Milliseconds 300
+
+    $OAuthServer = Start-OAuthNativeServer "restart"
+    python $OAuthSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "14_oauth_mcp_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "OAuth MCP restart phase failed with exit code $LASTEXITCODE"
+    }
+    $OAuthRestartText = (Get-Content (Join-Path $Logs "14_oauth_mcp_restart.txt") -Raw)
+    if ($OAuthRestartText -notmatch "CHATGPT_OAUTH_MCP_RESTART_PASS") {
+        throw "OAuth MCP did not prove restart/WAL recovery"
+    }
+} finally {
+    if ($null -ne $OAuthServer -and -not $OAuthServer.HasExited) {
+        Stop-Process -Id $OAuthServer.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $OAuthServer.Id -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $OAuthIssuer -and -not $OAuthIssuer.HasExited) {
+        Stop-Process -Id $OAuthIssuer.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $OAuthIssuer.Id -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host ""
+Write-Host "NATIVE_WINDOWS_CHATGPT_OAUTH_MCP_PASS"

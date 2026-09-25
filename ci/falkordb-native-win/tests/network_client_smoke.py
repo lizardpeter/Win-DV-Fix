@@ -115,9 +115,23 @@ def phase_write():
     except ResponseError:
         pass
 
+    udf_script = """
+    function PersistedAdd(x) { return x + 7; }
+    falkor.register("PersistedAdd", PersistedAdd);
+    """
+    assert db.udf_load("native_ci", udf_script, True) == "OK"
+    udf_result = graph.query("RETURN native_ci.PersistedAdd(35)")
+    assert udf_result.result_set == [[42]], udf_result.result_set
+
+    udf_list = db.udf_list("native_ci", with_code=True)
+    assert len(udf_list) == 1, udf_list
+    assert udf_list[0][1] == "native_ci", udf_list
+    assert "PersistedAdd" in udf_list[0][3], udf_list
+
     names = db.list_graphs()
     assert GRAPH in names, names
     db.close()
+    print("OFFICIAL_FALKORDB_CLIENT_UDF_WRITE_PASS")
     print("OFFICIAL_FALKORDB_CLIENT_WRITE_PASS")
     if TLS_DIR is not None:
         print("OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS")
@@ -146,8 +160,16 @@ def phase_read():
     )
     assert result.result_set == [["Alice"]], result.result_set
 
+    # GRAPH.UDF is process-global upstream state. The standalone server persists
+    # it beside graph WAL/checkpoints and must restore it on a fresh process.
+    udf_result = graph.query("RETURN native_ci.PersistedAdd(35)")
+    assert udf_result.result_set == [[42]], udf_result.result_set
+    udf_list = db.udf_list("native_ci")
+    assert len(udf_list) == 1, udf_list
+
     assert GRAPH in db.list_graphs()
     db.close()
+    print("OFFICIAL_FALKORDB_CLIENT_UDF_RESTART_PASS")
     print("OFFICIAL_FALKORDB_CLIENT_RESTART_PASS")
     if TLS_DIR is not None:
         print("OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS")

@@ -14,6 +14,7 @@ use rustls::{
 };
 
 use parking_lot::RwLock;
+use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{NativeGraph, OutputStats, QueryOutput, wire::WireValue};
 
@@ -523,6 +524,7 @@ fn dispatch(
             }
         }
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
+        "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
     }
@@ -631,6 +633,82 @@ fn handle_client(args: &[Vec<u8>], state: &mut ConnectionState) -> Resp {
             .map_or(Resp::Null, |name| bulk(name)),
         "ID" => Resp::Int(1),
         _ => Resp::Simple("OK".to_string()),
+    }
+}
+
+
+fn handle_graph_constraint(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 9 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.constraint' command".to_string());
+    }
+
+    let create = match ascii_upper(&args[1]).as_str() {
+        "CREATE" => true,
+        "DROP" => false,
+        _ => return Resp::Error("ERR Invalid constraint operation".to_string()),
+    };
+    let graph_name = match utf8(&args[2], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let constraint_type = match ascii_upper(&args[3]).as_str() {
+        "UNIQUE" => ConstraintType::Unique,
+        "MANDATORY" => ConstraintType::Mandatory,
+        _ => return Resp::Error("ERR Invalid constraint type".to_string()),
+    };
+    let entity_type = match ascii_upper(&args[4]).as_str() {
+        "NODE" => EntityType::Node,
+        "RELATIONSHIP" => EntityType::Relationship,
+        _ => return Resp::Error("ERR Invalid entity type".to_string()),
+    };
+    let label = match utf8(&args[5], "constraint label") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    if ascii_upper(&args[6]) != "PROPERTIES" {
+        return Resp::Error("ERR Expected PROPERTIES".to_string());
+    }
+    let count = match utf8(&args[7], "property count").and_then(|v| {
+        v.parse::<usize>()
+            .map_err(|_| "ERR invalid property count".to_string())
+    }) {
+        Ok(v) if v > 0 => v,
+        Ok(_) => return Resp::Error("ERR constraint must include at least one property".to_string()),
+        Err(err) => return Resp::Error(err),
+    };
+    if args.len() != 8 + count {
+        return Resp::Error("ERR property count does not match arguments".to_string());
+    }
+
+    let mut properties = Vec::with_capacity(count);
+    for value in &args[8..] {
+        match utf8(value, "constraint property") {
+            Ok(v) => properties.push(v.to_string()),
+            Err(err) => return Resp::Error(err),
+        }
+    }
+
+    let graph = if create {
+        match catalog.get_or_create(graph_name) {
+            Ok(graph) => graph,
+            Err(err) => return Resp::Error(format!("ERR {err}")),
+        }
+    } else {
+        match catalog.get(graph_name) {
+            Some(graph) => graph,
+            None => return Resp::Error("ERR Invalid graph operation on empty key".to_string()),
+        }
+    };
+
+    match graph.mutate_constraint(
+        create,
+        constraint_type,
+        entity_type,
+        label,
+        &properties,
+    ) {
+        Ok(()) => Resp::Simple("OK".to_string()),
+        Err(err) => Resp::Error(format!("ERR {err}")),
     }
 }
 

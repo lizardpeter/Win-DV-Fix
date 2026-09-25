@@ -9,6 +9,7 @@ graph = { path = "../build/src/FalkorDB/graph" }
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
 atomic_refcell = "0.1.14"
 thin-vec = "0.2.18"
+crc32fast = "1.5"
 orx-tree = "2.2.0"
 
 [profile.release]

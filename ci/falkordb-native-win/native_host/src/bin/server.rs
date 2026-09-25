@@ -9,6 +9,7 @@ use std::{
 use falkordb_native_host::{
     Engine,
     api::{ApiConfig, serve_api},
+    oauth::{OAuthConfig, OAuthVerifier},
     server::{GraphCatalog, ServerConfig, TlsConfig, serve_with_catalog},
 };
 
@@ -48,9 +49,29 @@ fn main() -> Result<(), String> {
     let mut api_allow_plaintext_remote = false;
     let mut api_allow_unauthenticated_remote = false;
 
+    let mut oauth_resource = env::var("FALKORDB_OAUTH_RESOURCE").ok().filter(|v| !v.is_empty());
+    let mut oauth_issuer = env::var("FALKORDB_OAUTH_ISSUER").ok().filter(|v| !v.is_empty());
+    let mut oauth_audience = env::var("FALKORDB_OAUTH_AUDIENCE").ok().filter(|v| !v.is_empty());
+    let mut oauth_jwks_url = env::var("FALKORDB_OAUTH_JWKS_URL").ok().filter(|v| !v.is_empty());
+    let mut oauth_read_scope = env::var("FALKORDB_OAUTH_READ_SCOPE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "graph:read".to_string());
+    let mut oauth_write_scope = env::var("FALKORDB_OAUTH_WRITE_SCOPE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "graph:write".to_string());
+
     // A configured API credential implies a localhost API even when no bind
     // was specified, making the ChatGPT surface easy to enable safely.
-    if api_bind.is_none() && (api_token.is_some() || api_read_token.is_some()) {
+    if api_bind.is_none()
+        && (api_token.is_some()
+            || api_read_token.is_some()
+            || oauth_resource.is_some()
+            || oauth_issuer.is_some()
+            || oauth_audience.is_some()
+            || oauth_jwks_url.is_some())
+    {
         api_bind = Some("127.0.0.1:8443".parse().expect("valid default API bind"));
     }
 
@@ -125,6 +146,38 @@ fn main() -> Result<(), String> {
             "--api-allow-unauthenticated-remote" => {
                 api_allow_unauthenticated_remote = true;
             }
+            "--oauth-resource" => {
+                oauth_resource = Some(
+                    args.next()
+                        .ok_or_else(|| "--oauth-resource requires a URL".to_string())?,
+                );
+            }
+            "--oauth-issuer" => {
+                oauth_issuer = Some(
+                    args.next()
+                        .ok_or_else(|| "--oauth-issuer requires a URL".to_string())?,
+                );
+            }
+            "--oauth-audience" => {
+                oauth_audience = Some(
+                    args.next()
+                        .ok_or_else(|| "--oauth-audience requires a value".to_string())?,
+                );
+            }
+            "--oauth-jwks-url" => {
+                oauth_jwks_url = Some(
+                    args.next()
+                        .ok_or_else(|| "--oauth-jwks-url requires a URL".to_string())?,
+                );
+            }
+            "--oauth-read-scope" => {
+                oauth_read_scope = args.next()
+                    .ok_or_else(|| "--oauth-read-scope requires a value".to_string())?;
+            }
+            "--oauth-write-scope" => {
+                oauth_write_scope = args.next()
+                    .ok_or_else(|| "--oauth-write-scope requires a value".to_string())?;
+            }
             "--help" | "-h" => {
                 println!(r#"falkordb-native-server
 
@@ -150,6 +203,12 @@ CHATGPT HTTPS API OPTIONS:
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
+  --oauth-resource URL             Public HTTPS MCP resource identifier
+  --oauth-issuer URL               OAuth/OIDC token issuer
+  --oauth-audience AUDIENCE        Required access-token audience
+  --oauth-jwks-url URL             Issuer JWKS URL for JWT validation
+  --oauth-read-scope SCOPE         Read scope (default graph:read)
+  --oauth-write-scope SCOPE        Write scope (default graph:write)
 
 The HTTPS API reuses --tls-cert/--tls-key for server TLS but does not require
 the RESP client certificate. This permits standard HTTPS Bearer-token clients,
@@ -180,6 +239,36 @@ including a ChatGPT custom integration.
         });
     }
 
+    let oauth = {
+        let supplied = [
+            oauth_resource.is_some(),
+            oauth_issuer.is_some(),
+            oauth_audience.is_some(),
+            oauth_jwks_url.is_some(),
+        ];
+        if supplied.iter().any(|v| *v) && !supplied.iter().all(|v| *v) {
+            return Err(
+                "OAuth requires --oauth-resource, --oauth-issuer, --oauth-audience, and --oauth-jwks-url together"
+                    .to_string(),
+            );
+        }
+
+        match (oauth_resource, oauth_issuer, oauth_audience, oauth_jwks_url) {
+            (Some(resource), Some(issuer), Some(audience), Some(jwks_url)) => {
+                Some(Arc::new(OAuthVerifier::new(OAuthConfig {
+                    resource,
+                    issuer,
+                    audience,
+                    jwks_url,
+                    read_scope: oauth_read_scope,
+                    write_scope: oauth_write_scope,
+                })?))
+            }
+            (None, None, None, None) => None,
+            _ => unreachable!("OAuth completeness checked above"),
+        }
+    };
+
     let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
 
     if let Some(bind) = api_bind {
@@ -187,6 +276,7 @@ including a ChatGPT custom integration.
             bind,
             read_write_token: api_token,
             read_only_token: api_read_token,
+            oauth,
             allow_unauthenticated_remote: api_allow_unauthenticated_remote,
             allow_plaintext_remote: api_allow_plaintext_remote,
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {

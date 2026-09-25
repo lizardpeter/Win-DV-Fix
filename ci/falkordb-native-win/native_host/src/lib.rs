@@ -188,6 +188,16 @@ impl NativeGraph {
                         format!("WAL recovery failed at sequence {}: {e}", record.sequence)
                     })?;
                 }
+
+                // EFFECT_CREATE_INDEX is replayed in WAL order. If an index was
+                // originally created after data already existed, replay creates
+                // the schema after those entity records. In the Redis host that
+                // population is asynchronous; during single-process recovery
+                // there is no published committed graph for that worker to scan.
+                // Once all effects are applied, the graph is fully constructed,
+                // so use FalkorDB's synchronous RDB-load population path before
+                // publishing the recovered MVCC version.
+                graph.populate_indexes_sync();
             }
 
             mvcc.commit(Arc::clone(&private));

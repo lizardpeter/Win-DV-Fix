@@ -1,0 +1,84 @@
+name: FalkorDB native Windows TLS CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - chatgpt/falkordb-network-tls
+    paths:
+      - 'ci/falkordb-native-win/**'
+      - '.github/workflows/falkordb-network-tls-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: falkordb-native-network-tls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tls:
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore native dependency cache
+        id: native-deps
+        uses: actions/cache@v4
+        with:
+          path: ci/falkordb-native-win/build/native-prefix
+          key: falkordb-native-deps-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/scripts/bootstrap_windows.ps1') }}
+
+      - name: Bootstrap source with cached native dependencies
+        if: steps.native-deps.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1' -SkipNativeDeps
+
+      - name: Bootstrap native dependencies
+        if: steps.native-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1'
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ci/falkordb-native-win/build/cargo-target
+          key: falkordb-native-tls-rust-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml') }}
+          restore-keys: |
+            falkordb-native-rust-${{ runner.os }}-
+
+      - name: Install official FalkorDB client and cert tooling
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade falkordb cryptography
+
+      - name: Run official-client TLS smoke
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\tls_network_smoke.ps1'
+
+      - name: Upload TLS diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falkordb-native-tls-diagnostics
+          path: ci/falkordb-native-win/build/logs
+          if-no-files-found: ignore

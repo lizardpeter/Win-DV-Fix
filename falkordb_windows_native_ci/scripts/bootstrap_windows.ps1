@@ -96,7 +96,8 @@ if (-not $SkipNativeDeps) {
     cmake -S $LA -B $LABuild @CMakeGeneratorArgs `
         -DCMAKE_BUILD_TYPE=Release `
         -DSUITESPARSE_USE_FORTRAN=OFF `
-        -DLAGRAPH_USE_OPENMP=ON `
+        -DLAGRAPH_USE_OPENMP=OFF `
+        -DSUITESPARSE_USE_OPENMP=OFF `
         -DBUILD_TESTING=OFF `
         -DBUILD_SHARED_LIBS=OFF `
         -DBUILD_STATIC_LIBS=ON `

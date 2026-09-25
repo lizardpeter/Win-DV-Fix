@@ -1,3 +1,4 @@
+pub mod property_index;
 pub mod wal;
 pub mod property_index;
 pub mod range_index;

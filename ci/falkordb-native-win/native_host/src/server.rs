@@ -16,7 +16,9 @@ use rustls::{
 use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
-use crate::{NativeGraph, OutputStats, QueryOutput, udf_store, wire::WireValue};
+use crate::{
+    NativeGraph, OutputStats, QueryOutput, native_config, udf_store, wire::WireValue,
+};
 
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -859,15 +861,73 @@ fn handle_graph_config(args: &[Vec<u8>]) -> Resp {
     if args.len() < 2 {
         return Resp::Error("ERR wrong number of arguments for 'graph.config' command".to_string());
     }
+
     match ascii_upper(&args[1]).as_str() {
         "GET" => {
             if args.len() != 3 {
                 return Resp::Error("ERR wrong number of arguments for 'graph.config get'".to_string());
             }
-            Resp::Array(vec![Resp::Bulk(args[2].clone()), Resp::Int(0)])
+            let name = match utf8(&args[2], "configuration name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+
+            if name == "*" {
+                return Resp::Array(
+                    native_config::CONFIG_NAMES
+                        .iter()
+                        .map(|name| {
+                            Resp::Array(vec![
+                                bulk(*name),
+                                config_value_resp(
+                                    native_config::get(name)
+                                        .expect("known native config must resolve"),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                );
+            }
+
+            match native_config::get(name) {
+                Ok(value) => Resp::Array(vec![bulk(name.to_ascii_uppercase()), config_value_resp(value)]),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
         }
-        "SET" => Resp::Simple("OK".to_string()),
-        _ => Resp::Error("ERR GRAPH.CONFIG expects GET or SET".to_string()),
+        "SET" => {
+            if args.len() < 4 {
+                return Resp::Error("ERR Missing configuration parameter name or value".to_string());
+            }
+            if (args.len() - 2) % 2 != 0 {
+                return Resp::Error("ERR Missing value for configuration parameter".to_string());
+            }
+
+            let mut pairs = Vec::with_capacity((args.len() - 2) / 2);
+            for chunk in args[2..].chunks_exact(2) {
+                let name = match utf8(&chunk[0], "configuration name") {
+                    Ok(v) => v.to_string(),
+                    Err(err) => return Resp::Error(err),
+                };
+                let value = match utf8(&chunk[1], "configuration value") {
+                    Ok(v) => v.to_string(),
+                    Err(err) => return Resp::Error(err),
+                };
+                pairs.push((name, value));
+            }
+
+            match native_config::set_many(&pairs) {
+                Ok(()) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
+        _ => Resp::Error("ERR Unknown subcommand for GRAPH.CONFIG".to_string()),
+    }
+}
+
+fn config_value_resp(value: native_config::ConfigValue) -> Resp {
+    match value {
+        native_config::ConfigValue::Int(value) => Resp::Int(value),
+        native_config::ConfigValue::Text(value) => bulk(value),
     }
 }
 
@@ -965,12 +1025,76 @@ fn handle_graph_query(args: &[Vec<u8>], catalog: &GraphCatalog, read_only: bool)
         Err(err) => return Resp::Error(err),
     };
 
+    let mut timeout: Option<i64> = None;
+    let mut version: Option<u64> = None;
+    let mut i = 3usize;
+    while i < args.len() {
+        let option = ascii_upper(&args[i]);
+        match option.as_str() {
+            "--COMPACT" | "--TRACK-MEMORY" => {
+                i += 1;
+            }
+            "TIMEOUT" => {
+                if i + 1 >= args.len() {
+                    return Resp::Error("ERR missing TIMEOUT value".to_string());
+                }
+                timeout = match utf8(&args[i + 1], "timeout").and_then(|v| {
+                    v.parse::<i64>()
+                        .map_err(|_| "ERR invalid TIMEOUT value".to_string())
+                }) {
+                    Ok(v) => Some(v),
+                    Err(err) => return Resp::Error(err),
+                };
+                i += 2;
+            }
+            "VERSION" => {
+                if i + 1 >= args.len() {
+                    return Resp::Error("ERR missing VERSION value".to_string());
+                }
+                version = match utf8(&args[i + 1], "version").and_then(|v| {
+                    v.parse::<u64>()
+                        .map_err(|_| "ERR invalid VERSION value".to_string())
+                }) {
+                    Ok(v) => Some(v),
+                    Err(err) => return Resp::Error(err),
+                };
+                i += 2;
+            }
+            _ => {
+                // Upstream ignores unknown trailing query flags rather than
+                // rejecting an otherwise valid query.
+                i += 1;
+            }
+        }
+    }
+
+    let existing = catalog.get(name);
+    if let (Some(graph), Some(expected)) = (&existing, version) {
+        let current = graph.schema_version();
+        if current != expected {
+            return Resp::Array(vec![
+                Resp::Error("ERR invalid graph version".to_string()),
+                Resp::Int(current as i64),
+            ]);
+        }
+    }
+
     let graph = if read_only {
-        match catalog.get(name) {
+        match existing {
             Some(graph) => graph,
             None => return Resp::Error("ERR Invalid graph operation on empty key".to_string()),
         }
+    } else if let Some(graph) = existing {
+        graph
     } else {
+        if let Some(expected) = version
+            && expected != 0
+        {
+            return Resp::Array(vec![
+                Resp::Error("ERR invalid graph version".to_string()),
+                Resp::Int(0),
+            ]);
+        }
         match catalog.get_or_create(name) {
             Ok(graph) => graph,
             Err(err) => return Resp::Error(format!("ERR {err}")),
@@ -978,9 +1102,9 @@ fn handle_graph_query(args: &[Vec<u8>], catalog: &GraphCatalog, read_only: bool)
     };
 
     let result = if read_only {
-        graph.query_read_only(query)
+        graph.query_read_only_with_timeout(query, timeout)
     } else {
-        graph.query(query)
+        graph.query_with_timeout(query, timeout)
     };
 
     match result {

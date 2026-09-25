@@ -661,13 +661,16 @@ impl Index {
                             .is_some_and(|p| !p.is_empty());
                         let tokens = tokenize(text);
                         for token in tokens {
-                            let matched = if phonetic {
-                                soundex(&token) == soundex(term)
-                            } else if nostem {
-                                token == *term
-                            } else {
-                                stem(&token) == stem(term)
-                            };
+                            let prefix = term.strip_suffix('*');
+                        let matched = if let Some(prefix) = prefix {
+                            token.starts_with(prefix)
+                        } else if phonetic {
+                            soundex(&token) == soundex(term)
+                        } else if nostem {
+                            token == *term
+                        } else {
+                            stem(&token) == stem(term)
+                        };
                             if matched {
                                 term_score += weight;
                             }
@@ -785,8 +788,10 @@ impl Index {
     pub fn index_count(&self) -> usize { self.fields.values().map(Vec::len).sum() }
 
     pub fn recreate_index(&mut self, _label: &Arc<String>) -> Result<(), String> {
-        *self.store.write() = NativeStore::default();
-        self.ready=true;
+        // Publish a fresh backing store for the new generation. Older Index
+        // generations keep their Arc and therefore retain a stable read snapshot.
+        self.store = Arc::new(RwLock::new(NativeStore::default()));
+        self.ready = true;
         self.bump_id();
         Ok(())
     }
@@ -879,10 +884,26 @@ fn query_groups(query: &str, stopwords: Option<&Vec<Arc<String>>>) -> Vec<Vec<St
     let stop: HashSet<String> = stopwords
         .map(|v| v.iter().map(|s| s.to_lowercase()).collect())
         .unwrap_or_default();
+
     query
         .split('|')
-        .map(tokenize)
-        .map(|terms| terms.into_iter().filter(|t| !stop.contains(t)).collect::<Vec<_>>())
+        .map(|group| {
+            group
+                .split_whitespace()
+                .filter_map(|raw| {
+                    let prefix = raw.ends_with('*');
+                    let raw = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '*');
+                    let base = raw.trim_end_matches('*').to_lowercase();
+                    if base.is_empty() || stop.contains(&base) {
+                        None
+                    } else if prefix {
+                        Some(format!("{base}*"))
+                    } else {
+                        Some(base)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
         .filter(|terms| !terms.is_empty())
         .collect()
 }

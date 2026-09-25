@@ -95,6 +95,17 @@ def phase_write():
         "(a)-[:KNOWS {since:2026}]->(b)"
     )
 
+    memory = db.execute_command("GRAPH.MEMORY", "USAGE", GRAPH)
+    assert len(memory) == 18, memory
+    memory_map = dict(zip(memory[0::2], memory[1::2]))
+    assert "total_graph_sz_mb" in memory_map, memory_map
+    assert "indices_sz_mb" in memory_map, memory_map
+
+    object_pool = db.execute_command("GRAPH.INFO", "ObjectPool")
+    assert object_pool[0] == "Object Pool", object_pool
+    assert len(object_pool[1]) == 2, object_pool
+    assert db.execute_command("GRAPH.INFO", "not-a-section") == "no section found"
+
     # Explain/profile are parsed into the official client's ExecutionPlan type.
     explain = graph.explain("MATCH (n:Person) RETURN n.name")
     assert explain.plan and len(explain.plan) > 0, explain.plan
@@ -110,6 +121,13 @@ def phase_write():
 
     # Constraint creation/enforcement through official high-level helpers.
     assert graph.create_node_unique_constraint("Person", "name") == "OK"
+    memory = db.execute_command("GRAPH.MEMORY", "USAGE", GRAPH, "SAMPLES", 10)
+    assert len(memory) == 18, memory
+    info = db.execute_command("GRAPH.INFO")
+    assert "# Running queries" in info, info
+    assert "# Waiting queries" in info, info
+    assert "Object Pool" in info, info
+
     constraints = graph.list_constraints()
     assert any(
         c["type"] == "UNIQUE"

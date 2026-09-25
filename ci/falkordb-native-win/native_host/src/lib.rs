@@ -4,6 +4,7 @@ pub mod api;
 pub mod property_index;
 pub mod range_index;
 pub mod server;
+pub mod snapshot;
 pub mod slowlog;
 pub mod wal;
 pub mod wire;
@@ -175,17 +176,32 @@ impl NativeGraph {
         name: &str,
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, String> {
-        let (wal, records) = Wal::open(wal_path)?;
-        let mut mvcc = MvccGraph::new(16_384, 16_384, 25, name);
+        let wal_path = wal_path.as_ref().to_path_buf();
+        let loaded_snapshot = snapshot::load_latest(&wal_path, name)?;
+        let snapshot_sequence = loaded_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.sequence);
 
-        if !records.is_empty() {
+        let (wal, records) = Wal::open_after(&wal_path, snapshot_sequence)?;
+        let mut mvcc = if let Some(snapshot) = loaded_snapshot {
+            MvccGraph::from_graph(snapshot.graph)
+        } else {
+            MvccGraph::new(16_384, 16_384, 25, name)
+        };
+
+        let replay: Vec<_> = records
+            .iter()
+            .filter(|record| record.sequence > snapshot_sequence)
+            .collect();
+
+        if !replay.is_empty() {
             let private = mvcc
                 .write()
                 .ok_or_else(|| "native host: failed to claim MVCC writer during recovery".to_string())?;
 
             {
                 let mut graph = private.borrow_mut();
-                for record in &records {
+                for record in replay {
                     if record.key.as_slice() != name.as_bytes() {
                         return Err(format!(
                             "WAL sequence {} belongs to graph {:?}, expected {:?}",
@@ -198,20 +214,16 @@ impl NativeGraph {
                         format!("WAL recovery failed at sequence {}: {e}", record.sequence)
                     })?;
                 }
-
-                // CREATE INDEX effects intentionally use FalkorDB's normal
-                // generation-safe asynchronous population path. Do not call
-                // populate_indexes_sync() here: the replay-created worker already
-                // owns the population ticket, and acquiring another pre-commit
-                // ticket makes that worker correctly treat the generation as
-                // conflicting and stop.
             }
 
-            // Publication installs the recovered graph Arc into the indexers,
-            // which is the point at which replay-created population workers can
-            // safely scan the fully reconstructed graph.
             mvcc.commit(Arc::clone(&private));
             wait_for_recovered_indexes(&mvcc, Duration::from_secs(60))?;
+        } else if snapshot_sequence > 0 {
+            // MvccGraph::from_graph does not perform a commit, so publish the
+            // restored graph Arc into its indexers explicitly for subsequent
+            // background index work.
+            let committed = mvcc.read();
+            committed.borrow().set_indexer_graph(Arc::clone(&committed));
         }
 
         Ok(Self {
@@ -224,6 +236,35 @@ impl NativeGraph {
             slow_log: SlowLog::new(),
         })
     }
+
+    /// Create a durable full-graph checkpoint and compact all WAL history that
+    /// the checkpoint contains. The graph stays query-consistent throughout:
+    /// active readers may finish on their Arc snapshot while new writes wait.
+    pub fn checkpoint(&self) -> Result<std::path::PathBuf, String> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| "native host: checkpoint requires a persistent graph".to_string())?;
+
+        let host_guard = self.inner.write();
+        let committed = host_guard.read();
+        let sequence = wal.last_sequence();
+
+        let path = {
+            let graph = committed.borrow();
+            snapshot::write_checkpoint(wal.path(), &self.name, sequence, &graph)?
+        };
+
+        // The checkpoint is durable before any WAL bytes are discarded. A
+        // crash before this line leaves the old full WAL; a crash after it can
+        // recover from the checkpoint plus any subsequent absolute-sequence
+        // frames.
+        wal.reset_after(sequence)?;
+        snapshot::cleanup_old_checkpoints(wal.path(), 2)?;
+
+        Ok(path)
+    }
+
 
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
         let wall = Instant::now();

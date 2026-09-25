@@ -11,8 +11,13 @@ pub mod wire;
 use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc, time::{Duration, Instant}};
 
 use graph::{
-    effects::EffectsPayload,
+    effects::{
+        EffectsBuffer, EffectsPayload,
+        announce::{AnnouncedConstraint, SchemaBaseline},
+    },
+    entity_type::EntityType,
     graph::{
+        constraint::{ConstraintStatus, ConstraintType},
         graph::{Plan, NODE_CREATION_BUFFER},
         graphblas::matrix,
         mvcc_graph::MvccGraph,
@@ -318,6 +323,108 @@ impl NativeGraph {
         drop(target);
 
         Self::open_persistent(destination_name, destination_wal)
+    }
+
+
+    pub fn mutate_constraint(
+        &self,
+        create: bool,
+        constraint_type: ConstraintType,
+        entity_type: EntityType,
+        label: &str,
+        properties: &[String],
+    ) -> Result<(), String> {
+        if properties.is_empty() {
+            return Err("constraint must include at least one property".to_string());
+        }
+
+        let mut host_guard = self.inner.write();
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+
+        let label_arc = Arc::new(label.to_string());
+        let property_arcs: Vec<Arc<String>> = properties
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .collect();
+
+        let mut graph = private.borrow_mut();
+        let baseline = SchemaBaseline::of(&graph);
+
+        let status = if create {
+            graph.create_constraint(
+                constraint_type,
+                entity_type,
+                &label_arc,
+                &property_arcs,
+            )?;
+
+            // The Redis host settles large constraints asynchronously. The
+            // standalone host validates them before publishing so a successful
+            // command never leaves an unenforced constraint stranded.
+            graph.validate_pending_constraints();
+
+            match entity_type {
+                EntityType::Node => {
+                    graph.get_label_id_mut(&label_arc);
+                }
+                EntityType::Relationship => {
+                    graph.get_type_id_mut(&label_arc);
+                }
+            }
+            for property in &property_arcs {
+                graph.add_node_attribute_name(property);
+            }
+
+            graph
+                .constraints()
+                .iter()
+                .find(|constraint| {
+                    constraint.matches(
+                        &constraint_type,
+                        &entity_type,
+                        label,
+                        &property_arcs,
+                    )
+                })
+                .map(|constraint| constraint.status)
+                .ok_or_else(|| "constraint creation did not produce a constraint".to_string())?
+        } else {
+            graph.drop_constraint(
+                &constraint_type,
+                &entity_type,
+                label,
+                &property_arcs,
+            )?;
+            ConstraintStatus::Operational
+        };
+
+        let mut effects = EffectsBuffer::new();
+        effects.build_constraint(
+            &graph,
+            create,
+            &AnnouncedConstraint {
+                ct: constraint_type,
+                entity_type,
+                status: create.then_some(status),
+                label,
+                properties: &property_arcs,
+            },
+            &baseline,
+        )?;
+        drop(graph);
+
+        if let Some(wal) = &self.wal {
+            if let Err(err) = wal.append_effects(effects, self.name.as_bytes()) {
+                host_guard.rollback();
+                return Err(err);
+            }
+        }
+
+        host_guard.commit(Arc::clone(&private));
+        Ok(())
     }
 
 

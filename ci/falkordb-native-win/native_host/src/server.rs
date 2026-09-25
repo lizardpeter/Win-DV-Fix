@@ -427,6 +427,8 @@ fn dispatch(
         "GRAPH.LIST" => Resp::Array(catalog.list().into_iter().map(bulk).collect()),
         "GRAPH.QUERY" => handle_graph_query(&args, catalog, false),
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
+        "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
+        "GRAPH.PROFILE" => handle_graph_profile(&args, catalog),
         "GRAPH.DELETE" => {
             if let Err(err) = require_arity(&args, 2) {
                 return Resp::Error(err);
@@ -474,7 +476,7 @@ fn dispatch(
                 Resp::Simple("none".to_string())
             }
         }
-        "GRAPH.SLOWLOG" => Resp::Array(Vec::new()),
+        "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
     }
@@ -600,6 +602,87 @@ fn handle_graph_config(args: &[Vec<u8>]) -> Resp {
         "SET" => Resp::Simple("OK".to_string()),
         _ => Resp::Error("ERR GRAPH.CONFIG expects GET or SET".to_string()),
     }
+}
+
+
+fn handle_graph_explain(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 3 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.explain' command".to_string());
+    }
+    let name = match utf8(&args[1], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let query = match utf8(&args[2], "query") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let Some(graph) = catalog.get(name) else {
+        return Resp::Error("ERR Invalid graph operation on empty key".to_string());
+    };
+    match graph.explain(query) {
+        Ok(lines) => Resp::Array(lines.into_iter().map(bulk).collect()),
+        Err(err) => Resp::Error(format!("ERR {err}")),
+    }
+}
+
+fn handle_graph_profile(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 3 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.profile' command".to_string());
+    }
+    let name = match utf8(&args[1], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let query = match utf8(&args[2], "query") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let graph = match catalog.get_or_create(name) {
+        Ok(graph) => graph,
+        Err(err) => return Resp::Error(format!("ERR {err}")),
+    };
+    match graph.profile(query) {
+        Ok(lines) => Resp::Array(lines.into_iter().map(bulk).collect()),
+        Err(err) => Resp::Error(format!("ERR {err}")),
+    }
+}
+
+fn handle_graph_slowlog(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if !(args.len() == 2 || args.len() == 3) {
+        return Resp::Error("ERR wrong number of arguments for 'graph.slowlog' command".to_string());
+    }
+    let name = match utf8(&args[1], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let Some(graph) = catalog.get(name) else {
+        return Resp::Error("ERR Invalid graph operation on empty key".to_string());
+    };
+
+    if args.len() == 3 {
+        if ascii_upper(&args[2]) != "RESET" {
+            return Resp::Error("ERR Unknown subcommand".to_string());
+        }
+        graph.slowlog_reset();
+        return Resp::Simple("OK".to_string());
+    }
+
+    Resp::Array(
+        graph
+            .slowlog_entries()
+            .into_iter()
+            .map(|entry| {
+                Resp::Array(vec![
+                    bulk(format!("{:.0}", entry.timestamp)),
+                    bulk(entry.command),
+                    bulk(entry.query),
+                    bulk(format!("{:.5}", entry.latency_ms)),
+                    entry.params.map_or(Resp::Null, bulk),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn handle_graph_query(args: &[Vec<u8>], catalog: &GraphCatalog, read_only: bool) -> Resp {

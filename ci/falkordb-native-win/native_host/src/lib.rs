@@ -24,7 +24,7 @@ use graph::{
         runtime::{QueryStatistics, ResultSummary, Runtime},
     },
 };
-use orx_tree::Collection;
+use orx_tree::{Collection, Dfs, NodeRef};
 use parking_lot::RwLock;
 use slowlog::{SlowLog, SlowLogEntry};
 use wal::Wal;
@@ -286,6 +286,154 @@ impl NativeGraph {
         &self.name
     }
 
+    pub fn explain(&self, cypher: &str) -> Result<Vec<String>, String> {
+        let host_guard = self.inner.read();
+        let snapshot = host_guard.read();
+        let plan = {
+            let graph_ref = snapshot.borrow();
+            graph_ref.get_plan(cypher)?.plan
+        };
+
+        Ok(plan
+            .root()
+            .indices::<Dfs>()
+            .map(|idx| {
+                let node = plan.node(idx);
+                format!("{}{}", " ".repeat(node.depth() * 4), node.data())
+            })
+            .collect())
+    }
+
+    pub fn profile(&self, cypher: &str) -> Result<Vec<String>, String> {
+        let wall = Instant::now();
+        let (snapshot, first_plan) = {
+            let host_guard = self.inner.read();
+            let snapshot = host_guard.read();
+            let plan = {
+                let graph_ref = snapshot.borrow();
+                graph_ref.get_plan(cypher)?
+            };
+            (snapshot, plan)
+        };
+
+        let result = if plan_is_write(&first_plan) {
+            drop(snapshot);
+            self.execute_write_profile(cypher)
+        } else {
+            self.execute_read_profile(snapshot, first_plan)
+        };
+
+        if result.is_ok() {
+            self.slow_log
+                .add("GRAPH.PROFILE", cypher, wall.elapsed().as_secs_f64() * 1000.0);
+        }
+        result
+    }
+
+    fn execute_read_profile(
+        &self,
+        snapshot: Arc<atomic_refcell::AtomicRefCell<graph::graph::graph::Graph>>,
+        Plan {
+            plan,
+            parameters,
+            ..
+        }: Plan,
+    ) -> Result<Vec<String>, String> {
+        let lock = ReadOnlyEscalation;
+        let runtime = Runtime::new(
+            snapshot,
+            parameters,
+            false,
+            plan,
+            false,
+            self.import_folder.clone(),
+            self.result_set_size,
+            true,
+            self.timeout_ms,
+            0,
+            None,
+            &lock,
+        );
+        let _ = runtime.query()?;
+        Ok(format_profile(&runtime))
+    }
+
+    fn execute_write_profile(&self, cypher: &str) -> Result<Vec<String>, String> {
+        let mut host_guard = self.inner.write();
+
+        let Plan {
+            plan,
+            parameters,
+            ..
+        } = {
+            let committed = host_guard.read();
+            let graph_ref = committed.borrow();
+            graph_ref.get_plan(cypher)?
+        };
+
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+
+        let escalation = PrelockedWriteEscalation::default();
+        let runtime = Runtime::new(
+            Arc::clone(&private),
+            parameters,
+            true,
+            plan,
+            false,
+            self.import_folder.clone(),
+            self.result_set_size,
+            true,
+            self.timeout_ms,
+            0,
+            None,
+            &escalation,
+        );
+        runtime.build_effects.set(self.wal.is_some());
+
+        let result = match runtime.query() {
+            Ok(result) => result,
+            Err(err) => {
+                if escalation.crossed() {
+                    let committed = host_guard.read();
+                    runtime.resync_published_indexes(&committed);
+                }
+                host_guard.rollback();
+                return Err(err);
+            }
+        };
+
+        let modified = query_modified(&runtime, &result.stats);
+        let lines = format_profile(&runtime);
+        drop(result);
+
+        if escalation.crossed() {
+            if modified
+                && let Some(wal) = &self.wal
+            {
+                let effects = runtime
+                    .effects_buffer
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| "native host: modified profile produced no effects buffer".to_string())?;
+
+                if let Err(err) = wal.append_effects(effects, self.name.as_bytes()) {
+                    let committed = host_guard.read();
+                    runtime.resync_published_indexes(&committed);
+                    drop(committed);
+                    host_guard.rollback();
+                    return Err(err);
+                }
+            }
+            host_guard.commit(Arc::clone(&private));
+        } else {
+            host_guard.rollback();
+        }
+
+        Ok(lines)
+    }
+
     fn execute_read(
         &self,
         snapshot: Arc<atomic_refcell::AtomicRefCell<graph::graph::graph::Graph>>,
@@ -403,6 +551,40 @@ impl NativeGraph {
 
         Ok(output)
     }
+}
+
+
+fn format_profile(runtime: &Runtime<'_>) -> Vec<String> {
+    let plan = &runtime.plan;
+    let all_ops: Vec<_> = plan.root().indices::<Dfs>().collect();
+    let profile_data = runtime.profile_data.borrow();
+
+    all_ops
+        .into_iter()
+        .filter(|idx| !matches!(plan.node(*idx).data(), IR::Commit))
+        .map(|idx| {
+            let node = plan.node(idx);
+            let mut depth = node.depth();
+            let mut cur = idx;
+            while let Some(parent) = plan.node(cur).parent() {
+                if matches!(parent.data(), IR::Commit) {
+                    depth = depth.saturating_sub(1);
+                }
+                cur = parent.idx();
+            }
+
+            let (records, time) = profile_data
+                .get(&idx)
+                .copied()
+                .unwrap_or((0, Duration::ZERO));
+            format!(
+                "{}{} | Records produced: {records}, Execution time: {:.6} ms",
+                "    ".repeat(depth),
+                node.data(),
+                time.as_secs_f64() * 1000.0
+            )
+        })
+        .collect()
 }
 
 fn wait_for_recovered_indexes(

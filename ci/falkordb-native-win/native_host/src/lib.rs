@@ -1,9 +1,8 @@
-pub mod property_index;
-pub mod wal;
+//! Native non-Redis host for FalkorDB's `graph` crate.
+
 pub mod property_index;
 pub mod range_index;
-
-//! Native non-Redis host for FalkorDB's `graph` crate.
+pub mod wal;
 
 use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc};
 

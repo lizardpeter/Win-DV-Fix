@@ -1,4 +1,4 @@
-name: Webkinz origin verify
+name: Webkinz exhaustive resource verify
 
 on:
   push:
@@ -12,74 +12,214 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Compare play, www, and assets origins
+      - name: Verify every TransList resource
         shell: bash
         run: |
-          set +e
-          mkdir -p out/files out/meta
-          fetch() {
-            name="$1"; url="$2"
-            echo "$url" > "out/meta/$name.url"
-            curl -L --retry 2 --retry-all-errors --connect-timeout 20 --max-time 120 \
-              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
-              -D "out/meta/$name.headers" -o "out/files/$name" "$url" \
-              >"out/meta/$name.stdout" 2>"out/meta/$name.stderr"
-            echo "$?" > "out/meta/$name.exit"
-            if [ -f "out/files/$name" ]; then
-              wc -c "out/files/$name" > "out/meta/$name.size"
-              sha256sum "out/files/$name" > "out/meta/$name.sha256" 2>&1 || true
-              file "out/files/$name" > "out/meta/$name.file" 2>&1 || true
-            fi
-            return 0
-          }
-
-          V='v390_249'
-          fetch play_webkinz "https://play.webkinz.com/Webkinz.swf?v=$V"
-          fetch www_webkinz "https://www.webkinz.com/Webkinz.swf?v=$V"
-          fetch play_main2 "https://play.webkinz.com/SWF/main2.swf?v=$V"
-          fetch www_main2 "https://www.webkinz.com/SWF/main2.swf?v=$V"
-          fetch play_arcade "https://play.webkinz.com/SWF/ARCADE/arcade.swf?v=$V"
-          fetch www_arcade "https://www.webkinz.com/SWF/ARCADE/arcade.swf?v=$V"
-          fetch play_tips "https://play.webkinz.com/SWF/staticdata/tips.swf?v=$V"
-          fetch www_tips "https://www.webkinz.com/SWF/staticdata/tips.swf?v=$V"
-          fetch play_webkinz_xml "https://play.webkinz.com/SWF/server/webkinzXML.swf?v=$V"
-          fetch www_webkinz_xml "https://www.webkinz.com/SWF/server/webkinzXML.swf?v=$V"
-          fetch play_translist "https://play.webkinz.com/XML/L10N/TransList.xml?v=$V"
-          fetch www_translist "https://www.webkinz.com/XML/L10N/TransList.xml?v=$V"
-          fetch play_l10n_main2 "https://play.webkinz.com/XML/L10N/US_EN/main2.xml"
-          fetch www_l10n_main2 "https://www.webkinz.com/XML/L10N/US_EN/main2.xml"
-          fetch play_petclasses "https://play.webkinz.com/swf/pet/petclasses.swf?v=$V"
-          fetch assets_petclasses "https://assets.webkinz.com/swf/pet/petclasses.swf?v=$V"
+          set -e
+          mkdir -p out
+          curl -L --fail --retry 3 --connect-timeout 20 --max-time 120 \
+            -A 'Mozilla/5.0' \
+            'https://play.webkinz.com/XML/L10N/TransList.xml?v=v390_249' \
+            -o out/TransList.xml
 
           python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
-          import hashlib,json,re
-          rows=[]
-          for p in sorted(Path("out/files").glob("*")):
-              b=p.read_bytes()
-              h=(Path("out/meta")/f"{p.name}.headers").read_text(errors="ignore")
-              statuses=[x for x in h.splitlines() if x.startswith("HTTP/")]
-              rows.append({
-                "name":p.name,
-                "url":(Path("out/meta")/f"{p.name}.url").read_text().strip(),
-                "size":len(b),
-                "sha256":hashlib.sha256(b).hexdigest(),
-                "http":statuses,
-                "magic":b[:12].hex(),
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          import csv, json, xml.etree.ElementTree as ET, hashlib, time
+
+          VERSION = "v390_249"
+          ROOT = "https://play.webkinz.com"
+
+          xml_path = Path("out/TransList.xml")
+          tree = ET.parse(xml_path)
+          root = tree.getroot()
+
+          pairs = []
+          for elem in root.iter():
+              n = elem.attrib.get("n")
+              tf = elem.attrib.get("tf")
+              if n or tf:
+                  pairs.append({"n": n, "tf": tf})
+
+          resources = sorted({p["n"].lstrip("/") for p in pairs if p.get("n")})
+          translations = sorted({p["tf"].lstrip("/") for p in pairs if p.get("tf")})
+
+          targets = []
+          for rel in resources:
+              enc = quote(rel, safe="/._-~")
+              targets.append({
+                  "kind":"resource",
+                  "relative":rel,
+                  "url":f"{ROOT}/SWF/{enc}?v={VERSION}"
               })
-          Path("out/origin_report.json").write_text(json.dumps(rows,indent=2))
-          with Path("out/origin_report.tsv").open("w") as f:
-              f.write("name\tsize\tsha256\thttp\turl\n")
-              for r in rows:
-                  f.write(f"{r['name']}\t{r['size']}\t{r['sha256']}\t{' | '.join(r['http'])}\t{r['url']}\n")
+          for rel in translations:
+              enc = quote(rel, safe="/._-~")
+              targets.append({
+                  "kind":"translation",
+                  "relative":rel,
+                  "url":f"{ROOT}/XML/L10N/US_EN/{enc}"
+              })
+
+          def probe(t):
+              headers = {
+                  "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                  "Accept":"*/*",
+              }
+              started = time.time()
+              req = Request(t["url"], headers=headers, method="HEAD")
+              try:
+                  with urlopen(req, timeout=20) as r:
+                      status = getattr(r, "status", r.getcode())
+                      return {
+                          **t,
+                          "status":int(status),
+                          "content_type":r.headers.get("Content-Type",""),
+                          "content_length":r.headers.get("Content-Length",""),
+                          "etag":r.headers.get("ETag",""),
+                          "last_modified":r.headers.get("Last-Modified",""),
+                          "effective_url":r.geturl(),
+                          "elapsed_ms":round((time.time()-started)*1000),
+                          "error":"",
+                      }
+              except HTTPError as e:
+                  return {
+                      **t,
+                      "status":int(e.code),
+                      "content_type":e.headers.get("Content-Type","") if e.headers else "",
+                      "content_length":e.headers.get("Content-Length","") if e.headers else "",
+                      "etag":e.headers.get("ETag","") if e.headers else "",
+                      "last_modified":e.headers.get("Last-Modified","") if e.headers else "",
+                      "effective_url":e.geturl() if hasattr(e,"geturl") else t["url"],
+                      "elapsed_ms":round((time.time()-started)*1000),
+                      "error":str(e),
+                  }
+              except Exception as e:
+                  return {
+                      **t,
+                      "status":0,
+                      "content_type":"",
+                      "content_length":"",
+                      "etag":"",
+                      "last_modified":"",
+                      "effective_url":t["url"],
+                      "elapsed_ms":round((time.time()-started)*1000),
+                      "error":repr(e),
+                  }
+
+          results = []
+          with ThreadPoolExecutor(max_workers=32) as ex:
+              futures = [ex.submit(probe,t) for t in targets]
+              for i,fut in enumerate(as_completed(futures),1):
+                  results.append(fut.result())
+                  if i % 100 == 0:
+                      print("completed", i, "of", len(futures), flush=True)
+
+          results.sort(key=lambda x:(x["kind"], x["relative"].lower()))
+
+          retry_indices = [i for i,r in enumerate(results) if r["status"] == 0]
+          for i in retry_indices:
+              t = results[i]
+              req = Request(t["url"], headers={
+                  "User-Agent":"Mozilla/5.0",
+                  "Range":"bytes=0-31",
+                  "Accept":"*/*",
+              }, method="GET")
+              started=time.time()
+              try:
+                  with urlopen(req,timeout=20) as r:
+                      body=r.read(32)
+                      results[i].update({
+                          "status":int(getattr(r,"status",r.getcode())),
+                          "content_type":r.headers.get("Content-Type",""),
+                          "content_length":r.headers.get("Content-Length",""),
+                          "etag":r.headers.get("ETag",""),
+                          "last_modified":r.headers.get("Last-Modified",""),
+                          "effective_url":r.geturl(),
+                          "elapsed_ms":round((time.time()-started)*1000),
+                          "error":"",
+                          "prefix_hex":body.hex(),
+                      })
+              except HTTPError as e:
+                  results[i]["status"]=int(e.code)
+                  results[i]["error"]=str(e)
+              except Exception as e:
+                  results[i]["error"]=repr(e)
+
+          counts = {}
+          kind_counts = {}
+          for r in results:
+              counts[str(r["status"])] = counts.get(str(r["status"]),0)+1
+              kc = kind_counts.setdefault(r["kind"],{})
+              kc[str(r["status"])] = kc.get(str(r["status"]),0)+1
+
+          active = [r for r in results if 200 <= r["status"] < 400]
+          inactive = [r for r in results if not (200 <= r["status"] < 400)]
+
+          summary = {
+              "version":VERSION,
+              "translist_sha256":hashlib.sha256(xml_path.read_bytes()).hexdigest(),
+              "pairs":len(pairs),
+              "unique_resources":len(resources),
+              "unique_translations":len(translations),
+              "total_targets":len(results),
+              "status_counts":counts,
+              "status_counts_by_kind":kind_counts,
+              "active_count":len(active),
+              "inactive_count":len(inactive),
+          }
+
+          Path("out/verify_summary.json").write_text(json.dumps(summary,indent=2))
+          Path("out/verify_results.json").write_text(json.dumps(results,indent=2))
+          Path("out/active_results.json").write_text(json.dumps(active,indent=2))
+          Path("out/inactive_results.json").write_text(json.dumps(inactive,indent=2))
+
+          fields = ["kind","relative","status","content_type","content_length","etag","last_modified","elapsed_ms","url","effective_url","error"]
+          for fn, rows in [
+              ("verify_results.csv", results),
+              ("active_results.csv", active),
+              ("inactive_results.csv", inactive),
+          ]:
+              with open("out/"+fn,"w",newline="",encoding="utf-8") as fh:
+                  w=csv.DictWriter(fh,fieldnames=fields,extrasaction="ignore")
+                  w.writeheader()
+                  w.writerows(rows)
+
+          Path("out/active_urls.txt").write_text("\n".join(r["url"] for r in active)+"\n")
+          Path("out/inactive_urls.txt").write_text("\n".join(r["url"] for r in inactive)+"\n")
+
+          md = [
+              "# Webkinz live TransList verification",
+              "",
+              f"- Client version: {VERSION}",
+              f"- Unique resource entries: {len(resources)}",
+              f"- Unique translation entries: {len(translations)}",
+              f"- Total targets checked: {len(results)}",
+              f"- Active (2xx/3xx): {len(active)}",
+              f"- Inactive/error: {len(inactive)}",
+              "",
+              "## Status counts",
+              "",
+              json.dumps(kind_counts,indent=2),
+              "",
+              "## Active resources",
+              "",
+          ]
+          for r in active:
+              md.append(f"- [{r['status']}] {r['kind']}: {r['relative']} ({r['content_length'] or '?'} bytes)")
+          Path("out/SUMMARY.md").write_text("\n".join(md),encoding="utf-8")
+          print(json.dumps(summary,indent=2))
           PY
 
-      - name: Upload
+      - name: Upload exhaustive verification
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webkinz-origin-verify
+          name: webkinz-translist-verify
           path: out/
+          if-no-files-found: error
           retention-days: 7

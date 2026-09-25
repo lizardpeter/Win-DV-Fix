@@ -2,6 +2,7 @@ import argparse
 import os
 import pathlib
 import sys
+import struct
 
 from falkordb import FalkorDB
 from falkordb.node import Node
@@ -12,6 +13,7 @@ HOST = "localhost"
 PORT = 6391
 PASSWORD = "native-ci-secret"
 GRAPH = "network-official-client"
+BULK_GRAPH = "network-bulk"
 
 TLS_DIR = pathlib.Path(
     os.environ.get("FALKORDB_TEST_TLS_DIR", "")
@@ -182,6 +184,53 @@ def phase_write():
     except ResponseError:
         pass
 
+    # Upstream-compatible binary GRAPH.BULK transport.
+    node_token = (
+        b"BulkN\x00"
+        + struct.pack("=I", 1)
+        + b"v\x00"
+        + struct.pack("=Bq", 4, 11)
+        + struct.pack("=Bq", 4, 22)
+    )
+    edge_token = (
+        b"BulkR\x00"
+        + struct.pack("=I", 1)
+        + b"w\x00"
+        + struct.pack("=QQ", 0, 1)
+        + struct.pack("=Bq", 4, 99)
+    )
+    bulk_reply = db.execute_command(
+        "GRAPH.BULK", BULK_GRAPH, "BEGIN", 2, 1, 1, 1, node_token, edge_token
+    )
+    assert "2 nodes created" in bulk_reply, bulk_reply
+    assert "1 relations created" in bulk_reply, bulk_reply
+
+    bulk_graph = db.select_graph(BULK_GRAPH)
+    bulk_rows = bulk_graph.query(
+        "MATCH (a:BulkN)-[r:BulkR]->(b:BulkN) RETURN a.v,r.w,b.v"
+    ).result_set
+    assert bulk_rows == [[11, 99, 22]], bulk_rows
+
+    append_token = (
+        b"BulkN\x00"
+        + struct.pack("=I", 1)
+        + b"v\x00"
+        + struct.pack("=Bq", 4, 33)
+    )
+    append_reply = db.execute_command(
+        "GRAPH.BULK", BULK_GRAPH, 1, 0, 1, 0, append_token
+    )
+    assert "1 nodes created" in append_reply, append_reply
+    assert bulk_graph.query("MATCH (n:BulkN) RETURN count(n)").result_set == [[3]]
+
+    try:
+        db.execute_command("GRAPH.BULK", "bulk-invalid", "BEGIN", "010", 0, 0, 0)
+        raise AssertionError("non-canonical GRAPH.BULK count unexpectedly succeeded")
+    except ResponseError:
+        pass
+    assert "bulk-invalid" not in db.list_graphs(), db.list_graphs()
+    print("OFFICIAL_FALKORDB_CLIENT_BULK_WRITE_PASS")
+
     udf_script = """
     function PersistedAdd(x) { return x + 7; }
     falkor.register("PersistedAdd", PersistedAdd);
@@ -238,6 +287,17 @@ def phase_read():
         "YIELD node RETURN node.name"
     )
     assert result.result_set == [["Alice"]], result.result_set
+
+    bulk_graph = db.select_graph(BULK_GRAPH)
+    bulk_rows = bulk_graph.query(
+        "MATCH (n:BulkN) RETURN n.v ORDER BY n.v"
+    ).result_set
+    assert bulk_rows == [[11], [22], [33]], bulk_rows
+    rel_rows = bulk_graph.query(
+        "MATCH (:BulkN)-[r:BulkR]->(:BulkN) RETURN r.w"
+    ).result_set
+    assert rel_rows == [[99]], rel_rows
+    print("OFFICIAL_FALKORDB_CLIENT_BULK_RESTART_PASS")
 
     # GRAPH.UDF is process-global upstream state. The standalone server persists
     # it beside graph WAL/checkpoints and must restore it on a fresh process.

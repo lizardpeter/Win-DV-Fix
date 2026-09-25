@@ -30,6 +30,23 @@ pub struct OAuthConfig {
 }
 
 impl OAuthConfig {
+    pub fn protected_resource_metadata_url(&self) -> Result<String, String> {
+        let resource = Url::parse(&self.resource)
+            .map_err(|e| format!("invalid OAuth resource URL {:?}: {e}", self.resource))?;
+        let mut metadata = resource.clone();
+
+        let path = resource.path().trim_matches('/');
+        let metadata_path = if path.is_empty() {
+            "/.well-known/oauth-protected-resource".to_string()
+        } else {
+            format!("/.well-known/oauth-protected-resource/{path}")
+        };
+        metadata.set_path(&metadata_path);
+        metadata.set_query(None);
+        metadata.set_fragment(None);
+        Ok(metadata.to_string().trim_end_matches('/').to_string())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         validate_https_or_loopback_url(&self.resource, "OAuth resource")?;
         validate_https_or_loopback_url(&self.issuer, "OAuth issuer")?;

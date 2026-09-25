@@ -293,7 +293,7 @@ including a ChatGPT custom integration.
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {
                 cert_path: cert_path.clone(),
                 key_path: key_path.clone(),
-                client_ca_path: api_openai_mtls_ca,
+                client_ca_path: api_openai_mtls_ca.clone(),
                 client_dns_name: api_openai_mtls_ca
                     .as_ref()
                     .map(|_| "mtls.prod.connectors.openai.com".to_string()),

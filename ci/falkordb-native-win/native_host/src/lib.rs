@@ -280,6 +280,15 @@ impl NativeGraph {
             .map_err(|e| format!("stat WAL {}: {e}", wal.path().display()))
     }
 
+    pub fn memory_usage_report(
+        &self,
+        samples: usize,
+    ) -> graph::graph::graph::MemoryUsageReport {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        committed.borrow().memory_usage_report(samples)
+    }
+
 
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
         self.query_with_timeout(cypher, None)

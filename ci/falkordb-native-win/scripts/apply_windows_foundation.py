@@ -92,6 +92,19 @@ def patch_graphblas_matrix():
 
     p.write_text(s, encoding="utf-8")
 
+
+def patch_graph_cargo():
+    p = root / "graph/Cargo.toml"
+    s = p.read_text(encoding="utf-8")
+    if 'usearch = "2.26.2"' not in s:
+        marker = "[dependencies]\n"
+        idx = s.find(marker)
+        if idx < 0:
+            raise RuntimeError("graph/Cargo.toml: [dependencies] section not found")
+        idx += len(marker)
+        s = s[:idx] + 'usearch = "2.26.2"\n' + s[idx:]
+    p.write_text(s, encoding="utf-8")
+
 def install_native_index():
     source = Path(__file__).resolve().parent.parent / "patches" / "native_index_mod.rs"
     if not source.exists():
@@ -198,5 +211,6 @@ patch_module_init()
 patch_graphblas_bindings()
 patch_graphblas_matrix()
 patch_graph_build()
+patch_graph_cargo()
 install_native_index()
 print("Windows foundation patches applied")

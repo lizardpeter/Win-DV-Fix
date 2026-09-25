@@ -51,6 +51,16 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass
           & '.\ci\falkordb-native-win\scripts\diagnose.ps1'
 
+      - name: Save Rust build cache
+        if: always() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ci/falkordb-native-win/build/cargo-target
+          key: falkordb-native-rust-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml') }}
+
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4

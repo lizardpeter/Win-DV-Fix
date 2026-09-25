@@ -30,6 +30,7 @@ $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
 $env:LAGRAPH_LIB_DIR = $NativeLibDir
 $env:FALKORDB_NATIVE_NO_OPENMP = "1"
 $env:FALKORDB_NATIVE_REDISEARCH_SHIM_DIR = $ShimDir
+$env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
 Remove-Item Env:FALKORDB_SKIP_REDISEARCH -ErrorAction SilentlyContinue
 
 rustc -Vv | Tee-Object -FilePath (Join-Path $Logs "00_rustc.txt")
@@ -41,7 +42,9 @@ cmake --version | Tee-Object -FilePath (Join-Path $Logs "00_cmake.txt")
 Write-Host "=== Stage 1: graph crate type-check ==="
 Push-Location $Falkor
 cargo check -p graph 2>&1 | Tee-Object -FilePath (Join-Path $Logs "01_graph_check.txt")
+$GraphCheckExit = $LASTEXITCODE
 Pop-Location
+if ($GraphCheckExit -ne 0) { throw "FalkorDB graph cargo check failed with exit code $GraphCheckExit" }
 
 Write-Host "=== Stage 2: native host type-check ==="
 $HostManifest = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
@@ -54,7 +57,7 @@ cargo build --manifest-path $HostManifest --bin smoke --release 2>&1 |
 if ($LASTEXITCODE -ne 0) { throw "Native smoke build failed with exit code $LASTEXITCODE" }
 
 Write-Host "=== Stage 4: native smoke execution ==="
-$SmokeExe = Join-Path $PSScriptRoot "..\native_host\target\release\smoke.exe"
+$SmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\smoke.exe"
 if (-not (Test-Path $SmokeExe)) {
     throw "Smoke executable was not produced: $SmokeExe"
 }

@@ -15,6 +15,7 @@ use graph::{
         runtime::{QueryStatistics, ResultSummary, Runtime},
     },
 };
+use orx_tree::Collection;
 use parking_lot::RwLock;
 
 unsafe extern "C" {

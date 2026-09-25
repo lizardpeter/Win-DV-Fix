@@ -25,6 +25,7 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
+use usearch::{Index as UsearchIndex, IndexOptions as UsearchOptions, MetricKind, ScalarKind};
 
 use crate::runtime::{value::Value, vec_distance};
 
@@ -353,6 +354,84 @@ impl NumericKey {
 type NumericPostings = HashMap<String, BTreeMap<NumericKey, BTreeSet<u64>>>;
 type StringPostings = HashMap<String, BTreeMap<String, BTreeSet<u64>>>;
 
+
+struct NativeVectorIndex {
+    index: UsearchIndex,
+    dimensions: usize,
+}
+
+impl NativeVectorIndex {
+    fn new(field: &Field) -> Result<Self, String> {
+        let options = field
+            .vector_options()
+            .ok_or_else(|| "vector field is missing options".to_string())?;
+        let dimensions = usize::try_from(options.dimension)
+            .map_err(|_| format!("invalid vector dimension {}", options.dimension))?;
+        if dimensions == 0 {
+            return Err("vector dimension must be greater than zero".to_string());
+        }
+
+        let metric = match options.similarity_function.as_deref().unwrap_or("euclidean") {
+            "euclidean" => MetricKind::L2sq,
+            "cosine" => MetricKind::Cos,
+            "ip" => MetricKind::IP,
+            other => return Err(format!("unsupported vector similarity function: {other}")),
+        };
+
+        let config = UsearchOptions {
+            dimensions,
+            metric,
+            quantization: ScalarKind::F32,
+            connectivity: options.m.unwrap_or(16),
+            expansion_add: options.ef_construction.unwrap_or(200),
+            expansion_search: options.ef_runtime.unwrap_or(10),
+            multi: false,
+        };
+        let index = UsearchIndex::new(&config)
+            .map_err(|e| format!("create HNSW vector index: {e}"))?;
+        index
+            .reserve(1024)
+            .map_err(|e| format!("reserve HNSW vector index: {e}"))?;
+
+        Ok(Self { index, dimensions })
+    }
+
+    fn ensure_capacity(&self) -> Result<(), String> {
+        if self.index.size().saturating_add(1) <= self.index.capacity() {
+            return Ok(());
+        }
+        let next = self.index.capacity().max(1024).saturating_mul(2);
+        self.index
+            .reserve(next)
+            .map_err(|e| format!("grow HNSW vector index to {next}: {e}"))
+    }
+
+    fn upsert(&self, id: u64, vector: &[f32]) -> Result<(), String> {
+        if vector.len() != self.dimensions {
+            return Err(format!(
+                "vector dimension mismatch, expected {} but got {}",
+                self.dimensions,
+                vector.len()
+            ));
+        }
+        if self.index.contains(id) {
+            self.index
+                .remove(id)
+                .map_err(|e| format!("remove stale HNSW vector {id}: {e}"))?;
+        }
+        self.ensure_capacity()?;
+        self.index
+            .add(id, vector)
+            .map_err(|e| format!("add HNSW vector {id}: {e}"))
+    }
+
+    fn remove(&self, id: u64) {
+        if self.index.contains(id) {
+            let _ = self.index.remove(id);
+        }
+    }
+}
+
 #[derive(Default)]
 struct NativeStore {
     docs: HashMap<u64, NativeDocument>,
@@ -364,6 +443,7 @@ struct NativeStore {
     /// Key namespace is r:<token>, s:<stem>, or p:<soundex>.
     /// Values are per-document term scores precomputed at insert/update time.
     fulltext: HashMap<String, HashMap<u64, f64>>,
+    vectors: HashMap<String, NativeVectorIndex>,
 }
 
 impl NativeStore {
@@ -423,7 +503,18 @@ impl NativeStore {
                         self.index_fulltext_value(field, document.id, text);
                     }
                 }
-                IndexType::Vector => {}
+                IndexType::Vector => {
+                    if let Value::VecF32(vector) = value {
+                        let key = name.into_owned();
+                        let state = self.vectors.entry(key.clone()).or_insert_with(|| {
+                            NativeVectorIndex::new(field)
+                                .unwrap_or_else(|e| panic!("native HNSW index {key}: {e}"))
+                        });
+                        if let Err(err) = state.upsert(document.id, vector.as_slice()) {
+                            panic!("native HNSW insert {key}/{}: {err}", document.id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -448,7 +539,12 @@ impl NativeStore {
                         self.unindex_fulltext_value(field, document.id, text);
                     }
                 }
-                IndexType::Vector => {}
+                IndexType::Vector => {
+                    let key = name.into_owned();
+                    if let Some(state) = self.vectors.get(&key) {
+                        state.remove(document.id);
+                    }
+                }
             }
         }
     }

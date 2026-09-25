@@ -52,17 +52,19 @@ fn main() -> Result<(), String> {
                 config.allow_unauthenticated_remote = true;
             }
             "--help" | "-h" => {
-                println!(
-                    "falkordb-native-server\n\
-                     \nUSAGE:\n  falkordb-native-server [OPTIONS]\n\
-                     \nOPTIONS:\n\
-                     \  --bind HOST:PORT                 Bind address (default 127.0.0.1:6379)\n\
-                     \  --port PORT                      Override port\n\
-                     \  --data-dir PATH                  Persistent graph data directory\n\
-                     \  --username USER                  AUTH username (default: default)\n\
-                     \  --password PASSWORD              AUTH password (or FALKORDB_PASSWORD)\n\
-                     \  --allow-unauthenticated-remote   Allow non-loopback bind without AUTH\n"
-                );
+                println!(r#"falkordb-native-server
+
+USAGE:
+  falkordb-native-server [OPTIONS]
+
+OPTIONS:
+  --bind HOST:PORT                 Bind address (default 127.0.0.1:6379)
+  --port PORT                      Override port
+  --data-dir PATH                  Persistent graph data directory
+  --username USER                  AUTH username (default: default)
+  --password PASSWORD              AUTH password (or FALKORDB_PASSWORD)
+  --allow-unauthenticated-remote   Allow non-loopback bind without AUTH
+"#);
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}")),

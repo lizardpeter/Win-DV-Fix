@@ -6,7 +6,6 @@ $ErrorActionPreference = "Stop"
 $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 $Falkor = Join-Path $WorkDir "src\FalkorDB"
 $Prefix = Join-Path $WorkDir "native-prefix"
-$ShimDir = Join-Path $WorkDir "redisearch-shim"
 $Logs = Join-Path $WorkDir "logs"
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 
@@ -29,9 +28,9 @@ if (Test-Path $LibDirFile) {
 $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
 $env:LAGRAPH_LIB_DIR = $NativeLibDir
 $env:FALKORDB_NATIVE_NO_OPENMP = "1"
-$env:FALKORDB_NATIVE_REDISEARCH_SHIM_DIR = $ShimDir
 $env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
-Remove-Item Env:FALKORDB_SKIP_REDISEARCH -ErrorAction SilentlyContinue
+$env:FALKORDB_SKIP_REDISEARCH = "1"
+Remove-Item Env:FALKORDB_NATIVE_REDISEARCH_SHIM_DIR -ErrorAction SilentlyContinue
 
 rustc -Vv | Tee-Object -FilePath (Join-Path $Logs "00_rustc.txt")
 cargo -V | Tee-Object -FilePath (Join-Path $Logs "00_cargo.txt")
@@ -51,17 +50,22 @@ $HostManifest = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
 cargo check --manifest-path $HostManifest 2>&1 | Tee-Object -FilePath (Join-Path $Logs "02_host_check.txt")
 if ($LASTEXITCODE -ne 0) { throw "Native host cargo check failed with exit code $LASTEXITCODE" }
 
-Write-Host "=== Stage 3: native smoke executable link ==="
+Write-Host "=== Stage 3: native host unit tests ==="
+cargo test --manifest-path $HostManifest --lib 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "03_host_tests.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native host unit tests failed with exit code $LASTEXITCODE" }
+
+Write-Host "=== Stage 4: native smoke executable link ==="
 cargo build --manifest-path $HostManifest --bin smoke --release 2>&1 |
-    Tee-Object -FilePath (Join-Path $Logs "03_smoke_build.txt")
+    Tee-Object -FilePath (Join-Path $Logs "04_smoke_build.txt")
 if ($LASTEXITCODE -ne 0) { throw "Native smoke build failed with exit code $LASTEXITCODE" }
 
-Write-Host "=== Stage 4: native smoke execution ==="
+Write-Host "=== Stage 5: native smoke execution ==="
 $SmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\smoke.exe"
 if (-not (Test-Path $SmokeExe)) {
     throw "Smoke executable was not produced: $SmokeExe"
 }
-$SmokeOutput = & $SmokeExe 2>&1 | Tee-Object -FilePath (Join-Path $Logs "04_smoke_run.txt")
+$SmokeOutput = & $SmokeExe 2>&1 | Tee-Object -FilePath (Join-Path $Logs "05_smoke_run.txt")
 if ($LASTEXITCODE -ne 0) {
     throw "Native smoke executable failed with exit code $LASTEXITCODE"
 }

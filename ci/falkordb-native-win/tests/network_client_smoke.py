@@ -70,6 +70,22 @@ def phase_write():
     result = graph.query("RETURN 1 AS one, 'wire-ok' AS text")
     assert result.result_set == [[1, "wire-ok"]], result.result_set
 
+    # Official FalkorDB client admin/config surface.
+    original_resultset_size = db.config_get("RESULTSET_SIZE")
+    assert int(original_resultset_size) == -1, original_resultset_size
+    db.config_set("RESULTSET_SIZE", 1)
+    limited = graph.query("UNWIND [1,2,3] AS x RETURN x")
+    assert limited.result_set == [[1]], limited.result_set
+    db.config_set("RESULTSET_SIZE", -1)
+
+    db.config_set("TIMEOUT_MAX", 1)
+    try:
+        graph.query("RETURN 1", timeout=2)
+        raise AssertionError("per-query timeout above TIMEOUT_MAX unexpectedly succeeded")
+    except ResponseError as exc:
+        assert "TIMEOUT_MAX" in str(exc), exc
+    db.config_set("TIMEOUT_MAX", 0)
+
     graph.create_node_range_index("Person", "age")
     graph.create_node_fulltext_index("Person", "name")
 
@@ -78,6 +94,39 @@ def phase_write():
         "(b:Person {name:'Bob',age:30}), "
         "(a)-[:KNOWS {since:2026}]->(b)"
     )
+
+    # Explain/profile are parsed into the official client's ExecutionPlan type.
+    explain = graph.explain("MATCH (n:Person) RETURN n.name")
+    assert explain.plan and len(explain.plan) > 0, explain.plan
+    profile = graph.profile("MATCH (n:Person) RETURN n.name")
+    assert profile.plan and len(profile.plan) > 0, profile.plan
+
+    # Real per-graph slowlog plus reset.
+    graph.query("MATCH (n:Person) RETURN n.name")
+    slow = graph.slowlog()
+    assert len(slow) > 0, slow
+    graph.slowlog_reset()
+    assert graph.slowlog() == [], graph.slowlog()
+
+    # Constraint creation/enforcement through official high-level helpers.
+    assert graph.create_node_unique_constraint("Person", "name") == "OK"
+    constraints = graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in constraints
+    ), constraints
+    try:
+        graph.query("CREATE (:Person {name:'Alice',age:99})")
+        raise AssertionError("unique constraint did not reject duplicate Person.name")
+    except ResponseError:
+        pass
+
+    # GRAPH.COPY must produce an independently queryable durable graph.
+    clone = graph.copy("network-official-client-copy")
+    clone_result = clone.query("MATCH (n:Person) RETURN count(n)")
+    assert clone_result.result_set == [[2]], clone_result.result_set
 
     # This exercises compact Node/Edge encoding plus schema-id refresh through
     # DB.LABELS, DB.PROPERTYKEYS and DB.RELATIONSHIPTYPES.
@@ -148,6 +197,18 @@ def phase_read():
         "RETURN a.age, r.since, b.age"
     )
     assert result.result_set == [[40, 2026, 30]], result.result_set
+
+    constraints = graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in constraints
+    ), constraints
+
+    clone = db.select_graph("network-official-client-copy")
+    clone_result = clone.query("MATCH (n:Person) RETURN count(n)")
+    assert clone_result.result_set == [[2]], clone_result.result_set
 
     result = graph.query(
         "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"

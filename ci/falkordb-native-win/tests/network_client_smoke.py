@@ -39,6 +39,9 @@ def phase_write():
     result = graph.query("RETURN 1 AS one, 'wire-ok' AS text")
     assert result.result_set == [[1, "wire-ok"]], result.result_set
 
+    graph.create_node_range_index("Person", "age")
+    graph.create_node_fulltext_index("Person", "name")
+
     graph.query(
         "CREATE (a:Person {name:'Alice',age:40}), "
         "(b:Person {name:'Bob',age:30}), "
@@ -61,13 +64,11 @@ def phase_write():
     assert edge.relation == "KNOWS", edge.relation
     assert edge.properties["since"] == 2026, edge.properties
 
-    graph.create_node_range_index("Person", "age")
     result = graph.query(
         "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name ORDER BY n.name"
     )
     assert result.result_set == [["Alice"]], result.result_set
 
-    graph.create_node_fulltext_index("Person", "name")
     result = graph.query(
         "CALL db.idx.fulltext.queryNodes('Person','Alice') "
         "YIELD node RETURN node.name"

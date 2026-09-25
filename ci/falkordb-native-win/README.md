@@ -6,17 +6,21 @@ This directory contains the native Windows standalone FalkorDB-derived graph bac
 
 **Verified working on native Windows/MSVC without Redis, Memurai, WSL, Docker, Hyper-V, or a VM.**
 
-Known-good Windows CI evidence:
+Current verified Windows CI evidence:
 
-- Workflow run: `36163782345`
-- Verified commit: `d99c2761f6b9bbb6952ca54cf50732952587bb47`
-- Final marker: `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
-- Current branch restored to the verified binding configuration at commit:
-  `f3cb92e0ceeea8c13f0319e16300059cd63e31bd`
+- Workflow run: `36190878880`
+- Verified network-capable commit: `3989ee1c8ec252bacd7e24fb51416cf7498c1874`
+- Standalone marker: `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
+- Official-client write marker: `OFFICIAL_FALKORDB_CLIENT_WRITE_PASS`
+- Official-client restart marker: `OFFICIAL_FALKORDB_CLIENT_RESTART_PASS`
+- Final network marker: `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
 
 The successful run compiled the FalkorDB `graph` crate and the native host with
-`FALKORDB_SKIP_REDISEARCH=1`, linked and executed the Windows binaries, then
-passed the standalone Cypher/index/WAL restart integration suite.
+`FALKORDB_SKIP_REDISEARCH=1`, passed the standalone Cypher/index/WAL suite,
+started the RESP/TCP server with password authentication, connected with the
+unmodified official `falkordb-py` client, created and queried graph/index data,
+terminated and restarted the server process, and verified the same data and
+indexes again through the official client.
 
 ## What Redis used to provide
 
@@ -107,6 +111,59 @@ A valid end-to-end run must finish with:
 NATIVE_WINDOWS_FULL_STANDALONE_PASS
 ```
 
+
+## Network server
+
+The standalone host now includes a Redis RESP-compatible TCP server so normal
+FalkorDB clients can connect without a Redis or FalkorDB server process.
+
+Verified network behavior includes:
+
+- RESP2 command transport over TCP
+- Redis-style `AUTH <password>` and `AUTH <username> <password>`
+- `INFO server` reporting standalone mode for client discovery
+- `GRAPH.QUERY`
+- `GRAPH.RO_QUERY`
+- `GRAPH.LIST`
+- `GRAPH.DELETE`
+- `FLUSHDB` / `FLUSHALL`
+- compact typed FalkorDB result encoding
+- real Node and Edge decoding by the official Python client
+- graph-name routing to separate persistent WALs
+- range and full-text index queries over the network
+- restart/recovery while preserving remotely created graph and index state
+
+Build the tested server with the normal Windows bootstrap/diagnostic path. The
+server executable is `server.exe` in the Cargo release target directory.
+
+Example remote-server launch:
+
+```powershell
+$env:FALKORDB_PASSWORD = "replace-with-a-long-random-secret"
+.\server.exe --bind 0.0.0.0:6379 --data-dir D:\FalkorDBNative\data
+```
+
+Example official Python client:
+
+```python
+from falkordb import FalkorDB
+
+db = FalkorDB(
+    host="SERVER_IP_OR_DNS",
+    port=6379,
+    password="replace-with-a-long-random-secret",
+)
+graph = db.select_graph("reversal")
+graph.query("CREATE (:Project {name:'T6'})")
+print(graph.query("MATCH (n:Project) RETURN n.name").result_set)
+```
+
+The server refuses an unauthenticated non-loopback bind by default. RESP
+password authentication does not itself encrypt traffic, so an Internet-facing
+deployment should use a private network/VPN or an encrypted transport in front
+of the listener. Do not expose plaintext RESP/AUTH directly to the public
+Internet.
+
 ## Design direction for the reversal graph
 
 This backend is intended to host the universal reversal graph for T6, Destiny,
@@ -130,9 +187,10 @@ performance work, including:
 
 - optimized native range index hot paths
 - snapshot compaction in addition to WAL replay
-- graph catalog/multi-project lifecycle
+- graph catalog/multi-project lifecycle (network graph-name routing is complete; schema/project conventions remain)
 - CAS artifact store integration
 - observability/progress metrics
 - packaging/install/update flow
+- optional native TLS termination (private-network/VPN deployment is supported now)
 - benchmarking against the original FalkorDB/RediSearch deployment
 - stress/crash/fuzz testing

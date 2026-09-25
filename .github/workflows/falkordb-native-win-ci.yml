@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - chatgpt/falkordb-native-win-ci
+      - chatgpt/falkordb-native-mcp
     paths:
       - 'ci/falkordb-native-win/**'
       - '.github/workflows/falkordb-native-win-ci.yml'
@@ -67,7 +68,7 @@ jobs:
       - name: Install official FalkorDB Python client
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check --upgrade falkordb trustme
+          python -m pip install --disable-pip-version-check --upgrade falkordb trustme "mcp>=2,<3"
 
       - name: Compile, link, and run smoke test
         shell: pwsh

@@ -632,6 +632,9 @@ fn numeric_range(
     let Some(values) = index.get(field) else {
         return BTreeSet::new();
     };
+    if min.zip(max).is_some_and(|(min, max)| min > max) {
+        return BTreeSet::new();
+    }
     let lower = match min {
         Some(value) if include_min => Included(value),
         Some(value) => Excluded(value),
@@ -677,6 +680,9 @@ fn string_range(
     let Some(values) = index.get(field) else {
         return BTreeSet::new();
     };
+    if min.zip(max).is_some_and(|(min, max)| min > max) {
+        return BTreeSet::new();
+    }
     let lower = match min {
         Some(value) if include_min => Included(value.to_string()),
         Some(value) => Excluded(value.to_string()),
@@ -1015,14 +1021,11 @@ impl Index {
                 let mut sets: Vec<BTreeSet<u64>> =
                     children.iter().map(|child| self.query_ids(store, child)).collect();
                 sets.sort_by_key(BTreeSet::len);
-                let Some(mut out) = sets.into_iter().next() else {
+                let mut sets = sets.into_iter();
+                let Some(mut out) = sets.next() else {
                     return BTreeSet::new();
                 };
-                for rhs in children
-                    .iter()
-                    .skip(1)
-                    .map(|child| self.query_ids(store, child))
-                {
+                for rhs in sets {
                     out.retain(|id| rhs.contains(id));
                     if out.is_empty() {
                         break;
@@ -1339,24 +1342,39 @@ impl Index {
     #[must_use]
     pub fn get_fields(&self, attr: &Arc<String>) -> Option<&Vec<Arc<Field>>> { self.fields.get(attr) }
     pub fn add_field_to_existing(&mut self, attr: &Arc<String>, field: Arc<Field>) {
-        if let Some(fields) = self.fields.get_mut(attr) { fields.push(field); }
+        if let Some(fields) = self.fields.get_mut(attr) {
+            fields.push(field);
+            self.store.write().rebuild(&self.fields);
+        }
     }
     pub fn insert_field(&mut self, attr: Arc<String>, field: Arc<Field>) {
-        if !self.fields.contains_key(&attr) { self.field_order.push(attr.clone()); }
+        if !self.fields.contains_key(&attr) {
+            self.field_order.push(attr.clone());
+        }
         self.fields.insert(attr, vec![field]);
+        self.store.write().rebuild(&self.fields);
     }
     pub fn remove_field(&mut self, attr: &Arc<String>) -> bool {
         let removed = self.fields.remove(attr).is_some();
-        if removed { self.field_order.retain(|a| a != attr); }
+        if removed {
+            self.field_order.retain(|a| a != attr);
+            self.store.write().rebuild(&self.fields);
+        }
         removed
     }
     pub fn retain_fields(&mut self, attr: &Arc<String>, ty: &IndexType) {
+        let mut changed = false;
         if let Some(fields) = self.fields.get_mut(attr) {
+            let before = fields.len();
             fields.retain(|f| f.ty != *ty);
+            changed = fields.len() != before;
             if fields.is_empty() {
                 self.fields.remove(attr);
                 self.field_order.retain(|a| a != attr);
             }
+        }
+        if changed {
+            self.store.write().rebuild(&self.fields);
         }
     }
     #[must_use]

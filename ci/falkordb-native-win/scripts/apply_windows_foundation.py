@@ -74,6 +74,14 @@ def patch_graphblas_bindings():
     if "__darwin_" in s or "__sFILE" in s:
         raise RuntimeError("graphblas/mod.rs: Darwin FILE definitions remain after patch")
 
+    # Rust's ordinary MSVC extern-static linkage expects direct data symbols.
+    # GraphBLAS exports predefined types/operators/descriptors from a DLL, which
+    # on Windows require DLL-data import thunks (__imp_*). raw-dylib tells rustc
+    # to generate the correct import records for both functions and globals.
+    raw_link = '#[cfg_attr(windows, link(name = "graphblas", kind = "raw-dylib"))]\nunsafe extern "C" {'
+    if 'kind = "raw-dylib"' not in s:
+        s = s.replace('unsafe extern "C" {', raw_link)
+
     p.write_text(s, encoding="utf-8")
 
 def patch_graphblas_matrix():

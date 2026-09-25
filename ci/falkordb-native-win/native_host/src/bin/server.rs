@@ -6,6 +6,8 @@ use std::{
     thread,
 };
 
+use std::time::Duration;
+
 use falkordb_native_host::{
     Engine,
     api::{ApiConfig, serve_api},
@@ -47,6 +49,15 @@ fn main() -> Result<(), String> {
         .filter(|v| !v.is_empty());
     let mut api_allow_plaintext_remote = false;
     let mut api_allow_unauthenticated_remote = false;
+
+    let mut checkpoint_wal_mb: u64 = env::var("FALKORDB_CHECKPOINT_WAL_MB")
+        .ok()
+        .map(|v| {
+            v.parse::<u64>()
+                .map_err(|e| format!("invalid FALKORDB_CHECKPOINT_WAL_MB {v:?}: {e}"))
+        })
+        .transpose()?
+        .unwrap_or(256);
 
     // A configured API credential implies a localhost API even when no bind
     // was specified, making the ChatGPT surface easy to enable safely.
@@ -125,6 +136,14 @@ fn main() -> Result<(), String> {
             "--api-allow-unauthenticated-remote" => {
                 api_allow_unauthenticated_remote = true;
             }
+            "--checkpoint-wal-mb" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--checkpoint-wal-mb requires a number".to_string())?;
+                checkpoint_wal_mb = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid --checkpoint-wal-mb: {e}"))?;
+            }
             "--help" | "-h" => {
                 println!(r#"falkordb-native-server
 
@@ -150,6 +169,10 @@ CHATGPT HTTPS API OPTIONS:
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
+
+DURABILITY OPTIONS:
+  --checkpoint-wal-mb MB           Auto-checkpoint each graph when its WAL reaches
+                                   this size (default 256; env FALKORDB_CHECKPOINT_WAL_MB)
 
 The HTTPS API reuses --tls-cert/--tls-key for server TLS but does not require
 the RESP client certificate. This permits standard HTTPS Bearer-token clients,
@@ -181,6 +204,25 @@ including a ChatGPT custom integration.
     }
 
     let catalog = Arc::new(GraphCatalog::open(&config.data_dir)?);
+
+    if checkpoint_wal_mb > 0 {
+        let checkpoint_catalog = Arc::clone(&catalog);
+        let threshold_bytes = checkpoint_wal_mb.saturating_mul(1024 * 1024);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(60));
+            for (name, result) in checkpoint_catalog.checkpoint_large_wals(threshold_bytes) {
+                match result {
+                    Ok(path) => eprintln!(
+                        "checkpointed graph {name:?} at {}",
+                        path.display()
+                    ),
+                    Err(err) => eprintln!(
+                        "automatic checkpoint failed for graph {name:?}: {err}"
+                    ),
+                }
+            }
+        });
+    }
 
     if let Some(bind) = api_bind {
         let api_config = ApiConfig {

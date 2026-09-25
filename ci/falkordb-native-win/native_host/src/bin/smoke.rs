@@ -1,6 +1,6 @@
 use falkordb_native_host::{Engine, NativeGraph, property_index::NativePropertyIndex, range_index::{NativeNumericRangeIndex, NativeStringRangeIndex}};
 use graph::{index::IndexQuery, runtime::value::{Point, Value}};
-use std::sync::Arc;
+use std::{fs::{self, OpenOptions}, io::Write, sync::Arc};
 
 fn require_contains(haystack: &str, needle: &str, what: &str) -> Result<(), String> {
     if haystack.contains(needle) {
@@ -170,6 +170,69 @@ fn main() -> Result<(), String> {
     }
 
     println!("NATIVE_INDEXQUERY_BACKEND_SMOKE_PASS");
+
+    let wal_path = std::env::temp_dir().join(format!(
+        "falkordb-native-restart-smoke-{}.wal",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&wal_path);
+
+    {
+        let persistent = NativeGraph::open_persistent("restart-smoke", &wal_path)?;
+        let created = persistent.query(
+            "CREATE (:Persist {id: 9001, value: 111, name: 'durable'})"
+        )?;
+        if created.stats.nodes_created != 1 {
+            return Err(format!("persistent CREATE mismatch: {:?}", created.stats));
+        }
+        let updated = persistent.query(
+            "MATCH (n:Persist {id: 9001}) SET n.value = 222"
+        )?;
+        if updated.stats.properties_set == 0 {
+            return Err(format!("persistent SET produced no property mutation: {:?}", updated.stats));
+        }
+    }
+
+    {
+        let recovered = NativeGraph::open_persistent("restart-smoke", &wal_path)?;
+        let out = recovered.query(
+            "MATCH (n:Persist {id: 9001}) RETURN n.value AS value, n.name AS name"
+        )?;
+        if out.rows.len() != 1 || out.rows[0].len() != 2 {
+            return Err(format!("WAL recovery shape mismatch: {:?}", out.rows));
+        }
+        require_contains(&out.rows[0][0], "222", "WAL recovered property")?;
+        require_contains(&out.rows[0][1], "durable", "WAL recovered string")?;
+    }
+
+    // Simulate a crash in the middle of appending the next frame. Startup must
+    // truncate only this incomplete tail and preserve all complete commits.
+    {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .map_err(|e| format!("open WAL for torn-tail smoke: {e}"))?;
+        file.write_all(b"FGW")
+            .map_err(|e| format!("append torn WAL tail: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync torn WAL tail: {e}"))?;
+    }
+
+    {
+        let repaired = NativeGraph::open_persistent("restart-smoke", &wal_path)?;
+        let out = repaired.query(
+            "MATCH (n:Persist {id: 9001}) RETURN n.value AS value"
+        )?;
+        if out.rows.len() != 1 {
+            return Err(format!("torn-tail WAL recovery mismatch: {:?}", out.rows));
+        }
+        require_contains(&out.rows[0][0], "222", "torn-tail recovered property")?;
+    }
+
+    fs::remove_file(&wal_path)
+        .map_err(|e| format!("remove WAL smoke file {}: {e}", wal_path.display()))?;
+    println!("NATIVE_WAL_RESTART_SMOKE_PASS");
+
 
 
     println!("NATIVE_RANGE_INDEX_SMOKE_PASS");

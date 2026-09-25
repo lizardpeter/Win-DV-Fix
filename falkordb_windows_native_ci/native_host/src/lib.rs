@@ -215,7 +215,7 @@ impl NativeGraph {
         )));
 
         #[cfg(feature = "redisearch_link_stubs")]
-        if plan.plan.iter().any(|n| {
+        if plan.iter().any(|n| {
             matches!(
                 n,
                 IR::CreateIndex { .. }

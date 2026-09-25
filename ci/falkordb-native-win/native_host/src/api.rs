@@ -774,10 +774,10 @@ fn mcp_oauth_tool_error(
         RequiredOAuthScope::Read => &oauth.config().read_scope,
         RequiredOAuthScope::Write => &oauth.config().write_scope,
     };
-    let metadata = format!(
-        "{}/.well-known/oauth-protected-resource",
-        oauth.config().resource.trim_end_matches('/')
-    );
+    let metadata = oauth
+        .config()
+        .protected_resource_metadata_url()
+        .unwrap_or_else(|_| "/.well-known/oauth-protected-resource".to_string());
     let challenge = format!(
         "Bearer resource_metadata=\"{}\", scope=\"{}\", error=\"insufficient_scope\", error_description=\"Authorization with {} is required\"",
         metadata, scope, scope
@@ -1242,18 +1242,15 @@ fn oauth_resource_metadata(oauth: &OAuthVerifier) -> JsonValue {
         "resource": config.resource,
         "authorization_servers": [config.issuer],
         "scopes_supported": [config.read_scope, config.write_scope],
-        "resource_documentation": format!(
-            "{}/openapi.json",
-            config.resource.trim_end_matches('/')
-        )
+        "bearer_methods_supported": ["header"]
     })
 }
 
 fn oauth_unauthorized_response(oauth: &OAuthVerifier, required_scope: &str) -> HttpResponse {
-    let metadata = format!(
-        "{}/.well-known/oauth-protected-resource",
-        oauth.config().resource.trim_end_matches('/')
-    );
+    let metadata = oauth
+        .config()
+        .protected_resource_metadata_url()
+        .unwrap_or_else(|_| "/.well-known/oauth-protected-resource".to_string());
     let mut response = error_response(
         401,
         "oauth_required",

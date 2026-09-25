@@ -14,7 +14,7 @@ pub use vector_index_options::VectorIndexOptions;
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::CString,
     hash::Hash,
     marker::PhantomData,
@@ -325,9 +325,360 @@ struct NativeDocument {
     edge: Option<(u64, u64, u64)>,
     values: HashMap<String, Value>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct NumericKey(u64);
+
+impl NumericKey {
+    fn from_f64(mut value: f64) -> Option<Self> {
+        if value.is_nan() {
+            return None;
+        }
+        if value == 0.0 {
+            value = 0.0;
+        }
+        let bits = value.to_bits();
+        Some(Self(if bits & (1u64 << 63) != 0 {
+            !bits
+        } else {
+            bits ^ (1u64 << 63)
+        }))
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        numeric_value(value).and_then(Self::from_f64)
+    }
+}
+
+type NumericPostings = HashMap<String, BTreeMap<NumericKey, BTreeSet<u64>>>;
+type StringPostings = HashMap<String, BTreeMap<String, BTreeSet<u64>>>;
+
 #[derive(Default)]
 struct NativeStore {
     docs: HashMap<u64, NativeDocument>,
+    scalar_numeric: NumericPostings,
+    scalar_string: StringPostings,
+    array_numeric: NumericPostings,
+    array_string: StringPostings,
+    points: HashMap<String, HashMap<u64, crate::runtime::value::Point>>,
+    /// Key namespace is r:<token>, s:<stem>, or p:<soundex>.
+    /// Values are per-document term scores precomputed at insert/update time.
+    fulltext: HashMap<String, HashMap<u64, f64>>,
+}
+
+impl NativeStore {
+    fn upsert(
+        &mut self,
+        document: NativeDocument,
+        fields: &HashMap<Arc<String>, Vec<Arc<Field>>>,
+    ) {
+        self.remove(document.id, fields);
+        self.index_document(&document, fields);
+        self.docs.insert(document.id, document);
+    }
+
+    fn remove(
+        &mut self,
+        id: u64,
+        fields: &HashMap<Arc<String>, Vec<Arc<Field>>>,
+    ) -> Option<NativeDocument> {
+        let document = self.docs.remove(&id)?;
+        self.unindex_document(&document, fields);
+        Some(document)
+    }
+
+    fn rebuild(
+        &mut self,
+        fields: &HashMap<Arc<String>, Vec<Arc<Field>>>,
+    ) {
+        let docs: Vec<NativeDocument> = self.docs.values().cloned().collect();
+        self.scalar_numeric.clear();
+        self.scalar_string.clear();
+        self.array_numeric.clear();
+        self.array_string.clear();
+        self.points.clear();
+        self.fulltext.clear();
+        for document in &docs {
+            self.index_document(document, fields);
+        }
+    }
+
+    fn index_document(
+        &mut self,
+        document: &NativeDocument,
+        fields: &HashMap<Arc<String>, Vec<Arc<Field>>>,
+    ) {
+        for field in fields.values().flatten() {
+            let name = field.name.to_string_lossy();
+            let Some(value) = document.values.get(name.as_ref()) else {
+                continue;
+            };
+
+            match field.ty {
+                IndexType::Range => {
+                    self.index_range_value(name.as_ref(), document.id, value);
+                }
+                IndexType::Fulltext => {
+                    if let Value::String(text) = value {
+                        self.index_fulltext_value(field, document.id, text);
+                    }
+                }
+                IndexType::Vector => {}
+            }
+        }
+    }
+
+    fn unindex_document(
+        &mut self,
+        document: &NativeDocument,
+        fields: &HashMap<Arc<String>, Vec<Arc<Field>>>,
+    ) {
+        for field in fields.values().flatten() {
+            let name = field.name.to_string_lossy();
+            let Some(value) = document.values.get(name.as_ref()) else {
+                continue;
+            };
+
+            match field.ty {
+                IndexType::Range => {
+                    self.unindex_range_value(name.as_ref(), document.id, value);
+                }
+                IndexType::Fulltext => {
+                    if let Value::String(text) = value {
+                        self.unindex_fulltext_value(field, document.id, text);
+                    }
+                }
+                IndexType::Vector => {}
+            }
+        }
+    }
+
+    fn index_range_value(&mut self, field: &str, id: u64, value: &Value) {
+        match value {
+            Value::String(value) => insert_string_posting(
+                &mut self.scalar_string,
+                field,
+                value.as_str(),
+                id,
+            ),
+            Value::List(values) => {
+                for item in values.iter() {
+                    if let Value::String(value) = item {
+                        insert_string_posting(
+                            &mut self.array_string,
+                            field,
+                            value.as_str(),
+                            id,
+                        );
+                    } else if let Some(key) = NumericKey::from_value(item) {
+                        insert_numeric_posting(
+                            &mut self.array_numeric,
+                            field,
+                            key,
+                            id,
+                        );
+                    }
+                }
+            }
+            Value::Point(point) => {
+                self.points
+                    .entry(field.to_string())
+                    .or_default()
+                    .insert(id, point.clone());
+            }
+            _ => {
+                if let Some(key) = NumericKey::from_value(value) {
+                    insert_numeric_posting(&mut self.scalar_numeric, field, key, id);
+                }
+            }
+        }
+    }
+
+    fn unindex_range_value(&mut self, field: &str, id: u64, value: &Value) {
+        match value {
+            Value::String(value) => remove_string_posting(
+                &mut self.scalar_string,
+                field,
+                value.as_str(),
+                id,
+            ),
+            Value::List(values) => {
+                for item in values.iter() {
+                    if let Value::String(value) = item {
+                        remove_string_posting(
+                            &mut self.array_string,
+                            field,
+                            value.as_str(),
+                            id,
+                        );
+                    } else if let Some(key) = NumericKey::from_value(item) {
+                        remove_numeric_posting(
+                            &mut self.array_numeric,
+                            field,
+                            key,
+                            id,
+                        );
+                    }
+                }
+            }
+            Value::Point(_) => {
+                if let Some(points) = self.points.get_mut(field) {
+                    points.remove(&id);
+                    if points.is_empty() {
+                        self.points.remove(field);
+                    }
+                }
+            }
+            _ => {
+                if let Some(key) = NumericKey::from_value(value) {
+                    remove_numeric_posting(&mut self.scalar_numeric, field, key, id);
+                }
+            }
+        }
+    }
+
+    fn index_fulltext_value(&mut self, field: &Field, id: u64, text: &str) {
+        let opts = field.options();
+        let weight = opts.and_then(|o| o.weight).unwrap_or(1.0);
+        let nostem = opts.and_then(|o| o.nostem).unwrap_or(false);
+        let phonetic = opts
+            .and_then(|o| o.phonetic.as_deref())
+            .is_some_and(|p| !p.is_empty());
+
+        for token in tokenize(text) {
+            let key = if phonetic {
+                format!("p:{}", soundex(&token))
+            } else if nostem {
+                format!("r:{token}")
+            } else {
+                format!("s:{}", stem(&token))
+            };
+            *self
+                .fulltext
+                .entry(key)
+                .or_default()
+                .entry(id)
+                .or_default() += weight;
+        }
+    }
+
+    fn unindex_fulltext_value(&mut self, field: &Field, id: u64, text: &str) {
+        let opts = field.options();
+        let nostem = opts.and_then(|o| o.nostem).unwrap_or(false);
+        let phonetic = opts
+            .and_then(|o| o.phonetic.as_deref())
+            .is_some_and(|p| !p.is_empty());
+
+        let mut keys = BTreeSet::new();
+        for token in tokenize(text) {
+            keys.insert(if phonetic {
+                format!("p:{}", soundex(&token))
+            } else if nostem {
+                format!("r:{token}")
+            } else {
+                format!("s:{}", stem(&token))
+            });
+        }
+        for key in keys {
+            if let Some(posting) = self.fulltext.get_mut(&key) {
+                posting.remove(&id);
+                if posting.is_empty() {
+                    self.fulltext.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn fulltext_term_scores(&self, term: &str) -> HashMap<u64, f64> {
+        let keys = [
+            format!("r:{term}"),
+            format!("s:{}", stem(term)),
+            format!("p:{}", soundex(term)),
+        ];
+        let mut scores = HashMap::new();
+        for key in keys {
+            if let Some(posting) = self.fulltext.get(&key) {
+                for (&id, &score) in posting {
+                    *scores.entry(id).or_insert(0.0) += score;
+                }
+            }
+        }
+        scores
+    }
+}
+
+fn insert_numeric_posting(
+    index: &mut NumericPostings,
+    field: &str,
+    key: NumericKey,
+    id: u64,
+) {
+    index
+        .entry(field.to_string())
+        .or_default()
+        .entry(key)
+        .or_default()
+        .insert(id);
+}
+
+fn remove_numeric_posting(
+    index: &mut NumericPostings,
+    field: &str,
+    key: NumericKey,
+    id: u64,
+) {
+    let mut remove_field = false;
+    if let Some(values) = index.get_mut(field) {
+        let mut remove_key = false;
+        if let Some(ids) = values.get_mut(&key) {
+            ids.remove(&id);
+            remove_key = ids.is_empty();
+        }
+        if remove_key {
+            values.remove(&key);
+        }
+        remove_field = values.is_empty();
+    }
+    if remove_field {
+        index.remove(field);
+    }
+}
+
+fn insert_string_posting(
+    index: &mut StringPostings,
+    field: &str,
+    value: &str,
+    id: u64,
+) {
+    index
+        .entry(field.to_string())
+        .or_default()
+        .entry(value.to_string())
+        .or_default()
+        .insert(id);
+}
+
+fn remove_string_posting(
+    index: &mut StringPostings,
+    field: &str,
+    value: &str,
+    id: u64,
+) {
+    let mut remove_field = false;
+    if let Some(values) = index.get_mut(field) {
+        let mut remove_key = false;
+        if let Some(ids) = values.get_mut(value) {
+            ids.remove(&id);
+            remove_key = ids.is_empty();
+        }
+        if remove_key {
+            values.remove(value);
+        }
+        remove_field = values.is_empty();
+    }
+    if remove_field {
+        index.remove(field);
+    }
 }
 
 #[derive(Debug, Default)]

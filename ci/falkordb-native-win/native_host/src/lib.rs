@@ -188,6 +188,8 @@ impl NativeGraph {
                         format!("WAL recovery failed at sequence {}: {e}", record.sequence)
                     })?;
                 }
+
+                graph.populate_indexes_sync();
             }
 
             mvcc.commit(Arc::clone(&private));

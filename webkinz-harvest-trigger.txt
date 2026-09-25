@@ -1,2 +1,2 @@
 Trigger temporary Webkinz harvest.
-Fast probe revision 2.
+Fast probe revision 3.

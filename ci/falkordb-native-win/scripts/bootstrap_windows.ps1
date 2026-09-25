@@ -37,8 +37,7 @@ Write-Host "Using CMake generator: $VSGenerator"
 $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 $Src = Join-Path $WorkDir "src"
 $Prefix = Join-Path $WorkDir "native-prefix"
-$ShimDir = Join-Path $WorkDir "redisearch-shim"
-New-Item -ItemType Directory -Force -Path $Src, $Prefix, $ShimDir | Out-Null
+New-Item -ItemType Directory -Force -Path $Src, $Prefix | Out-Null
 
 $Falkor = Join-Path $Src "FalkorDB"
 if (-not (Test-Path $Falkor)) {
@@ -123,10 +122,8 @@ if (-not $SkipNativeDeps) {
     $LibDir | Set-Content -Path (Join-Path $WorkDir "native-lib-dir.txt") -Encoding Ascii
 }
 
-& "$PSScriptRoot\build_redisearch_shim.ps1" -OutDir $ShimDir -VSGenerator $VSGenerator
 
 Write-Host ""
 Write-Host "Prepared source:       $Falkor"
 Write-Host "Native prefix:         $Prefix"
-Write-Host "RediSearch shim dir:   $ShimDir"
 Write-Host "Next: .\scripts\diagnose.ps1"

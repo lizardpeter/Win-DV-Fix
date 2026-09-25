@@ -156,6 +156,33 @@ impl GraphCatalog {
         Ok(graph)
     }
 
+    pub fn create_for_bulk(&self, name: &str) -> Result<Arc<NativeGraph>, String> {
+        let mut graphs = self.graphs.write();
+        let wal = self.wal_path(name);
+        let snapshot_prefix = format!(
+            "{}.snapshot.",
+            wal.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let checkpoint_exists = fs::read_dir(&self.graph_dir)
+            .map_err(|e| format!("scan graph directory: {e}"))?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy();
+                filename.starts_with(&snapshot_prefix) && filename.ends_with(".fgs")
+            });
+
+        if graphs.contains_key(name) || wal.exists() || checkpoint_exists {
+            return Err(format!(
+                "Graph with name '{name}' cannot be created, as key '{name}' already exists."
+            ));
+        }
+
+        let graph = Arc::new(NativeGraph::open_persistent(name, &wal)?);
+        graphs.insert(name.to_string(), Arc::clone(&graph));
+        Ok(graph)
+    }
+
     pub fn list(&self) -> Vec<String> {
         let mut names: Vec<String> = self.graphs.read().keys().cloned().collect();
         names.sort();
@@ -238,6 +265,24 @@ impl GraphCatalog {
             fs::remove_file(&wal)
                 .map_err(|e| format!("delete graph WAL {}: {e}", wal.display()))?;
         }
+
+        let snapshot_prefix = format!(
+            "{}.snapshot.",
+            wal.file_name().unwrap_or_default().to_string_lossy()
+        );
+        for entry in fs::read_dir(&self.graph_dir)
+            .map_err(|e| format!("scan graph directory for checkpoint deletion: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("read graph checkpoint entry: {e}"))?;
+            let filename = entry.file_name();
+            let filename = filename.to_string_lossy();
+            if filename.starts_with(&snapshot_prefix) && filename.ends_with(".fgs") {
+                fs::remove_file(entry.path()).map_err(|e| {
+                    format!("delete graph checkpoint {}: {e}", entry.path().display())
+                })?;
+            }
+        }
+
         Ok(true)
     }
 

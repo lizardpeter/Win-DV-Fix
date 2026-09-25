@@ -4,6 +4,7 @@ pub mod api;
 pub mod property_index;
 pub mod range_index;
 pub mod server;
+pub mod udf_store;
 pub mod snapshot;
 pub mod slowlog;
 pub mod wal;

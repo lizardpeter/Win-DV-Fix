@@ -240,6 +240,17 @@ def verify(args) -> None:
         ).result_set
         assert after_delete == [[1]], after_delete
 
+        if args.roundtrip_output is not None:
+            roundtrip = raw.dump(RESTORED)
+            if not roundtrip:
+                raise RuntimeError("endpoint returned an empty round-trip DUMP payload")
+            args.roundtrip_output.parent.mkdir(parents=True, exist_ok=True)
+            args.roundtrip_output.write_bytes(roundtrip)
+            print(
+                f"FALKORDB_ROUNDTRIP_DUMP_WRITTEN bytes={len(roundtrip)} "
+                f"path={args.roundtrip_output}"
+            )
+
         if args.skip_restore:
             print("UPSTREAM_FALKORDB_DUMP_RESTART_PASS")
         else:
@@ -274,6 +285,11 @@ def main() -> None:
         "--skip-restore",
         action="store_true",
         help="query an already-restored fixture, used after a hard server restart",
+    )
+    ver.add_argument(
+        "--roundtrip-output",
+        type=Path,
+        help="after verification, DUMP the restored graph to this path",
     )
 
     args = parser.parse_args()

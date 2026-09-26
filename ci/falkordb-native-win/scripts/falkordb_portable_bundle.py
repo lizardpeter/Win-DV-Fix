@@ -263,10 +263,10 @@ def load_bundle(bundle: Path) -> tuple[dict, dict[str, bytes]]:
 def rollback_graph(
     destination: Redis,
     name: str,
-    previous_dump: bytes | None,
+    previous_dump: Path | None,
 ) -> None:
     if previous_dump is not None:
-        destination.restore(name, 0, previous_dump, replace=True)
+        destination.restore(name, 0, previous_dump.read_bytes(), replace=True)
         return
     current = {text(v) for v in destination.execute_command("GRAPH.LIST")}
     if name in current:
@@ -280,10 +280,12 @@ def import_bundle(args) -> int:
     destination = Redis(**destination_ep.redis_kwargs())
     destination_db = FalkorDB(**destination_ep.falkor_kwargs())
 
-    graph_backups: dict[str, bytes | None] = {}
+    graph_backups: dict[str, Path | None] = {}
     udf_backups: dict[str, str | None] = {}
     imported_graphs: list[str] = []
     imported_udfs: list[str] = []
+    backup_dir_obj = tempfile.TemporaryDirectory(prefix="falkordb-bundle-backup-")
+    backup_dir = Path(backup_dir_obj.name)
 
     try:
         require_standalone(destination, "destination")
@@ -306,7 +308,10 @@ def import_bundle(args) -> int:
                     raise RuntimeError(
                         f"could not back up destination graph {name!r}"
                     )
-                graph_backups[name] = previous
+                backup_path = backup_dir / f"{len(graph_backups):06d}.dump"
+                backup_path.write_bytes(previous)
+                del previous
+                graph_backups[name] = backup_path
             else:
                 graph_backups[name] = None
 
@@ -401,6 +406,7 @@ def import_bundle(args) -> int:
         )
         return 0
     finally:
+        backup_dir_obj.cleanup()
         destination.close()
         destination_db.close()
 

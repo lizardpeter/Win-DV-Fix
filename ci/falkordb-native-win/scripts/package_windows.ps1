@@ -341,7 +341,7 @@ if (($Help -join "`n") -notmatch "falkordb-native-server") {
 $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
 & (Join-Path $Stage "verify-portable.ps1")
-if ($LASTEXITCODE -ne 0) {
+if (-not $?) {
     throw "Packaged portable verifier failed"
 }
 
@@ -378,7 +378,7 @@ $ManifestLines = Get-ChildItem -Path $Stage -File -Recurse |
 $ManifestLines | Set-Content -Encoding ASCII $ManifestPath
 
 & (Join-Path $Stage "verify-portable.ps1")
-if ($LASTEXITCODE -ne 0) {
+if (-not $?) {
     throw "Portable verifier failed after SHA256 manifest generation"
 }
 

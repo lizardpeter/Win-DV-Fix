@@ -329,5 +329,108 @@ fn main() -> Result<(), String> {
     }
 
     println!("NATIVE_CHECKPOINT_WAL_ROTATION_PASS");
+
+    // Upstream FalkorDB v19 GRAPH.RESTORE compatibility. The payload format
+    // here is the same single-key byte stream FalkorDB uses for replication
+    // and GRAPH.RESTORE; after import we immediately switch to native
+    // checkpoint + WAL durability and prove a second restart.
+    let restore_wal: PathBuf = std::env::temp_dir().join(format!(
+        "falkordb-native-upstream-restore-{}.wal",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&restore_wal);
+    for entry in std::fs::read_dir(std::env::temp_dir())
+        .map_err(|e| format!("scan temp dir for restore cleanup: {e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!(
+            "{}.snapshot.",
+            restore_wal.file_name().unwrap().to_string_lossy()
+        )) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    let payload = {
+        let source = NativeGraph::new("upstream-source");
+        must_query(&source, "CREATE INDEX FOR (n:Migrated) ON (n.id)")?;
+        must_query(&source, "CREATE FULLTEXT INDEX FOR (n:Migrated) ON (n.name)")?;
+        must_query(
+            &source,
+            "CREATE (:Migrated {id:7,name:'portable falkordb payload'})",
+        )?;
+        source.mutate_constraint(
+            true,
+            ConstraintType::Unique,
+            EntityType::Node,
+            "Migrated",
+            &["id".to_string()],
+        )?;
+        source.export_falkordb_v19_payload()
+    };
+
+    {
+        let restored = NativeGraph::restore_falkordb_v19_payload(
+            "upstream-import",
+            &restore_wal,
+            &payload,
+        )?;
+        let out = must_query(
+            &restored,
+            "MATCH (n:Migrated) WHERE n.id = 7 RETURN n.name",
+        )?;
+        require_contains(&out, "portable falkordb payload", "upstream range-index import")?;
+
+        let out = must_query(
+            &restored,
+            "CALL db.idx.fulltext.queryNodes('Migrated','portable') YIELD node RETURN node.id",
+        )?;
+        require_contains(&out, "7", "upstream fulltext import")?;
+
+        if restored
+            .query("CREATE (:Migrated {id:7,name:'duplicate'})")
+            .is_ok()
+        {
+            return Err("upstream-restored UNIQUE constraint accepted duplicate id".to_string());
+        }
+
+        must_query(
+            &restored,
+            "CREATE (:Migrated {id:8,name:'native wal after import'})",
+        )?;
+    }
+
+    {
+        let reopened = NativeGraph::open_persistent("upstream-import", &restore_wal)?;
+        let out = must_query(
+            &reopened,
+            "MATCH (n:Migrated) RETURN n.id ORDER BY n.id",
+        )?;
+        if out.rows.len() != 2 {
+            return Err(format!(
+                "upstream payload -> native WAL restart expected 2 rows, got {:?}",
+                out.rows
+            ));
+        }
+        require_contains(&out, "7", "imported upstream row after native restart")?;
+        require_contains(&out, "8", "post-import native WAL row after restart")?;
+    }
+
+    let _ = std::fs::remove_file(&restore_wal);
+    for entry in std::fs::read_dir(std::env::temp_dir())
+        .map_err(|e| format!("scan temp dir for restore cleanup: {e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!(
+            "{}.snapshot.",
+            restore_wal.file_name().unwrap().to_string_lossy()
+        )) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    println!("NATIVE_FALKORDB_V19_RESTORE_PASS");
     Ok(())
 }

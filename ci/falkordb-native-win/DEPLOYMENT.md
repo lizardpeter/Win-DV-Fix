@@ -22,13 +22,16 @@ falkordb-native-windows-x64\
   imports\
   exports\
   migration\
+  cache\
+  config\
+  profile\                # package-local HOME/USERPROFILE/AppData
   python\                 # embedded migration runtime + packages
   ...migration/documentation files...
 ```
 
 `start-local.ps1` enables `--portable`, roots the graph catalog at
-`.\data`, and redirects process/Python temporary and cache locations beneath
-this same folder. Portable mode rejects absolute data/TLS paths and any path
+`.\data`, and redirects process/Python temporary, cache, config, HOME,
+USERPROFILE, APPDATA, LOCALAPPDATA, and XDG locations beneath this same folder. Portable mode rejects absolute data/TLS paths and any path
 containing `..` so runtime files cannot escape the package directory.
 
 The folder can therefore be moved as a unit. There is no application data

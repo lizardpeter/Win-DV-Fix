@@ -24,7 +24,7 @@ from falkordb import FalkorDB
 from redis import Redis
 from redis.exceptions import ResponseError
 
-from migrate_current_falkordb import parse_udf_rows
+from migrate_current_falkordb import parse_udf_rows, portable_local_path
 
 RDB_OPCODE_SLOT_INFO = 244
 RDB_OPCODE_FUNCTION2 = 245
@@ -592,12 +592,24 @@ def endpoint_kwargs(args) -> dict:
     }
     if args.destination_ssl:
         if args.destination_ca:
-            kwargs["ssl_ca_certs"] = args.destination_ca
+            kwargs["ssl_ca_certs"] = portable_local_path(
+                args.destination_ca,
+                "--destination-ca",
+                must_exist=True,
+            )
             kwargs["ssl_cert_reqs"] = "required"
         if args.destination_cert:
-            kwargs["ssl_certfile"] = args.destination_cert
+            kwargs["ssl_certfile"] = portable_local_path(
+                args.destination_cert,
+                "--destination-cert",
+                must_exist=True,
+            )
         if args.destination_key:
-            kwargs["ssl_keyfile"] = args.destination_key
+            kwargs["ssl_keyfile"] = portable_local_path(
+                args.destination_key,
+                "--destination-key",
+                must_exist=True,
+            )
     return kwargs
 
 
@@ -609,7 +621,10 @@ def falkor_kwargs(args) -> dict:
 
 
 def import_rdb(args) -> None:
-    parsed = parse_rdb(args.rdb)
+    rdb_path = Path(
+        portable_local_path(args.rdb, "--rdb", must_exist=True)
+    )
+    parsed = parse_rdb(rdb_path)
     print(
         f"parsed Redis RDB v{parsed.version}: "
         f"{len(parsed.graphs)} graph(s), {len(parsed.udfs)} UDF library/libraries"
@@ -713,7 +728,10 @@ def import_rdb(args) -> None:
 
 
 def inspect_rdb(args) -> None:
-    parsed = parse_rdb(args.rdb)
+    rdb_path = Path(
+        portable_local_path(args.rdb, "--rdb", must_exist=True)
+    )
+    parsed = parse_rdb(rdb_path)
     print(f"Redis RDB version: {parsed.version}")
     for name, fragments in parsed.graphs.items():
         header = parsed.headers[name]

@@ -232,13 +232,16 @@ def verify(args) -> None:
             pass
 
         # Prove that deleted-ID bookkeeping did not corrupt allocation after
-        # import. Only mutate during the first verification; restart mode then
-        # proves this native post-import write is durable too.
-        if not args.skip_restore:
-            graph.query("CREATE (:AfterDelete {v:1})")
+        # import. Keep this idempotent so a native-generated round-trip DUMP can
+        # be restored into upstream and checked by the same verifier.
         after_delete = graph.query(
             "MATCH (n:AfterDelete) RETURN count(n)"
         ).result_set
+        if after_delete == [[0]] and not args.skip_restore:
+            graph.query("CREATE (:AfterDelete {v:1})")
+            after_delete = graph.query(
+                "MATCH (n:AfterDelete) RETURN count(n)"
+            ).result_set
         assert after_delete == [[1]], after_delete
 
         if args.roundtrip_output is not None:

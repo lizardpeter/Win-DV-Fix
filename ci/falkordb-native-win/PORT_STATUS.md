@@ -46,6 +46,11 @@ Verified Windows CI run:
 - [x] Remote range/full-text index usage
 - [x] Server-process restart + official-client recovery
 - [x] Recovery for indexes created after existing data
+- [x] Current FalkorDB Redis DUMP / RESTORE migration compatibility
+- [x] Whole-database live migration with graph/UDF verification and rollback
+- [x] Portable offline migration bundle with hashes and semantic verification
+- [x] Official FalkorDB-generated DUMP import + hard-restart verification
+- [x] Deployable Windows ZIP packaging
 
 ## Not required in standalone mode
 
@@ -59,15 +64,15 @@ Verified Windows CI run:
 
 ## Remaining engineering, not feasibility blockers
 
-- [ ] compact snapshot/checkpoint format to cap WAL replay time
-- [ ] WAL rotation/compaction
+- [x] compact snapshot/checkpoint format to cap WAL replay time
+- [x] WAL rotation/compaction
 - [ ] crash-injection test matrix
 - [ ] long-running concurrency/stress suite
 - [ ] index performance tuning
 - [ ] vector index acceleration beyond correctness-first backend
 - [ ] full-text ranking/tokenization parity tuning if exact upstream behavior is required
-- [ ] installer/service/library packaging
-- [ ] optional direct TLS listener (use private network/VPN meanwhile)
+- [ ] installer/service registration (portable ZIP packaging is complete)
+- [x] direct TLS listener and optional mTLS
 - [ ] CAS artifact store
 - [ ] universal reversal graph schema/migrations
 - [ ] benchmark native backend vs original Redis/RediSearch deployment

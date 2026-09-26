@@ -162,6 +162,27 @@ print(graph.query("MATCH (n:Project) RETURN n.name").result_set)
 
 The server refuses an unauthenticated non-loopback bind by default. Remote deployment now supports TLS directly, including mutual TLS for the FalkorDB/RESP listener. The verified CI path requires a trusted client certificate plus Redis-style AUTH. A separate HTTPS JSON API with Bearer-token read-only/read-write scopes is available for ChatGPT/tool access.
 
+## Migration from an existing FalkorDB
+
+The native host preserves current FalkorDB graph data without rebuilding every
+node and relationship through Cypher. Three migration paths are supported:
+
+1. **Live server-to-server** — `migrate_current_falkordb.py` enumerates all
+   graphs, transfers their native Redis/FalkorDB DUMP bytes, verifies graph
+   data/schema/index/constraint signatures, migrates UDF libraries, and rolls
+   back a failed replacement.
+2. **Portable offline bundle** — `falkordb_bundle.py` exports graph DUMP
+   payloads, SHA-256 hashes, semantic signatures, and UDF source into one ZIP
+   that can be moved to a disconnected destination and verified on import.
+3. **Direct current `dump.rdb` import** — `import_falkordb_rdb.py` reads
+   FalkorDB v19 `graphdata` / `graphmeta` values directly from Redis RDB,
+   including graphs split across virtual keys, plus FalkorDB UDF module-AUX
+   data. Unsupported ordinary Redis data is rejected rather than silently
+   discarded.
+
+Imported graphs are converted once into the native checkpoint + WAL format.
+See `DEPLOYMENT.md` for commands and the exact fail-loud compatibility rules.
+
 ## Design direction for the reversal graph
 
 This backend is intended to host the universal reversal graph for T6, Destiny,

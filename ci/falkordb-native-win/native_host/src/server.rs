@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, QueryOutput, native_config, redis_dump, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, QueryOutput, native_config, redis_dump, snapshot, udf_store, wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -272,6 +272,7 @@ impl GraphCatalog {
             let wal = self.wal_path(destination);
             fs::remove_file(&wal)
                 .map_err(|e| format!("remove replaced graph WAL {}: {e}", wal.display()))?;
+            snapshot::remove_all_checkpoints(&wal)?;
         }
 
         let payload = redis_dump::extract_falkordb_v19_payload(dump)?;
@@ -301,6 +302,7 @@ impl GraphCatalog {
             fs::remove_file(&wal)
                 .map_err(|e| format!("delete graph WAL {}: {e}", wal.display()))?;
         }
+        snapshot::remove_all_checkpoints(&wal)?;
         Ok(true)
     }
 

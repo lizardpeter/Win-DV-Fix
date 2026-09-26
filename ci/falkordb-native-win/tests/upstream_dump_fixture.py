@@ -158,7 +158,8 @@ def verify(args) -> None:
             if reply not in (True, b"OK", "OK"):
                 raise RuntimeError(f"unexpected RESTORE reply: {reply!r}")
 
-        graph = db.select_graph(RESTORED)
+        target_name = args.graph_name or RESTORED
+        graph = db.select_graph(target_name)
 
         people = graph.query(
             "MATCH (n:Person) RETURN n.name,n.age ORDER BY n.name"
@@ -241,7 +242,7 @@ def verify(args) -> None:
         assert after_delete == [[1]], after_delete
 
         if args.roundtrip_output is not None:
-            roundtrip = raw.dump(RESTORED)
+            roundtrip = raw.dump(target_name)
             if not roundtrip:
                 raise RuntimeError("endpoint returned an empty round-trip DUMP payload")
             args.roundtrip_output.parent.mkdir(parents=True, exist_ok=True)
@@ -290,6 +291,10 @@ def main() -> None:
         "--roundtrip-output",
         type=Path,
         help="after verification, DUMP the restored graph to this path",
+    )
+    ver.add_argument(
+        "--graph-name",
+        help="query this existing graph name instead of the default restored name",
     )
 
     args = parser.parse_args()

@@ -120,6 +120,8 @@ New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
+$UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
+$UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
 $MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
@@ -196,6 +198,27 @@ try {
     $WriteText = (Get-Content (Join-Path $Logs "10_official_client_write.txt") -Raw)
     if ($WriteText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS") {
         throw "Official FalkorDB client did not prove mTLS write connectivity"
+    }
+
+    if (-not (Test-Path $UpstreamFixture)) {
+        throw "Official upstream FalkorDB DUMP artifact is missing: $UpstreamFixture"
+    }
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_dump_restore.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB DUMP restore verification failed with exit code $LASTEXITCODE"
+    }
+    $UpstreamRestoreText = (Get-Content (Join-Path $Logs "10_upstream_dump_restore.txt") -Raw)
+    if ($UpstreamRestoreText -notmatch "UPSTREAM_FALKORDB_DUMP_RESTORE_PASS") {
+        throw "Official upstream FalkorDB DUMP did not emit restore success marker"
     }
 
     python $ApiSmoke write 2>&1 |
@@ -301,6 +324,25 @@ try {
         throw "Official FalkorDB client did not prove mTLS restart connectivity"
     }
 
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_upstream_dump_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB DUMP restart verification failed with exit code $LASTEXITCODE"
+    }
+    $UpstreamRestartText = (Get-Content (Join-Path $Logs "11_upstream_dump_restart.txt") -Raw)
+    if ($UpstreamRestartText -notmatch "UPSTREAM_FALKORDB_DUMP_RESTART_PASS") {
+        throw "Official upstream FalkorDB DUMP did not survive native restart"
+    }
+
     python $ApiSmoke read 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "11_chatgpt_api_restart.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -323,4 +365,5 @@ Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
+Write-Host "NATIVE_WINDOWS_UPSTREAM_FALKORDB_DUMP_PASS"
 

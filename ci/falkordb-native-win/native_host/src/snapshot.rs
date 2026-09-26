@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     ffi::CString,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };

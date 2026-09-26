@@ -244,6 +244,38 @@ try {
     }
     Write-Host "NATIVE_RAW_FALKORDB_RDB_IMPORT_PASS"
 
+    # Prove raw dump.rdb durability before the general client smoke deliberately
+    # executes FLUSHDB as part of its clean-room setup.
+    Stop-Process -Id $Server.Id -Force
+    Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    $Server = $null
+    Start-Sleep -Milliseconds 300
+
+    $Server = Start-NativeServer "raw-rdb-restart"
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --target-graph upstream-real-fixture `
+        --verify-udf `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb immediate restart verification failed with exit code $LASTEXITCODE"
+    }
+    $RawRestartText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_restart.txt") -Raw)
+    if ($RawRestartText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS" -or
+        $RawRestartText -notmatch "UPSTREAM_FALKORDB_RAW_RDB_MULTIGRAPH_PASS") {
+        throw "Official upstream FalkorDB dump.rdb data/UDFs did not survive native restart"
+    }
+    Write-Host "NATIVE_RAW_FALKORDB_RDB_RESTART_PASS"
+
     python $ClientSmoke write 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "10_official_client_write.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -424,28 +456,6 @@ try {
     Start-Sleep -Milliseconds 300
 
     $Server = Start-NativeServer "restart"
-
-    python $UpstreamFixtureTest verify `
-        --input $UpstreamFixture `
-        --skip-restore `
-        --target-graph upstream-real-fixture `
-        --verify-udf `
-        --host localhost `
-        --port 6391 `
-        --password native-ci-secret `
-        --ssl `
-        --ca (Join-Path $TlsDir "ca.pem") `
-        --cert (Join-Path $TlsDir "client-cert.pem") `
-        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
-        Tee-Object -FilePath (Join-Path $Logs "11_upstream_raw_rdb_restart.txt")
-    if ($LASTEXITCODE -ne 0) {
-        throw "Official upstream FalkorDB dump.rdb restart verification failed with exit code $LASTEXITCODE"
-    }
-    $RawRestartText = (Get-Content (Join-Path $Logs "11_upstream_raw_rdb_restart.txt") -Raw)
-    if ($RawRestartText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS") {
-        throw "Official upstream FalkorDB dump.rdb UDF did not survive native restart"
-    }
-    Write-Host "NATIVE_RAW_FALKORDB_RDB_RESTART_PASS"
 
     python $ClientSmoke read 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "11_official_client_restart.txt")

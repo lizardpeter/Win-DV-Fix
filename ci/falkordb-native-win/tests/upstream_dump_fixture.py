@@ -124,14 +124,15 @@ def verify(args) -> None:
     raw = redis_client(args)
     db = falkor_client(args)
     try:
-        try:
-            raw.execute_command("GRAPH.DELETE", RESTORED)
-        except ResponseError:
-            pass
+        if not args.skip_restore:
+            try:
+                raw.execute_command("GRAPH.DELETE", RESTORED)
+            except ResponseError:
+                pass
 
-        reply = raw.restore(RESTORED, 0, payload)
-        if reply not in (True, b"OK", "OK"):
-            raise RuntimeError(f"unexpected RESTORE reply: {reply!r}")
+            reply = raw.restore(RESTORED, 0, payload)
+            if reply not in (True, b"OK", "OK"):
+                raise RuntimeError(f"unexpected RESTORE reply: {reply!r}")
 
         graph = db.select_graph(RESTORED)
 
@@ -184,7 +185,10 @@ def verify(args) -> None:
         except ResponseError:
             pass
 
-        print("UPSTREAM_FALKORDB_DUMP_RESTORE_PASS")
+        if args.skip_restore:
+            print("UPSTREAM_FALKORDB_DUMP_RESTART_PASS")
+        else:
+            print("UPSTREAM_FALKORDB_DUMP_RESTORE_PASS")
     finally:
         db.close()
         raw.close()
@@ -211,6 +215,11 @@ def main() -> None:
     ver = sub.add_parser("verify")
     add_endpoint_args(ver)
     ver.add_argument("--input", type=Path, required=True)
+    ver.add_argument(
+        "--skip-restore",
+        action="store_true",
+        help="query an already-restored fixture, used after a hard server restart",
+    )
 
     args = parser.parse_args()
     if args.mode == "generate":

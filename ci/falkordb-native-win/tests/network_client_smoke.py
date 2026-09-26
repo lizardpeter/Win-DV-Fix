@@ -123,6 +123,14 @@ def phase_write():
     )
     original_types = graph.query(type_query).result_set
 
+    # Parallel relationships use FalkorDB's multi-edge tensor serialization,
+    # which is distinct from the ordinary single-edge relationship matrix.
+    graph.query(
+        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) "
+        "CREATE (a)-[:PARALLEL {slot:1}]->(b),"
+        "(a)-[:PARALLEL {slot:2}]->(b)"
+    )
+
     # Explain/profile are parsed into the official client's ExecutionPlan type.
     explain = graph.explain("MATCH (n:Person) RETURN n.name")
     assert explain.plan and len(explain.plan) > 0, explain.plan
@@ -245,6 +253,12 @@ def phase_write():
     restored_types = restored_graph.query(type_query).result_set
     assert restored_types == original_types, (original_types, restored_types)
 
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
+
     # Schema migration must preserve UNIQUE constraint enforcement, not just
     # graph data and indexes.
     try:
@@ -335,6 +349,12 @@ def phase_read():
     original_types = graph.query(type_query).result_set
     restored_types = restored_graph.query(type_query).result_set
     assert restored_types == original_types, (original_types, restored_types)
+
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
 
     restored_ft = restored_graph.query(
         "CALL db.idx.fulltext.queryNodes('Person','Alice') "

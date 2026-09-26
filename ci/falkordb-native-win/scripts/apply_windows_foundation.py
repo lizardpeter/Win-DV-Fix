@@ -92,6 +92,48 @@ def patch_graphblas_matrix():
 
     p.write_text(s, encoding="utf-8")
 
+def patch_udf_js_state_drop_order():
+    """Keep QuickJS Runtime alive until Context/Persistent values are dropped.
+
+    Rust drops struct fields in declaration order. Upstream ThreadJsState
+    declared Runtime first, so a connection-thread exit could destroy QuickJS
+    while Context and Persistent<Function> objects still referenced it,
+    triggering QuickJS' gc_obj_list assertion. The explicit rebuild path
+    already drops functions -> context -> runtime; make automatic TLS teardown
+    use the same order.
+    """
+    p = root / "graph/src/udf/js_context.rs"
+    s = p.read_text(encoding="utf-8")
+
+    old = '''struct ThreadJsState {
+    runtime: JsRuntime,
+    context: Context,
+    /// Cached function references: "lib.func" -> persistent JS function
+    functions: HashMap<String, Persistent<Function<'static>>>,
+    /// Version of the UdfRepo when this context was last rebuilt.
+    version: u64,
+}'''
+    new = '''struct ThreadJsState {
+    /// Cached function references must be dropped before their Context.
+    functions: HashMap<String, Persistent<Function<'static>>>,
+    /// The Context must be dropped before the Runtime that owns it.
+    context: Context,
+    /// Keep the QuickJS runtime last so thread-local destruction cannot free it
+    /// while Context/Persistent values are still alive.
+    runtime: JsRuntime,
+    /// Version of the UdfRepo when this context was last rebuilt.
+    version: u64,
+}'''
+
+    if new in s:
+        return
+    if old not in s:
+        raise RuntimeError("graph/src/udf/js_context.rs: ThreadJsState layout not found")
+    s = s.replace(old, new, 1)
+    p.write_text(s, encoding="utf-8")
+    print("patched QuickJS thread-local destruction order")
+
+
 def install_native_index():
     source = Path(__file__).resolve().parent.parent / "patches" / "native_index_mod.rs"
     if not source.exists():
@@ -198,5 +240,6 @@ patch_module_init()
 patch_graphblas_bindings()
 patch_graphblas_matrix()
 patch_graph_build()
+patch_udf_js_state_drop_order()
 install_native_index()
 print("Windows foundation patches applied")

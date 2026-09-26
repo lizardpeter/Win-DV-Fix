@@ -6,12 +6,14 @@ import sys
 from falkordb import FalkorDB
 from falkordb.node import Node
 from falkordb.edge import Edge
+from redis import Redis
 from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 
 HOST = "localhost"
 PORT = 6391
 PASSWORD = "native-ci-secret"
 GRAPH = "network-official-client"
+REDIS_RESTORED_GRAPH = "network-redis-dump-restored"
 
 TLS_DIR = pathlib.Path(
     os.environ.get("FALKORDB_TEST_TLS_DIR", "")
@@ -155,6 +157,35 @@ def phase_write():
     )
     assert result.result_set == [["Alice"]], result.result_set
 
+    # Standard Redis DUMP/RESTORE compatibility is the migration bridge for
+    # an existing FalkorDB deployment. Redis MIGRATE emits the same RESTORE
+    # request after serializing the graph module key with DUMP.
+    raw = Redis(
+        host=HOST,
+        port=PORT,
+        password=PASSWORD,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        protocol=2,
+        decode_responses=False,
+        **tls_kwargs(with_client_cert=True),
+    )
+    dump_payload = raw.dump(GRAPH)
+    assert dump_payload and len(dump_payload) > 10
+    assert raw.restore(REDIS_RESTORED_GRAPH, 0, dump_payload) is True
+    restored_graph = db.select_graph(REDIS_RESTORED_GRAPH)
+    restored = restored_graph.query(
+        "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) "
+        "RETURN a.age, r.since, b.age"
+    )
+    assert restored.result_set == [[40, 2026, 30]], restored.result_set
+    restored_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
+    raw.close()
+
     # Read-only command must work for reads and reject writes.
     result = graph.ro_query("MATCH (n:Person) RETURN count(n)")
     assert result.result_set == [[2]], result.result_set
@@ -181,6 +212,7 @@ def phase_write():
     assert GRAPH in names, names
     db.close()
     print("OFFICIAL_FALKORDB_CLIENT_UDF_WRITE_PASS")
+    print("NATIVE_REDIS_DUMP_RESTORE_MIGRATION_PASS")
     print("OFFICIAL_FALKORDB_CLIENT_WRITE_PASS")
     if TLS_DIR is not None:
         print("OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS")
@@ -210,6 +242,12 @@ def phase_read():
     clone_result = clone.query("MATCH (n:Person) RETURN count(n)")
     assert clone_result.result_set == [[2]], clone_result.result_set
 
+    restored_graph = db.select_graph(REDIS_RESTORED_GRAPH)
+    restored_result = restored_graph.query(
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name"
+    )
+    assert restored_result.result_set == [["Alice"], ["Bob"]], restored_result.result_set
+
     result = graph.query(
         "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"
     )
@@ -231,6 +269,7 @@ def phase_read():
     assert GRAPH in db.list_graphs()
     db.close()
     print("OFFICIAL_FALKORDB_CLIENT_UDF_RESTART_PASS")
+    print("NATIVE_REDIS_DUMP_RESTORE_RESTART_PASS")
     print("OFFICIAL_FALKORDB_CLIENT_RESTART_PASS")
     if TLS_DIR is not None:
         print("OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS")

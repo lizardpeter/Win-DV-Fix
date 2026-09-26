@@ -24,6 +24,8 @@ from falkordb import FalkorDB
 from redis import Redis
 from redis.exceptions import ResponseError
 
+from migrate_current_falkordb import parse_udf_rows
+
 RDB_OPCODE_SLOT_INFO = 244
 RDB_OPCODE_FUNCTION2 = 245
 RDB_OPCODE_FUNCTION_PRE_GA = 246
@@ -423,6 +425,7 @@ def parse_rdb(path: Path) -> ParsedRdb:
     headers: dict[str, GraphHeader] = {}
     udfs: dict[str, str] = {}
     current_db = 0
+    pending_expire = False
 
     while True:
         record_type = reader.u8()
@@ -448,9 +451,11 @@ def parse_rdb(path: Path) -> ParsedRdb:
             continue
         if record_type == RDB_OPCODE_EXPIRETIME_MS:
             reader.read(8)
+            pending_expire = True
             continue
         if record_type == RDB_OPCODE_EXPIRETIME:
             reader.read(4)
+            pending_expire = True
             continue
         if record_type == RDB_OPCODE_IDLE:
             reader.read_len()
@@ -489,6 +494,12 @@ def parse_rdb(path: Path) -> ParsedRdb:
         # Key-value record: the type byte is followed by key then value.
         key = reader.string()
         key_text = key.decode("utf-8", errors="replace")
+
+        if pending_expire:
+            raise ValueError(
+                f"RDB graph/key {key_text!r} has an expiration; the native "
+                "graph catalog does not preserve Redis key TTL semantics"
+            )
 
         if current_db != 0:
             raise ValueError(
@@ -551,6 +562,7 @@ def parse_rdb(path: Path) -> ParsedRdb:
                     f"inconsistent RDB fragment header for graph {header.name!r}"
                 )
         graphs[header.name].append(payload)
+        pending_expire = False
 
     for name, fragments in graphs.items():
         expected = headers[name].key_count
@@ -657,12 +669,9 @@ def import_rdb(args) -> None:
                     f"verified {name!r}: nodes={nodes}, relationships={edges}"
                 )
 
+            imported_udfs: list[str] = []
             if not args.skip_udfs:
-                existing_udfs = {
-                    str(row[1].decode() if isinstance(row[1], bytes) else row[1])
-                    for row in db.udf_list(with_code=True)
-                    if len(row) >= 2
-                }
+                existing_udfs = set(parse_udf_rows(db.udf_list(with_code=True)))
                 conflicts = sorted(set(parsed.udfs) & existing_udfs)
                 if conflicts:
                     raise RuntimeError(
@@ -671,11 +680,22 @@ def import_rdb(args) -> None:
                     )
                 for name, script in parsed.udfs.items():
                     db.udf_load(name, script, False)
-                    print(f"restored UDF library {name!r}")
+                    verified = parse_udf_rows(db.udf_list(name, with_code=True))
+                    if verified.get(name) != script:
+                        raise RuntimeError(
+                            f"restored UDF library {name!r} source did not match RDB"
+                        )
+                    imported_udfs.append(name)
+                    print(f"restored and verified UDF library {name!r}")
 
         except Exception:
-            # Raw import is non-destructive. Remove graphs created by this run
-            # if a later graph/UDF verification fails.
+            # Raw import is non-destructive. Remove UDFs and graphs created by
+            # this run if a later verification step fails.
+            for name in reversed(locals().get("imported_udfs", [])):
+                try:
+                    db.udf_delete(name)
+                except Exception:
+                    pass
             for name in reversed(imported):
                 try:
                     raw.execute_command("GRAPH.DELETE", name)

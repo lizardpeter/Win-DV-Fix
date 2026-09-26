@@ -179,7 +179,8 @@ def phase_write():
     )
     dump_payload = raw.dump(GRAPH)
     assert dump_payload and len(dump_payload) > 10
-    assert raw.restore(REDIS_RESTORED_GRAPH, 0, dump_payload) is True
+    restore_reply = raw.restore(REDIS_RESTORED_GRAPH, 0, dump_payload)
+    assert restore_reply in (True, b"OK", "OK"), restore_reply
     restored_graph = db.select_graph(REDIS_RESTORED_GRAPH)
     restored = restored_graph.query(
         "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) "

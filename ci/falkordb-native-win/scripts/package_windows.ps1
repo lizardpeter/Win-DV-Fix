@@ -31,6 +31,59 @@ Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
 Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
 
+# Bundle an official embeddable Python runtime plus all migration dependencies
+# so helper tools do not use a machine-wide Python installation.
+$PythonVersion = "3.12.10"
+$PythonDir = Join-Path $Stage "python"
+$PythonEmbedZip = Join-Path $Stage "tmp\python-$PythonVersion-embed-amd64.zip"
+$PythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
+$SitePackages = Join-Path $PythonDir "Lib\site-packages"
+
+New-Item -ItemType Directory -Force -Path (Split-Path $PythonEmbedZip -Parent) | Out-Null
+New-Item -ItemType Directory -Force -Path $PythonDir | Out-Null
+Invoke-WebRequest -UseBasicParsing -Uri $PythonUrl -OutFile $PythonEmbedZip
+Expand-Archive -Path $PythonEmbedZip -DestinationPath $PythonDir -Force
+Remove-Item -Force $PythonEmbedZip
+
+$Pth = Join-Path $PythonDir "python312._pth"
+@'
+python312.zip
+.
+..
+Lib\site-packages
+import site
+'@ | Set-Content -Encoding ASCII $Pth
+
+New-Item -ItemType Directory -Force -Path $SitePackages | Out-Null
+$OldPipCache = $env:PIP_CACHE_DIR
+$env:PIP_CACHE_DIR = Join-Path $Stage "tmp\pip-cache"
+try {
+    python -m pip install --disable-pip-version-check --no-compile --target $SitePackages -r (Join-Path $Root "requirements-migration.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to populate embedded migration Python runtime"
+    }
+} finally {
+    if ($null -eq $OldPipCache) {
+        Remove-Item Env:PIP_CACHE_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:PIP_CACHE_DIR = $OldPipCache
+    }
+    Remove-Item -Recurse -Force (Join-Path $Stage "tmp\pip-cache") -ErrorAction SilentlyContinue
+}
+
+$EmbeddedPython = Join-Path $PythonDir "python.exe"
+if (-not (Test-Path $EmbeddedPython)) {
+    throw "Embedded Python runtime was not produced: $EmbeddedPython"
+}
+& $EmbeddedPython -c "import redis, falkordb; print('NATIVE_EMBEDDED_MIGRATION_PYTHON_PASS')"
+if ($LASTEXITCODE -ne 0) {
+    throw "Embedded migration Python failed to import packaged dependencies"
+}
+& $EmbeddedPython (Join-Path $Stage "import_falkordb_rdb.py") --help | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Embedded migration Python failed to execute packaged importer"
+}
+
 @'
 param()
 
@@ -79,12 +132,9 @@ param(
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\portable-env.ps1"
 
-$Python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $Python) {
-    $Python = Get-Command py -ErrorAction SilentlyContinue
-}
-if (-not $Python) {
-    throw "Python is required only for migration helper tools. The database server itself does not require Python."
+$Python = Join-Path $PSScriptRoot "python\python.exe"
+if (-not (Test-Path $Python)) {
+    throw "Bundled migration Python runtime is missing: $Python"
 }
 
 $Script = switch ($Tool) {
@@ -93,7 +143,7 @@ $Script = switch ($Tool) {
     "import-rdb"   { "import_falkordb_rdb.py" }
 }
 
-& $Python.Source (Join-Path $PSScriptRoot $Script) @Arguments
+& $Python (Join-Path $PSScriptRoot $Script) @Arguments
 exit $LASTEXITCODE
 '@ | Set-Content -Encoding UTF8 (Join-Path $Stage "run-tool.ps1")
 
@@ -189,6 +239,7 @@ server.exe sha256 $Hash
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 
+Write-Host "NATIVE_WINDOWS_EMBEDDED_MIGRATION_RUNTIME_PASS"
 Write-Host "NATIVE_WINDOWS_PORTABLE_EXTERNAL_CWD_PASS"
 Write-Host "NATIVE_WINDOWS_STATIC_RUNTIME_AUDIT_PASS"
 Write-Host "NATIVE_WINDOWS_PORTABLE_CONFINEMENT_PASS"

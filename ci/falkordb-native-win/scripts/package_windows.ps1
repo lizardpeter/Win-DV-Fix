@@ -60,24 +60,23 @@ if (-not (Test-Path $EmbeddedPython)) {
     throw "Embedded Python runtime was not produced: $EmbeddedPython"
 }
 
-# Bootstrap and run pip with the embedded interpreter itself so native wheels
-# are resolved for CPython 3.12, not for whichever Python happens to be on the
-# build runner.
-$GetPip = Join-Path $Stage "tmp\get-pip.py"
-Invoke-WebRequest -UseBasicParsing -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $GetPip
+# Resolve migration dependencies explicitly for the embedded CPython 3.12
+# Windows x64 ABI at build time. The final package does not need pip.
 $OldPipCache = $env:PIP_CACHE_DIR
 $env:PIP_CACHE_DIR = Join-Path $Stage "tmp\pip-cache"
 try {
-    & $EmbeddedPython $GetPip --disable-pip-version-check --no-warn-script-location
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to bootstrap pip in embedded migration Python"
-    }
-    & $EmbeddedPython -m pip install --disable-pip-version-check --no-compile -r (Join-Path $Root "requirements-migration.txt")
+    python -m pip install --disable-pip-version-check --no-compile `
+        --target $SitePackages `
+        --platform win_amd64 `
+        --python-version 3.12 `
+        --implementation cp `
+        --abi cp312 `
+        --only-binary=:all: `
+        -r (Join-Path $Root "requirements-migration.txt")
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to populate embedded migration Python runtime"
     }
 } finally {
-    Remove-Item -Force $GetPip -ErrorAction SilentlyContinue
     if ($null -eq $OldPipCache) {
         Remove-Item Env:PIP_CACHE_DIR -ErrorAction SilentlyContinue
     } else {

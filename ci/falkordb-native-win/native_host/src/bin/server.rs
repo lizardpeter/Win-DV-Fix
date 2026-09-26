@@ -1,7 +1,7 @@
 use std::{
     env,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::Arc,
     thread,
 };
@@ -14,10 +14,70 @@ use falkordb_native_host::{
     server::{GraphCatalog, ServerConfig, TlsConfig, serve_with_catalog},
 };
 
+fn executable_root() -> Result<PathBuf, String> {
+    let exe = env::current_exe()
+        .map_err(|e| format!("resolve executable path: {e}"))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| format!("executable has no parent directory: {}", exe.display()))?;
+    parent
+        .canonicalize()
+        .map_err(|e| format!("canonicalize executable directory {}: {e}", parent.display()))
+}
+
+fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<PathBuf, String> {
+    let raw = raw.as_ref();
+    if raw.is_absolute() {
+        return Err(format!(
+            "{label} must be relative in --portable mode; all runtime files must remain below {}",
+            root.display()
+        ));
+    }
+    if raw.components().any(|component| matches!(
+        component,
+        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+    )) {
+        return Err(format!(
+            "{label} may not escape the executable folder in --portable mode: {}",
+            raw.display()
+        ));
+    }
+    Ok(root.join(raw))
+}
+
+fn portable_enabled_from_env() -> bool {
+    env::var("FALKORDB_PORTABLE")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+        })
+}
+
 fn main() -> Result<(), String> {
     let _engine = Engine::init()?;
 
+    let cli_args: Vec<String> = env::args().skip(1).collect();
+    let portable = portable_enabled_from_env()
+        || cli_args.iter().any(|arg| arg == "--portable");
+    let portable_root = portable.then(executable_root).transpose()?;
+
     let mut config = ServerConfig::default();
+    if let Some(root) = &portable_root {
+        config.data_dir = root.join("data");
+    }
+    if let Ok(data_dir) = env::var("FALKORDB_DATA_DIR") {
+        if !data_dir.is_empty() {
+            config.data_dir = if let Some(root) = &portable_root {
+                portable_path(root, data_dir, "FALKORDB_DATA_DIR")?
+            } else {
+                PathBuf::from(data_dir)
+            };
+        }
+    }
     if let Ok(password) = env::var("FALKORDB_PASSWORD") {
         if !password.is_empty() {
             config.password = Some(password);
@@ -29,10 +89,23 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let mut tls_cert: Option<PathBuf> = env::var_os("FALKORDB_TLS_CERT").map(PathBuf::from);
-    let mut tls_key: Option<PathBuf> = env::var_os("FALKORDB_TLS_KEY").map(PathBuf::from);
-    let mut tls_client_ca: Option<PathBuf> =
-        env::var_os("FALKORDB_TLS_CLIENT_CA").map(PathBuf::from);
+    let resolve_env_path = |name: &str| -> Result<Option<PathBuf>, String> {
+        let Some(value) = env::var_os(name) else {
+            return Ok(None);
+        };
+        if value.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(if let Some(root) = &portable_root {
+            portable_path(root, PathBuf::from(value), name)?
+        } else {
+            PathBuf::from(value)
+        }))
+    };
+
+    let mut tls_cert = resolve_env_path("FALKORDB_TLS_CERT")?;
+    let mut tls_key = resolve_env_path("FALKORDB_TLS_KEY")?;
+    let mut tls_client_ca = resolve_env_path("FALKORDB_TLS_CLIENT_CA")?;
 
     let mut api_bind: Option<SocketAddr> = env::var("FALKORDB_API_BIND")
         .ok()
@@ -65,7 +138,7 @@ fn main() -> Result<(), String> {
         api_bind = Some("127.0.0.1:8443".parse().expect("valid default API bind"));
     }
 
-    let mut args = env::args().skip(1);
+    let mut args = cli_args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => {
@@ -79,9 +152,14 @@ fn main() -> Result<(), String> {
                 let port = value.parse::<u16>().map_err(|e| format!("invalid --port: {e}"))?;
                 config.bind.set_port(port);
             }
+            "--portable" => {}
             "--data-dir" => {
                 let value = args.next().ok_or_else(|| "--data-dir requires a path".to_string())?;
-                config.data_dir = PathBuf::from(value);
+                config.data_dir = if let Some(root) = &portable_root {
+                    portable_path(root, value, "--data-dir")?
+                } else {
+                    PathBuf::from(value)
+                };
             }
             "--username" => {
                 config.username = args.next().ok_or_else(|| "--username requires a value".to_string())?;
@@ -90,19 +168,28 @@ fn main() -> Result<(), String> {
                 config.password = Some(args.next().ok_or_else(|| "--password requires a value".to_string())?);
             }
             "--tls-cert" => {
-                tls_cert = Some(PathBuf::from(
-                    args.next().ok_or_else(|| "--tls-cert requires a PEM path".to_string())?,
-                ));
+                let value = args.next().ok_or_else(|| "--tls-cert requires a PEM path".to_string())?;
+                tls_cert = Some(if let Some(root) = &portable_root {
+                    portable_path(root, value, "--tls-cert")?
+                } else {
+                    PathBuf::from(value)
+                });
             }
             "--tls-key" => {
-                tls_key = Some(PathBuf::from(
-                    args.next().ok_or_else(|| "--tls-key requires a PEM path".to_string())?,
-                ));
+                let value = args.next().ok_or_else(|| "--tls-key requires a PEM path".to_string())?;
+                tls_key = Some(if let Some(root) = &portable_root {
+                    portable_path(root, value, "--tls-key")?
+                } else {
+                    PathBuf::from(value)
+                });
             }
             "--tls-client-ca" => {
-                tls_client_ca = Some(PathBuf::from(
-                    args.next().ok_or_else(|| "--tls-client-ca requires a PEM path".to_string())?,
-                ));
+                let value = args.next().ok_or_else(|| "--tls-client-ca requires a PEM path".to_string())?;
+                tls_client_ca = Some(if let Some(root) = &portable_root {
+                    portable_path(root, value, "--tls-client-ca")?
+                } else {
+                    PathBuf::from(value)
+                });
             }
             "--allow-plaintext-remote" => {
                 config.allow_plaintext_remote = true;
@@ -150,10 +237,18 @@ fn main() -> Result<(), String> {
 USAGE:
   falkordb-native-server [OPTIONS]
 
+PORTABLE OPTIONS:
+  --portable                       Keep runtime state under the server.exe folder.
+                                   Relative data/TLS paths are rooted there and
+                                   external/parent paths are rejected.
+                                   Env: FALKORDB_PORTABLE=1
+
 RESP/FalkorDB OPTIONS:
   --bind HOST:PORT                 RESP bind address (default 127.0.0.1:6379)
   --port PORT                      Override RESP port
   --data-dir PATH                  Persistent graph data directory
+                                   (portable default: .\data)
+                                   Env: FALKORDB_DATA_DIR
   --username USER                  RESP AUTH username (default: default)
   --password PASSWORD              RESP AUTH password (or FALKORDB_PASSWORD)
   --tls-cert PATH                  PEM server certificate/chain (or FALKORDB_TLS_CERT)

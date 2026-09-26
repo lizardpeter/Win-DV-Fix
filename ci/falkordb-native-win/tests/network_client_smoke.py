@@ -9,9 +9,9 @@ from falkordb.edge import Edge
 from redis import Redis
 from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 
-HOST = "localhost"
-PORT = 6391
-PASSWORD = "native-ci-secret"
+HOST = os.environ.get("FALKORDB_TEST_HOST", "localhost")
+PORT = int(os.environ.get("FALKORDB_TEST_PORT", "6391"))
+PASSWORD = os.environ.get("FALKORDB_TEST_PASSWORD", "native-ci-secret")
 GRAPH = "network-official-client"
 REDIS_RESTORED_GRAPH = "network-redis-dump-restored"
 

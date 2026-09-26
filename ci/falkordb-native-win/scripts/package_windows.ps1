@@ -24,6 +24,7 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 Copy-Item -Force $ServerExe (Join-Path $Stage "server.exe")
 Copy-Item -Force (Join-Path $Root "scripts\migrate_current_falkordb.py") (Join-Path $Stage "migrate_current_falkordb.py")
+Copy-Item -Force (Join-Path $Root "scripts\falkordb_bundle.py") (Join-Path $Stage "falkordb_bundle.py")
 Copy-Item -Force (Join-Path $Root "requirements-migration.txt") (Join-Path $Stage "requirements-migration.txt")
 Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")

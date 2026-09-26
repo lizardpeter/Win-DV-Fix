@@ -6,16 +6,12 @@ This directory contains the native Windows standalone FalkorDB-derived graph bac
 
 **Verified working on native Windows/MSVC without Redis, Memurai, WSL, Docker, Hyper-V, or a VM.**
 
-Current verified Windows CI evidence:
-
-- Workflow run: `36198470377`
-- Verified network-capable commit: `833eb680b2335feca473e448a8f845ce699e6100`
-- Standalone marker: `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
-- Official-client write marker: `OFFICIAL_FALKORDB_CLIENT_WRITE_PASS`
-- Official-client restart marker: `OFFICIAL_FALKORDB_CLIENT_RESTART_PASS`
-- Final network marker: `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
-- mTLS marker: `NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS`
-- ChatGPT HTTPS API marker: `NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS`
+Verification is tied to the exact packaged commit. The deployment ZIP includes
+`BUILD_INFO.txt`; the FalkorDB native Windows workflow for that commit must
+complete successfully. Its end-to-end gates cover standalone execution,
+official-client write/restart, TLS/mTLS, ChatGPT HTTPS API, whole-database
+migration, offline bundle migration, official upstream DUMP import, and (when
+enabled by the commit) direct current `dump.rdb` import.
 
 The successful run compiled the FalkorDB `graph` crate and the native host with
 `FALKORDB_SKIP_REDISEARCH=1`, passed the standalone Cypher/index/WAL suite,

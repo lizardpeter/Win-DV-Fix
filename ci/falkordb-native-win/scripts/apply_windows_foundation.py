@@ -134,6 +134,32 @@ def patch_udf_js_state_drop_order():
     print("patched QuickJS thread-local destruction order")
 
 
+def patch_upstream_time_decode_compat():
+    """Canonicalize FalkorDB TIME persistence to seconds since midnight.
+
+    Stable FalkorDB C releases serialize T_TIME as a time_t whose date anchor
+    may be 1900-01-01 or the current date. The Rust runtime models TIME as a
+    date-less clock value. Strip the implementation-specific date anchor at the
+    v19 serialization boundary.
+    """
+    p = root / "graph/src/runtime/value.rs"
+    s = p.read_text(encoding="utf-8")
+
+    old = "            si_type::T_TIME => Ok(Self::Time(r.read_signed()?)),"
+    new = """            si_type::T_TIME => {
+                let raw = r.read_signed()?;
+                Ok(Self::Time(raw.rem_euclid(86_400)))
+            }"""
+
+    if new in s:
+        return
+    if old not in s:
+        raise RuntimeError("graph/src/runtime/value.rs: T_TIME decoder not found")
+    s = s.replace(old, new, 1)
+    p.write_text(s, encoding="utf-8")
+    print("patched FalkorDB v19 TIME anchor normalization")
+
+
 def install_native_index():
     source = Path(__file__).resolve().parent.parent / "patches" / "native_index_mod.rs"
     if not source.exists():
@@ -241,5 +267,6 @@ patch_graphblas_bindings()
 patch_graphblas_matrix()
 patch_graph_build()
 patch_udf_js_state_drop_order()
+patch_upstream_time_decode_compat()
 install_native_index()
 print("Windows foundation patches applied")

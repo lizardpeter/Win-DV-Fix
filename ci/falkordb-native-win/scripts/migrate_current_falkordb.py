@@ -154,6 +154,29 @@ def verify_graph(source_db: FalkorDB, destination_db: FalkorDB, name: str) -> No
         )
 
 
+def rollback_graph(
+    destination: Redis,
+    raw_name,
+    name: str,
+    previous_dump: bytes | None,
+) -> None:
+    """Best-effort transactional rollback for one graph migration."""
+    try:
+        current_graphs = {
+            text(v) for v in destination.execute_command("GRAPH.LIST")
+        }
+        if previous_dump is not None:
+            destination.restore(raw_name, 0, previous_dump, replace=True)
+            print(f"rolled back previous destination graph {name!r}")
+        elif name in current_graphs:
+            destination.execute_command("GRAPH.DELETE", raw_name)
+            print(f"removed failed migrated graph {name!r}")
+    except Exception as rollback_exc:
+        raise RuntimeError(
+            f"migration failed for {name!r} and rollback also failed: {rollback_exc}"
+        ) from rollback_exc
+
+
 def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -> int:
     """Move process-global FalkorDB UDF libraries through the public API."""
     source = FalkorDB(**source_ep.falkor_kwargs())
@@ -235,6 +258,23 @@ def main() -> int:
             if payload is None:
                 raise RuntimeError(f"graph disappeared during migration: {name}")
 
+            destination_graphs_before = {
+                text(v) for v in destination.execute_command("GRAPH.LIST")
+            }
+            destination_had_graph = name in destination_graphs_before
+            if destination_had_graph and not args.replace:
+                raise RuntimeError(
+                    f"destination graph {name!r} already exists; rerun with --replace"
+                )
+
+            previous_dump = None
+            if destination_had_graph:
+                previous_dump = destination.dump(raw_name)
+                if previous_dump is None:
+                    raise RuntimeError(
+                        f"could not back up existing destination graph {name!r}"
+                    )
+
             print(f"migrating {name!r}: {len(payload):,} byte DUMP payload")
             try:
                 destination.restore(
@@ -243,17 +283,34 @@ def main() -> int:
                     payload,
                     replace=args.replace,
                 )
-            except ResponseError as exc:
-                raise RuntimeError(f"RESTORE failed for graph {name!r}: {exc}") from exc
 
-            # Verify the destination accepted it as a graph before moving on.
-            dest_graphs = {text(v) for v in destination.execute_command("GRAPH.LIST")}
-            if name not in dest_graphs:
-                raise RuntimeError(f"destination did not register restored graph {name!r}")
+                # Verify the destination accepted it as a graph before moving on.
+                dest_graphs = {
+                    text(v) for v in destination.execute_command("GRAPH.LIST")
+                }
+                if name not in dest_graphs:
+                    raise RuntimeError(
+                        f"destination did not register restored graph {name!r}"
+                    )
 
-            if not args.skip_verify:
-                verify_graph(source_db, destination_db, name)
-                print(f"verified {name!r}: data/schema/index/constraint signature matches")
+                if not args.skip_verify:
+                    verify_graph(source_db, destination_db, name)
+                    print(
+                        f"verified {name!r}: "
+                        "data/schema/index/constraint signature matches"
+                    )
+            except Exception as exc:
+                try:
+                    rollback_graph(destination, raw_name, name, previous_dump)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"{exc}; additionally, {rollback_exc}"
+                    ) from exc
+                if isinstance(exc, ResponseError):
+                    raise RuntimeError(
+                        f"RESTORE failed for graph {name!r}: {exc}"
+                    ) from exc
+                raise
 
         if not args.skip_udfs:
             moved_udfs = migrate_udfs(source_ep, destination_ep, args.replace)

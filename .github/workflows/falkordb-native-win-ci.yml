@@ -137,6 +137,13 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass
           & '.\ci\falkordb-native-win\scripts\diagnose.ps1'
 
+      - name: Upload native round-trip DUMP
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-falkordb-roundtrip-dump
+          path: ci/falkordb-native-win/build/upstream-fixture/native-roundtrip.dump
+          if-no-files-found: error
+
       - name: Save Rust build cache
         if: always() && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -154,3 +161,52 @@ jobs:
           name: falkordb-native-windows-diagnostics
           path: ci/falkordb-native-win/build/logs
           if-no-files-found: ignore
+
+  upstream-roundtrip:
+    needs: windows-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FalkorDB clients
+        run: python -m pip install --disable-pip-version-check --upgrade falkordb redis
+
+      - name: Download native-generated DUMP
+        uses: actions/download-artifact@v4
+        with:
+          name: native-falkordb-roundtrip-dump
+          path: ci/falkordb-native-win/build/native-roundtrip
+
+      - name: Restore native DUMP into official FalkorDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name upstream-falkordb-roundtrip -p 6379:6379 falkordb/falkordb-server:v4.20.6
+          trap 'docker logs upstream-falkordb-roundtrip || true; docker rm -f upstream-falkordb-roundtrip || true' EXIT
+          python - <<'PY'
+          import time
+          from redis import Redis
+          client = Redis(host="127.0.0.1", port=6379, socket_connect_timeout=1)
+          for _ in range(120):
+              try:
+                  if client.ping():
+                      break
+              except Exception:
+                  pass
+              time.sleep(0.25)
+          else:
+              raise SystemExit("official FalkorDB round-trip container did not become ready")
+          PY
+          python ci/falkordb-native-win/tests/upstream_dump_fixture.py verify \
+            --host 127.0.0.1 \
+            --port 6379 \
+            --input ci/falkordb-native-win/build/native-roundtrip/native-roundtrip.dump
+          echo NATIVE_DUMP_RESTORED_BY_UPSTREAM_FALKORDB_PASS

@@ -91,7 +91,9 @@ server.exe sha256 $Hash
 $Commit = (git -C $Root rev-parse HEAD).Trim()
 $RustVersion = (rustc -V).Trim()
 @"
+source_repository=https://github.com/lizardpeter/Win-DV-Fix
 commit=$Commit
+falkordb_upstream_commit=55204c94bb6c8bc1684ada3d712a61f73f324067
 rustc=$RustVersion
 server_sha256=$Hash
 "@ | Set-Content -Encoding ASCII (Join-Path $Stage "BUILD_INFO.txt")

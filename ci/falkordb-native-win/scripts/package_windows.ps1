@@ -55,14 +55,29 @@ import site
 '@ | Set-Content -Encoding ASCII $Pth
 
 New-Item -ItemType Directory -Force -Path $SitePackages | Out-Null
+$EmbeddedPython = Join-Path $PythonDir "python.exe"
+if (-not (Test-Path $EmbeddedPython)) {
+    throw "Embedded Python runtime was not produced: $EmbeddedPython"
+}
+
+# Bootstrap and run pip with the embedded interpreter itself so native wheels
+# are resolved for CPython 3.12, not for whichever Python happens to be on the
+# build runner.
+$GetPip = Join-Path $Stage "tmp\get-pip.py"
+Invoke-WebRequest -UseBasicParsing -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $GetPip
 $OldPipCache = $env:PIP_CACHE_DIR
 $env:PIP_CACHE_DIR = Join-Path $Stage "tmp\pip-cache"
 try {
-    python -m pip install --disable-pip-version-check --no-compile --target $SitePackages -r (Join-Path $Root "requirements-migration.txt")
+    & $EmbeddedPython $GetPip --disable-pip-version-check --no-warn-script-location
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to bootstrap pip in embedded migration Python"
+    }
+    & $EmbeddedPython -m pip install --disable-pip-version-check --no-compile -r (Join-Path $Root "requirements-migration.txt")
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to populate embedded migration Python runtime"
     }
 } finally {
+    Remove-Item -Force $GetPip -ErrorAction SilentlyContinue
     if ($null -eq $OldPipCache) {
         Remove-Item Env:PIP_CACHE_DIR -ErrorAction SilentlyContinue
     } else {
@@ -71,10 +86,6 @@ try {
     Remove-Item -Recurse -Force (Join-Path $Stage "tmp\pip-cache") -ErrorAction SilentlyContinue
 }
 
-$EmbeddedPython = Join-Path $PythonDir "python.exe"
-if (-not (Test-Path $EmbeddedPython)) {
-    throw "Embedded Python runtime was not produced: $EmbeddedPython"
-}
 & $EmbeddedPython -c "import redis, falkordb; print('NATIVE_EMBEDDED_MIGRATION_PYTHON_PASS')"
 if ($LASTEXITCODE -ne 0) {
     throw "Embedded migration Python failed to import packaged dependencies"

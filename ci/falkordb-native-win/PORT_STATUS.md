@@ -4,12 +4,13 @@
 
 Standalone native Windows FalkorDB-derived engine: **WORKING**
 
-Verified Windows CI run:
-- run `36190878880`
-- commit `3989ee1c8ec252bacd7e24fb51416cf7498c1874`
-- standalone marker `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
-- network marker `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
-- official client write/restart markers passed
+Verification is commit-based: the deployable ZIP contains `BUILD_INFO.txt` with
+its exact repository commit. The FalkorDB native Windows workflow for that
+commit is authoritative and must be green. Required end-to-end markers include
+`NATIVE_WINDOWS_FULL_STANDALONE_PASS`,
+`NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`,
+`NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS`, and the migration/import
+markers enabled by that commit.
 
 ## Completed
 
@@ -98,6 +99,5 @@ runner:
 14. verify full-text query
 15. emit `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
 
-Run `36190878880` satisfies the standalone definition and additionally proves
-authenticated TCP/RESP access with the official FalkorDB Python client before
-and after a server-process restart.
+The authoritative workflow additionally proves authenticated TCP/RESP access
+with the official FalkorDB Python client before and after hard process restart.

@@ -90,6 +90,14 @@ fn main() -> Result<(), String> {
     let portable = portable_enabled_from_env()
         || cli_args.iter().any(|arg| arg == "--portable");
     let portable_root = portable.then(executable_root).transpose()?;
+    if let Some(root) = &portable_root {
+        env::set_current_dir(root).map_err(|e| {
+            format!(
+                "set portable working directory to {}: {e}",
+                root.display()
+            )
+        })?;
+    }
 
     let mut config = ServerConfig::default();
     if let Some(root) = &portable_root {

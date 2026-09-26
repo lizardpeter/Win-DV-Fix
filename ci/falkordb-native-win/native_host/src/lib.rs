@@ -376,6 +376,17 @@ impl NativeGraph {
     }
 
 
+    /// Detailed component-level memory accounting used by GRAPH.MEMORY.
+    #[must_use]
+    pub fn memory_usage_report(
+        &self,
+        samples: usize,
+    ) -> graph::graph::graph::MemoryUsageReport {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        committed.borrow().memory_usage_report(samples)
+    }
+
     pub fn wal_len(&self) -> Result<u64, String> {
         let wal = self
             .wal

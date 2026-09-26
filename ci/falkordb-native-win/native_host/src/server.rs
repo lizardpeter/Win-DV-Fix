@@ -215,6 +215,37 @@ impl GraphCatalog {
         Ok(())
     }
 
+    /// Import FalkorDB's upstream v19 single-key GRAPH.RESTORE payload and
+    /// convert it into the native checkpoint/WAL durability format.
+    pub fn restore_payload(
+        &self,
+        destination: &str,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let mut graphs = self.graphs.write();
+        let wal_path = self.wal_path(destination);
+        if graphs.contains_key(destination) || wal_path.exists() {
+            return Err("restore graph failed, key already exists".to_string());
+        }
+
+        let graph = Arc::new(NativeGraph::restore_falkordb_v19_payload(
+            destination,
+            &wal_path,
+            payload,
+        )?);
+        graphs.insert(destination.to_string(), graph);
+        Ok(())
+    }
+
+    /// Export one graph in FalkorDB's upstream v19 GRAPH.RESTORE payload
+    /// format. This provides a lossless portable migration artifact.
+    pub fn dump_payload(&self, name: &str) -> Result<Vec<u8>, String> {
+        let graph = self
+            .get(name)
+            .ok_or_else(|| "Invalid graph operation on empty key".to_string())?;
+        Ok(graph.export_falkordb_v19_payload())
+    }
+
 
     pub fn contains(&self, name: &str) -> bool {
         self.graphs.read().contains_key(name)
@@ -496,6 +527,32 @@ fn dispatch(
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
         "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
         "GRAPH.PROFILE" => handle_graph_profile(&args, catalog),
+        "GRAPH.DUMP" => {
+            if args.len() != 2 {
+                return Resp::Error("ERR wrong number of arguments for 'graph.dump' command".to_string());
+            }
+            let name = match utf8(&args[1], "graph name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            match catalog.dump_payload(name) {
+                Ok(payload) => Resp::Bulk(payload),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
+        "GRAPH.RESTORE" => {
+            if args.len() != 3 {
+                return Resp::Error("ERR wrong number of arguments for 'graph.restore' command".to_string());
+            }
+            let destination = match utf8(&args[1], "destination graph name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            match catalog.restore_payload(destination, &args[2]) {
+                Ok(()) => Resp::Simple("OK".to_string()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
         "GRAPH.COPY" => {
             if args.len() != 3 {
                 return Resp::Error("ERR wrong number of arguments for 'graph.copy' command".to_string());

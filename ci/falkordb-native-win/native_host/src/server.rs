@@ -684,6 +684,7 @@ fn dispatch(
                 Resp::Simple("none".to_string())
             }
         }
+        "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
@@ -1156,6 +1157,111 @@ fn handle_graph_profile(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
         Ok(lines) => Resp::Array(lines.into_iter().map(bulk).collect()),
         Err(err) => Resp::Error(format!("ERR {err}")),
     }
+}
+
+fn handle_graph_memory(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    const MB: usize = 1 << 20;
+
+    if args.len() != 3 && args.len() != 5 {
+        return Resp::Error(
+            "ERR wrong number of arguments for 'graph.memory' command".to_string(),
+        );
+    }
+
+    if !ascii_upper(&args[1]).eq("USAGE") {
+        return Resp::Error(
+            "ERR unknown subcommand. Try GRAPH.MEMORY USAGE <key> [SAMPLES <count>]"
+                .to_string(),
+        );
+    }
+
+    let name = match utf8(&args[2], "graph name") {
+        Ok(value) => value,
+        Err(err) => return Resp::Error(err),
+    };
+
+    let samples = if args.len() == 5 {
+        if !ascii_upper(&args[3]).eq("SAMPLES") {
+            return Resp::Error("ERR expected SAMPLES keyword".to_string());
+        }
+        let raw = match utf8(&args[4], "SAMPLES count") {
+            Ok(value) => value,
+            Err(err) => return Resp::Error(err),
+        };
+        if raw.starts_with('-') {
+            return Resp::Error("ERR SAMPLES count must be a positive integer".to_string());
+        }
+        match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                return Resp::Error(
+                    "ERR SAMPLES count must be a positive integer".to_string(),
+                );
+            }
+        }
+    } else {
+        100
+    };
+
+    let Some(graph) = catalog.get(name) else {
+        return Resp::Error("ERR Graph does not exist".to_string());
+    };
+    let report = graph.memory_usage_report(samples);
+
+    let label_matrices_mb = (report.label_matrices_sz / MB) as i64;
+    let relation_matrices_mb = (report.relation_matrices_sz / MB) as i64;
+    let node_block_mb = (report.node_block_storage_sz / MB) as i64;
+    let unlabeled_node_attr_mb = (report.unlabeled_node_attr_sz / MB) as i64;
+    let edge_block_mb = (report.edge_block_storage_sz / MB) as i64;
+    let indices_mb = (report.indices_sz / MB) as i64;
+
+    let mut node_attrs = Vec::new();
+    let mut node_attr_sum_mb = 0i64;
+    for (name, size) in report.node_attr_by_label {
+        let mb = (size / MB) as i64;
+        node_attr_sum_mb += mb;
+        node_attrs.push(bulk(name.as_bytes()));
+        node_attrs.push(Resp::Int(mb));
+    }
+
+    let mut edge_attrs = Vec::new();
+    let mut edge_attr_sum_mb = 0i64;
+    for (name, size) in report.edge_attr_by_type {
+        let mb = (size / MB) as i64;
+        edge_attr_sum_mb += mb;
+        edge_attrs.push(bulk(name.as_bytes()));
+        edge_attrs.push(Resp::Int(mb));
+    }
+
+    let total_mb = indices_mb
+        + node_block_mb
+        + unlabeled_node_attr_mb
+        + edge_block_mb
+        + label_matrices_mb
+        + node_attr_sum_mb
+        + edge_attr_sum_mb
+        + relation_matrices_mb;
+
+    Resp::Array(vec![
+        Resp::Simple("total_graph_sz_mb".to_string()),
+        Resp::Int(total_mb),
+        Resp::Simple("label_matrices_sz_mb".to_string()),
+        Resp::Int(label_matrices_mb),
+        Resp::Simple("relation_matrices_sz_mb".to_string()),
+        Resp::Int(relation_matrices_mb),
+        Resp::Simple("amortized_node_block_sz_mb".to_string()),
+        Resp::Int(node_block_mb),
+        Resp::Simple("amortized_node_attributes_by_label_sz_mb".to_string()),
+        Resp::Array(node_attrs),
+        Resp::Simple("amortized_unlabeled_nodes_attributes_sz_mb".to_string()),
+        Resp::Int(unlabeled_node_attr_mb),
+        Resp::Simple("amortized_edge_block_sz_mb".to_string()),
+        Resp::Int(edge_block_mb),
+        Resp::Simple("amortized_edge_attributes_by_type_sz_mb".to_string()),
+        Resp::Array(edge_attrs),
+        Resp::Simple("indices_sz_mb".to_string()),
+        Resp::Int(indices_mb),
+    ])
 }
 
 fn handle_graph_slowlog(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {

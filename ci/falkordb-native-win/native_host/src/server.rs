@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, QueryOutput, native_config, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, QueryOutput, native_config, redis_dump, udf_store, wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -244,6 +244,38 @@ impl GraphCatalog {
             .get(name)
             .ok_or_else(|| "Invalid graph operation on empty key".to_string())?;
         Ok(graph.export_falkordb_v19_payload())
+    }
+
+    /// Export a standard Redis DUMP value for this graph. A current Redis /
+    /// FalkorDB instance can consume the result with RESTORE.
+    pub fn redis_dump(&self, name: &str) -> Result<Vec<u8>, String> {
+        Ok(redis_dump::create_falkordb_dump(&self.dump_payload(name)?))
+    }
+
+    /// Consume a standard Redis DUMP payload produced for a FalkorDB
+    /// `graphdata` module key and convert it into native persistence.
+    pub fn redis_restore(
+        &self,
+        destination: &str,
+        dump: &[u8],
+        replace: bool,
+    ) -> Result<(), String> {
+        if self.contains(destination) {
+            if !replace {
+                return Err("BUSYKEY Target key name already exists.".to_string());
+            }
+            self.delete(destination)?;
+        } else if self.wal_path(destination).exists() {
+            if !replace {
+                return Err("BUSYKEY Target key name already exists.".to_string());
+            }
+            let wal = self.wal_path(destination);
+            fs::remove_file(&wal)
+                .map_err(|e| format!("remove replaced graph WAL {}: {e}", wal.display()))?;
+        }
+
+        let payload = redis_dump::extract_falkordb_v19_payload(dump)?;
+        self.restore_payload(destination, &payload)
     }
 
 
@@ -522,6 +554,20 @@ fn dispatch(
             Resp::Bulk(body.as_bytes().to_vec())
         }
         "COMMAND" => Resp::Array(Vec::new()),
+        "DUMP" => {
+            if args.len() != 2 {
+                return Resp::Error("ERR wrong number of arguments for 'dump' command".to_string());
+            }
+            let name = match utf8(&args[1], "key name") {
+                Ok(v) => v,
+                Err(err) => return Resp::Error(err),
+            };
+            match catalog.redis_dump(name) {
+                Ok(payload) => Resp::Bulk(payload),
+                Err(_) => Resp::Null,
+            }
+        }
+        "RESTORE" | "RESTORE-ASKING" => handle_redis_restore(&args, catalog),
         "GRAPH.LIST" => Resp::Array(catalog.list().into_iter().map(bulk).collect()),
         "GRAPH.QUERY" => handle_graph_query(&args, catalog, false),
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
@@ -622,6 +668,65 @@ fn dispatch(
         "GRAPH.CONFIG" => handle_graph_config(&args),
         "GRAPH.UDF" => handle_graph_udf(&args, catalog),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
+    }
+}
+
+fn handle_redis_restore(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 4 {
+        return Resp::Error("ERR wrong number of arguments for 'restore' command".to_string());
+    }
+
+    let destination = match utf8(&args[1], "key name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let ttl = match utf8(&args[2], "TTL").and_then(|value| {
+        value
+            .parse::<u64>()
+            .map_err(|_| "ERR value is not an integer or out of range".to_string())
+    }) {
+        Ok(value) => value,
+        Err(err) => return Resp::Error(err),
+    };
+
+    // Graph database keys are normally persistent. Do not silently discard
+    // expiration semantics if somebody RESTOREs an expiring graph.
+    if ttl != 0 {
+        return Resp::Error(
+            "ERR non-zero RESTORE TTL is not supported for native graph keys".to_string(),
+        );
+    }
+
+    let mut replace = false;
+    let mut i = 4usize;
+    while i < args.len() {
+        let option = ascii_upper(&args[i]);
+        match option.as_str() {
+            "REPLACE" => {
+                replace = true;
+                i += 1;
+            }
+            // MIGRATE does not send these metadata options, but accepting and
+            // ignoring them is safe because they affect Redis eviction/LRU
+            // metadata rather than graph contents.
+            "IDLETIME" | "FREQ" => {
+                if i + 1 >= args.len() {
+                    return Resp::Error("ERR syntax error".to_string());
+                }
+                i += 2;
+            }
+            "ABSTTL" => {
+                // With ttl=0 this is semantically identical.
+                i += 1;
+            }
+            _ => return Resp::Error("ERR syntax error".to_string()),
+        }
+    }
+
+    match catalog.redis_restore(destination, &args[3], replace) {
+        Ok(()) => Resp::Simple("OK".to_string()),
+        Err(err) if err.starts_with("BUSYKEY") => Resp::Error(err),
+        Err(err) => Resp::Error(format!("ERR {err}")),
     }
 }
 

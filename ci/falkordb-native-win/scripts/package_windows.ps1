@@ -165,6 +165,60 @@ $Script = switch ($Tool) {
 exit $LASTEXITCODE
 '@ | Set-Content -Encoding UTF8 (Join-Path $Stage "run-tool.ps1")
 
+@'
+param()
+
+$ErrorActionPreference = "Stop"
+$Root = [IO.Path]::GetFullPath($PSScriptRoot)
+Set-Location $Root
+
+$RequiredFiles = @(
+    "server.exe",
+    "portable-env.ps1",
+    "start-local.ps1",
+    "run-tool.ps1",
+    "import_falkordb_rdb.py",
+    "migrate_current_falkordb.py",
+    "falkordb_bundle.py",
+    "python\python.exe",
+    "DEPENDENCIES.txt"
+)
+foreach ($Relative in $RequiredFiles) {
+    if (-not (Test-Path (Join-Path $Root $Relative))) {
+        throw "Portable package is missing required file: $Relative"
+    }
+}
+
+. "$Root\portable-env.ps1"
+$RequiredDirs = @(
+    "data", "logs", "tls", "tmp", "pycache", "imports", "exports",
+    "migration", "cache", "config", "profile",
+    "profile\AppData\Roaming", "profile\AppData\Local"
+)
+foreach ($Relative in $RequiredDirs) {
+    if (-not (Test-Path (Join-Path $Root $Relative))) {
+        throw "Portable package is missing required local directory: $Relative"
+    }
+}
+
+$Deps = Get-Content (Join-Path $Root "DEPENDENCIES.txt") -Raw
+if ($Deps -match "(?i)(VCRUNTIME|MSVCP)[^\s]*\.dll") {
+    throw "server.exe depends on an external MSVC runtime"
+}
+
+& "$Root\python\python.exe" -c "import redis, falkordb"
+if ($LASTEXITCODE -ne 0) {
+    throw "Bundled migration Python runtime is not self-contained"
+}
+
+$Escape = & "$Root\server.exe" --portable --data-dir "..\escape" 2>&1
+if ($LASTEXITCODE -eq 0 -or ($Escape -join "`n") -notmatch "may not escape") {
+    throw "Portable parent-directory confinement check failed"
+}
+
+Write-Host "PORTABLE_FOLDER_VERIFY_PASS"
+'@ | Set-Content -Encoding UTF8 (Join-Path $Stage "verify-portable.ps1")
+
 # Create the complete portable folder layout at package time as well as on launch.
 & (Join-Path $Stage "portable-env.ps1")
 foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration", "cache", "config", "profile", "profile\AppData\Roaming", "profile\AppData\Local")) {
@@ -270,6 +324,11 @@ if (($Help -join "`n") -notmatch "falkordb-native-server") {
 }
 $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
+& (Join-Path $Stage "verify-portable.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged portable verifier failed"
+}
+
 $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.ToLowerInvariant()
 @"
 server.exe sha256 $Hash
@@ -277,6 +336,7 @@ server.exe sha256 $Hash
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 
+Write-Host "NATIVE_WINDOWS_PORTABLE_SELF_VERIFY_PASS"
 Write-Host "NATIVE_WINDOWS_EMBEDDED_MIGRATION_RUNTIME_PASS"
 Write-Host "NATIVE_WINDOWS_PORTABLE_EXTERNAL_CWD_PASS"
 Write-Host "NATIVE_WINDOWS_STATIC_RUNTIME_AUDIT_PASS"

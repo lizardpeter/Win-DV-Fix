@@ -1,5 +1,6 @@
 use std::{
     env,
+    fs,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -83,21 +84,78 @@ fn portable_enabled_from_env() -> bool {
         })
 }
 
-fn main() -> Result<(), String> {
-    let _engine = Engine::init()?;
+fn configure_portable_process(root: &Path) -> Result<(), String> {
+    let local_dirs = [
+        "data",
+        "logs",
+        "tls",
+        "tmp",
+        "pycache",
+        "imports",
+        "exports",
+        "migration",
+        "cache",
+        "config",
+        "profile",
+        "profile/AppData/Roaming",
+        "profile/AppData/Local",
+    ];
+    for relative in local_dirs {
+        let path = root.join(relative);
+        fs::create_dir_all(&path)
+            .map_err(|e| format!("create portable directory {}: {e}", path.display()))?;
+    }
 
+    env::set_current_dir(root).map_err(|e| {
+        format!(
+            "set portable working directory to {}: {e}",
+            root.display()
+        )
+    })?;
+
+    let tmp = root.join("tmp");
+    let profile = root.join("profile");
+    let roaming = profile.join("AppData/Roaming");
+    let local = profile.join("AppData/Local");
+    let cache = root.join("cache");
+    let config = root.join("config");
+    let pycache = root.join("pycache");
+
+    // SAFETY: portable-process environment is configured before Engine::init
+    // starts the FalkorDB threadpool or any other worker threads.
+    unsafe {
+        env::set_var("FALKORDB_PORTABLE_ROOT", root);
+        if env::var_os("FALKORDB_DATA_DIR").is_none() {
+            env::set_var("FALKORDB_DATA_DIR", "data");
+        }
+        env::set_var("TEMP", &tmp);
+        env::set_var("TMP", &tmp);
+        env::set_var("HOME", &profile);
+        env::set_var("USERPROFILE", &profile);
+        env::set_var("APPDATA", &roaming);
+        env::set_var("LOCALAPPDATA", &local);
+        env::set_var("XDG_CACHE_HOME", &cache);
+        env::set_var("XDG_CONFIG_HOME", &config);
+        env::set_var("PIP_CACHE_DIR", cache.join("pip"));
+        env::set_var("PYTHONPYCACHEPREFIX", &pycache);
+        env::set_var("PYTHONDONTWRITEBYTECODE", "1");
+        env::set_var("PYTHONNOUSERSITE", "1");
+        env::set_var("PYTHONPATH", "");
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<(), String> {
     let cli_args: Vec<String> = env::args().skip(1).collect();
     let portable = portable_enabled_from_env()
         || cli_args.iter().any(|arg| arg == "--portable");
     let portable_root = portable.then(executable_root).transpose()?;
     if let Some(root) = &portable_root {
-        env::set_current_dir(root).map_err(|e| {
-            format!(
-                "set portable working directory to {}: {e}",
-                root.display()
-            )
-        })?;
+        configure_portable_process(root)?;
     }
+
+    let _engine = Engine::init()?;
 
     let mut config = ServerConfig::default();
     if let Some(root) = &portable_root {

@@ -194,7 +194,7 @@ def export_bundle(args) -> int:
             )
 
         # Flush the completed archive before atomically publishing its name.
-        with open(temp_path, "rb") as handle:
+        with open(temp_path, "rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temp_path, bundle)
         temp_path = None

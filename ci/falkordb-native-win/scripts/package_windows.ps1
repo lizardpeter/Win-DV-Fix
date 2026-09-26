@@ -312,35 +312,19 @@ try {
 }
 Remove-Item -Recurse -Force $RuntimeSmokeDir -ErrorAction SilentlyContinue
 
-# Verify the final PE does not depend on the separately installed MSVC runtime.
-$LinkPath = $null
-$Link = Get-Command link.exe -ErrorAction SilentlyContinue
-if ($Link) {
-    $LinkPath = $Link.Source
-} else {
-    $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $VsWhere) {
-        $VsInstall = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-        if ($VsInstall) {
-            $ToolRoots = Get-ChildItem -Path (Join-Path $VsInstall "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
-            foreach ($ToolRoot in $ToolRoots) {
-                $CandidateLink = Join-Path $ToolRoot.FullName "bin\Hostx64\x64\link.exe"
-                if (Test-Path $CandidateLink) {
-                    $LinkPath = $CandidateLink
-                    break
-                }
-            }
-        }
-    }
+# Verify the final PE does not depend on the separately installed MSVC
+# runtime. Use our deterministic standard-library PE parser rather than
+# link.exe /dump, whose exit status varies across Visual Studio runner images.
+$PeScanner = Join-Path $PSScriptRoot "pe_dependencies.py"
+if (-not (Test-Path $PeScanner)) {
+    throw "PE dependency scanner not found: $PeScanner"
 }
-if (-not $LinkPath) {
-    throw "Could not locate MSVC link.exe; refusing to skip PE dependency audit"
-}
-$Deps = & $LinkPath /dump /dependents (Join-Path $Stage "server.exe") 2>&1
+$Deps = & python $PeScanner (Join-Path $Stage "server.exe") 2>&1
+$PeScanExit = $LASTEXITCODE
 $Deps | Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
 $DepsText = $Deps -join "`n"
-if ($LASTEXITCODE -ne 0) {
-    throw "PE dependency audit failed with exit code $LASTEXITCODE"
+if ($PeScanExit -ne 0) {
+    throw "PE dependency audit failed with exit code $PeScanExit"
 }
 if ($DepsText -match "(?i)(VCRUNTIME|MSVCP)[^\s]*\.dll") {
     throw "Packaged server still depends on the external MSVC runtime"

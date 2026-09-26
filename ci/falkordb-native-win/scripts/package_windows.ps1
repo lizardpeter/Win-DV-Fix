@@ -102,7 +102,7 @@ $ErrorActionPreference = "Stop"
 $Root = [IO.Path]::GetFullPath($PSScriptRoot)
 Set-Location $Root
 
-foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration")) {
+foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration", "cache", "config", "profile", "profile\AppData\Roaming", "profile\AppData\Local")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $Root $Name) | Out-Null
 }
 
@@ -112,6 +112,13 @@ $env:TEMP = Join-Path $Root "tmp"
 $env:TMP = Join-Path $Root "tmp"
 $env:PYTHONPYCACHEPREFIX = Join-Path $Root "pycache"
 $env:PYTHONDONTWRITEBYTECODE = "1"
+$env:HOME = Join-Path $Root "profile"
+$env:USERPROFILE = Join-Path $Root "profile"
+$env:APPDATA = Join-Path $Root "profile\AppData\Roaming"
+$env:LOCALAPPDATA = Join-Path $Root "profile\AppData\Local"
+$env:XDG_CACHE_HOME = Join-Path $Root "cache"
+$env:XDG_CONFIG_HOME = Join-Path $Root "config"
+$env:PIP_CACHE_DIR = Join-Path $Root "cache\pip"
 '@ | Set-Content -Encoding UTF8 (Join-Path $Stage "portable-env.ps1")
 
 @'
@@ -160,7 +167,7 @@ exit $LASTEXITCODE
 
 # Create the complete portable folder layout at package time as well as on launch.
 & (Join-Path $Stage "portable-env.ps1")
-foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration")) {
+foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration", "cache", "config", "profile", "profile\AppData\Roaming", "profile\AppData\Local")) {
     if (-not (Test-Path (Join-Path $Stage $Name))) {
         throw "Portable package directory missing: $Name"
     }
@@ -220,17 +227,37 @@ try {
 Remove-Item -Recurse -Force $RuntimeSmokeDir -ErrorAction SilentlyContinue
 
 # Verify the final PE does not depend on the separately installed MSVC runtime.
+$LinkPath = $null
 $Link = Get-Command link.exe -ErrorAction SilentlyContinue
 if ($Link) {
-    $Deps = & $Link.Source /dump /dependents (Join-Path $Stage "server.exe") 2>&1
-    $Deps | Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
-    $DepsText = $Deps -join "`n"
-    if ($DepsText -match "(?i)VCRUNTIME140|MSVCP140") {
-        throw "Packaged server still depends on the external MSVC runtime"
-    }
+    $LinkPath = $Link.Source
 } else {
-    "link.exe unavailable during packaging; PE dependency audit skipped" |
-        Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
+    $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $VsWhere) {
+        $VsInstall = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+        if ($VsInstall) {
+            $ToolRoots = Get-ChildItem -Path (Join-Path $VsInstall "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+            foreach ($ToolRoot in $ToolRoots) {
+                $CandidateLink = Join-Path $ToolRoot.FullName "bin\Hostx64\x64\link.exe"
+                if (Test-Path $CandidateLink) {
+                    $LinkPath = $CandidateLink
+                    break
+                }
+            }
+        }
+    }
+}
+if (-not $LinkPath) {
+    throw "Could not locate MSVC link.exe; refusing to skip PE dependency audit"
+}
+$Deps = & $LinkPath /dump /dependents (Join-Path $Stage "server.exe") 2>&1
+$Deps | Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
+$DepsText = $Deps -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "PE dependency audit failed with exit code $LASTEXITCODE"
+}
+if ($DepsText -match "(?i)(VCRUNTIME|MSVCP)[^\s]*\.dll") {
+    throw "Packaged server still depends on the external MSVC runtime"
 }
 
 # Prove the packaged executable itself starts and parses its CLI before zipping.

@@ -155,9 +155,6 @@ pub struct NativeGraph {
     inner: RwLock<MvccGraph>,
     name: String,
     wal: Option<Wal>,
-    import_folder: String,
-    result_set_size: i64,
-    timeout_ms: Option<u64>,
     slow_log: SlowLog,
 }
 
@@ -167,9 +164,6 @@ impl NativeGraph {
             inner: RwLock::new(MvccGraph::new(16_384, 16_384, 25, name)),
             name: name.to_string(),
             wal: None,
-            import_folder: String::new(),
-            result_set_size: -1,
-            timeout_ms: None,
             slow_log: SlowLog::new(),
         }
     }
@@ -254,9 +248,6 @@ impl NativeGraph {
             inner: RwLock::new(mvcc),
             name: name.to_string(),
             wal: Some(wal),
-            import_folder: String::new(),
-            result_set_size: -1,
-            timeout_ms: None,
             slow_log: SlowLog::new(),
         })
     }

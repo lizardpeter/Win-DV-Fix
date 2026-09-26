@@ -123,6 +123,8 @@ $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkord
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
 $MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
+$PortableBundleUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "falkordb_portable_bundle.py"))
+$PortableBundle = Join-Path $WorkDir "portable-migration.falkor.zip"
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -184,6 +186,26 @@ function Start-MigrationDestination([string]$Suffix) {
         "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
     ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     Wait-NativeServer 6392
+    return $proc
+}
+
+$BundleData = Join-Path $WorkDir "bundle-destination-data"
+Remove-Item -Recurse -Force $BundleData -ErrorAction SilentlyContinue
+Remove-Item -Force $PortableBundle -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $BundleData | Out-Null
+
+function Start-BundleDestination([string]$Suffix) {
+    $out = Join-Path $Logs ("10_bundle_dest_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("10_bundle_dest_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        "--bind", "127.0.0.1:6393",
+        "--data-dir", $BundleData,
+        "--password", "native-ci-secret",
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6393
     return $proc
 }
 
@@ -306,6 +328,69 @@ try {
         }
     }
 
+    # Prove offline export/import: source and destination need not be online
+    # together. Export the populated source to one archive, import it into a
+    # third independent native process, then hard-restart that destination.
+    $BundleServer = $null
+    try {
+        python $PortableBundleUtility export `
+            --source-host localhost `
+            --source-port 6391 `
+            --source-password native-ci-secret `
+            --source-ssl `
+            --source-ca (Join-Path $TlsDir "ca.pem") `
+            --source-cert (Join-Path $TlsDir "client-cert.pem") `
+            --source-key (Join-Path $TlsDir "client-key.pem") `
+            --bundle $PortableBundle 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_portable_bundle_export.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle export failed with exit code $LASTEXITCODE"
+        }
+        $BundleExportText = (Get-Content (Join-Path $Logs "10_portable_bundle_export.txt") -Raw)
+        if ($BundleExportText -notmatch "BUNDLE_EXPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle export did not emit completion marker"
+        }
+
+        $BundleServer = Start-BundleDestination "first"
+        python $PortableBundleUtility import `
+            --destination-host localhost `
+            --destination-port 6393 `
+            --destination-password native-ci-secret `
+            --destination-ssl `
+            --destination-ca (Join-Path $TlsDir "ca.pem") `
+            --destination-cert (Join-Path $TlsDir "client-cert.pem") `
+            --destination-key (Join-Path $TlsDir "client-key.pem") `
+            --bundle $PortableBundle 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_portable_bundle_import.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle import failed with exit code $LASTEXITCODE"
+        }
+        $BundleImportText = (Get-Content (Join-Path $Logs "10_portable_bundle_import.txt") -Raw)
+        if ($BundleImportText -notmatch "BUNDLE_IMPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle import did not emit completion marker"
+        }
+
+        Stop-Process -Id $BundleServer.Id -Force
+        Wait-Process -Id $BundleServer.Id -ErrorAction SilentlyContinue
+        $BundleServer = $null
+        Start-Sleep -Milliseconds 300
+
+        $BundleServer = Start-BundleDestination "restart"
+        $env:FALKORDB_TEST_PORT = "6393"
+        python $ClientSmoke read 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_portable_bundle_restart_verify.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable bundle restart verification failed with exit code $LASTEXITCODE"
+        }
+        Write-Host "NATIVE_PORTABLE_DATABASE_BUNDLE_PASS"
+    } finally {
+        Remove-Item Env:FALKORDB_TEST_PORT -ErrorAction SilentlyContinue
+        if ($null -ne $BundleServer -and -not $BundleServer.HasExited) {
+            Stop-Process -Id $BundleServer.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $BundleServer.Id -ErrorAction SilentlyContinue
+        }
+    }
+
     # Hard-stop the server to prove committed graph state is recoverable solely
     # from the native WAL on a fresh process.
     Stop-Process -Id $Server.Id -Force
@@ -366,4 +451,5 @@ Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_UPSTREAM_FALKORDB_DUMP_PASS"
+Write-Host "NATIVE_WINDOWS_PORTABLE_DATABASE_BUNDLE_PASS"
 

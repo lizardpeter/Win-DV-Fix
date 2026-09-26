@@ -74,10 +74,15 @@ impl Wal {
                     .max(floor_sequence.saturating_add(1))
             });
 
+        // Do not use append(true) here. On Windows that can open the file
+        // with FILE_APPEND_DATA semantics but without the access required by
+        // SetEndOfFile, causing checkpoint compaction (set_len(0)) to fail
+        // with ERROR_ACCESS_DENIED. Every append path below explicitly seeks
+        // to EOF while holding the WAL mutex, so read+write is sufficient and
+        // preserves ordered append behavior.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .append(true)
             .open(&path)
             .map_err(|e| format!("open WAL {}: {e}", path.display()))?;
 

@@ -42,7 +42,33 @@ fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<Path
             raw.display()
         ));
     }
-    Ok(root.join(raw))
+
+    let candidate = root.join(raw);
+
+    // Reject pre-existing symlink/junction/reparse-point chains that redirect
+    // an apparently local path outside the package. Check every existing
+    // prefix so this also protects a not-yet-created final data directory.
+    let relative = candidate
+        .strip_prefix(root)
+        .map_err(|_| format!("{label} escaped the executable folder"))?;
+    let mut prefix = root.to_path_buf();
+    for component in relative.components() {
+        prefix.push(component.as_os_str());
+        if prefix.exists() {
+            let resolved = prefix.canonicalize().map_err(|e| {
+                format!("canonicalize portable path {}: {e}", prefix.display())
+            })?;
+            if !resolved.starts_with(root) {
+                return Err(format!(
+                    "{label} resolves outside the executable folder in --portable mode: {} -> {}",
+                    prefix.display(),
+                    resolved.display()
+                ));
+            }
+        }
+    }
+
+    Ok(candidate)
 }
 
 fn portable_enabled_from_env() -> bool {

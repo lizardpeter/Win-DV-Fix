@@ -837,6 +837,27 @@ fn decode_index_field(reader: &mut dyn Reader) -> Result<(Arc<String>, Field), S
     Ok((Arc::new(attr_name), field))
 }
 
+/// Encode a graph using FalkorDB's v19 single-key GRAPH.RESTORE wire format.
+///
+/// This is intentionally the same type-tagged payload produced by upstream
+/// `serializers::encoder::vec_save_graph`: header, schema, payload directory,
+/// then graph payloads. It is not the native FGSN checkpoint envelope.
+pub fn save_falkordb_v19_payload(graph: &Graph, graph_name: &str) -> Vec<u8> {
+    save_graph(graph, graph_name)
+}
+
+/// Decode FalkorDB's v19 single-key GRAPH.RESTORE wire format.
+///
+/// The destination name is supplied by the caller, matching upstream
+/// GRAPH.RESTORE semantics: the serialized source graph can be installed
+/// under a different destination key without rewriting its payload first.
+pub fn load_falkordb_v19_payload(
+    data: &[u8],
+    destination_name: &str,
+) -> Result<Graph, String> {
+    load_graph(data, destination_name)
+}
+
 fn save_graph(graph: &Graph, graph_name: &str) -> Vec<u8> {
     let payloads = build_payloads(graph);
     let mut writer = VecWriter::new();

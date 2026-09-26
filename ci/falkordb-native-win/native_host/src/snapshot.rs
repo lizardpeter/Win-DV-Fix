@@ -866,6 +866,173 @@ fn decode_index_field(reader: &mut dyn Reader) -> Result<(Arc<String>, Field), S
     Ok((Arc::new(attr_name), field))
 }
 
+struct PendingGraphImport {
+    header: Header,
+    schema: Schema,
+    processed_keys: u64,
+    node_attrs: AttributeStore,
+    relationship_attrs: AttributeStore,
+    attrs_name: AttrNameMap,
+    deleted_nodes: RoaringTreemap,
+    deleted_relationships: RoaringTreemap,
+    label_matrices: Vec<VersionedMatrix<bool>>,
+    relationship_tensors: Vec<Tensor>,
+    adjacency: VersionedMatrix<bool>,
+    labels_matrix: VersionedMatrix<bool>,
+}
+
+impl PendingGraphImport {
+    fn new(header: Header, schema: Schema) -> Self {
+        let mut attrs_name = AttrNameMap::default();
+        for name in &schema.attribute_names {
+            attrs_name.insert(Arc::clone(name));
+        }
+
+        Self {
+            header,
+            schema,
+            processed_keys: 0,
+            node_attrs: AttributeStore::new(),
+            relationship_attrs: AttributeStore::new(),
+            attrs_name,
+            deleted_nodes: RoaringTreemap::new(),
+            deleted_relationships: RoaringTreemap::new(),
+            label_matrices: Vec::new(),
+            relationship_tensors: Vec::new(),
+            adjacency: VersionedMatrix::<bool>::new(0, 0),
+            labels_matrix: VersionedMatrix::<bool>::new(0, 0),
+        }
+    }
+
+    fn validate_fragment(&self, header: &Header, schema: &Schema) -> Result<(), String> {
+        if header.graph_name != self.header.graph_name
+            || header.node_count != self.header.node_count
+            || header.edge_count != self.header.edge_count
+            || header.deleted_node_count != self.header.deleted_node_count
+            || header.deleted_edge_count != self.header.deleted_edge_count
+            || header.label_count != self.header.label_count
+            || header.relationship_count != self.header.relationship_count
+            || header.multi_edge != self.header.multi_edge
+            || header.key_count != self.header.key_count
+        {
+            return Err(format!(
+                "FalkorDB v19 fragment header mismatch for graph {:?}",
+                self.header.graph_name
+            ));
+        }
+
+        let attrs_match = schema.attribute_names.len() == self.schema.attribute_names.len()
+            && schema
+                .attribute_names
+                .iter()
+                .zip(&self.schema.attribute_names)
+                .all(|(a, b)| a.as_str() == b.as_str());
+        let labels_match = schema.node_labels.len() == self.schema.node_labels.len()
+            && schema
+                .node_labels
+                .iter()
+                .zip(&self.schema.node_labels)
+                .all(|(a, b)| a.as_str() == b.as_str());
+        let rels_match =
+            schema.relationship_types.len() == self.schema.relationship_types.len()
+                && schema
+                    .relationship_types
+                    .iter()
+                    .zip(&self.schema.relationship_types)
+                    .all(|(a, b)| a.as_str() == b.as_str());
+
+        if !attrs_match || !labels_match || !rels_match {
+            return Err(format!(
+                "FalkorDB v19 fragment schema mismatch for graph {:?}",
+                self.header.graph_name
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode_payloads(
+        &mut self,
+        reader: &mut VecReader<'_>,
+        payloads: &[(EncodeState, u64)],
+    ) -> Result<(), String> {
+        for (state, count) in payloads {
+            match state {
+                EncodeState::Nodes => {
+                    self.node_attrs
+                        .decode_with_count(reader, *count, self.attrs_name.len())?;
+                }
+                EncodeState::DeletedNodes => {
+                    self.deleted_nodes
+                        .decode_with_count(reader, *count, self.attrs_name.len())?;
+                }
+                EncodeState::Edges => {
+                    self.relationship_attrs
+                        .decode_with_count(reader, *count, self.attrs_name.len())?;
+                }
+                EncodeState::DeletedEdges => {
+                    self.deleted_relationships
+                        .decode_with_count(reader, *count, self.attrs_name.len())?;
+                }
+                EncodeState::LabelsMatrices => {
+                    let actual = reader.read_unsigned()?;
+                    for _ in 0..actual {
+                        let _label_id = reader.read_unsigned()?;
+                        self.label_matrices.push(VersionedMatrix::decode(reader)?);
+                    }
+                }
+                EncodeState::RelationMatrices => {
+                    for _ in 0..self.header.relationship_count {
+                        let _relation_id = reader.read_unsigned()?;
+                        self.relationship_tensors.push(Tensor::decode(reader)?);
+                    }
+                }
+                EncodeState::AdjMatrix => {
+                    self.adjacency = VersionedMatrix::decode(reader)?;
+                }
+                EncodeState::LblsMatrix => {
+                    self.labels_matrix = VersionedMatrix::decode(reader)?;
+                }
+                _ => {}
+            }
+        }
+        self.processed_keys = self.processed_keys.saturating_add(1);
+        Ok(())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.processed_keys == self.header.key_count
+    }
+
+    fn finish(self, destination_name: &str) -> Graph {
+        let mut graph = Graph::restore(
+            destination_name,
+            25,
+            self.header.node_count,
+            self.header.edge_count,
+            self.deleted_nodes,
+            self.deleted_relationships,
+            self.adjacency,
+            self.labels_matrix,
+            VersionedMatrix::<bool>::new(0, 0),
+            self.label_matrices,
+            self.relationship_tensors,
+            self.schema.node_labels,
+            self.schema.relationship_types,
+            self.attrs_name,
+            self.node_attrs,
+            self.relationship_attrs,
+        );
+
+        graph.rebuild_derived_matrices();
+        rebuild_indexes(&mut graph, &self.schema.indexes);
+        for constraint in self.schema.constraints {
+            graph.add_constraint_raw(constraint);
+        }
+        graph.populate_indexes_sync();
+        graph
+    }
+}
+
 /// Encode a graph using FalkorDB's v19 single-key GRAPH.RESTORE wire format.
 ///
 /// This is intentionally the same type-tagged payload produced by upstream
@@ -885,6 +1052,85 @@ pub fn load_falkordb_v19_payload(
     destination_name: &str,
 ) -> Result<Graph, String> {
     load_graph(data, destination_name)
+}
+
+/// Decode ordered v19 RDB graph fragments exactly as FalkorDB does during
+/// Redis RDB loading. Fragments from different graphs may be interleaved, but
+/// the relative order for a given graph must match the RDB file order.
+pub fn load_falkordb_v19_fragments(
+    fragments: &[Vec<u8>],
+) -> Result<Vec<(String, Graph)>, String> {
+    let mut pending: HashMap<String, PendingGraphImport> = HashMap::new();
+    let mut completed = Vec::new();
+
+    for data in fragments {
+        let mut reader = VecReader::new(data);
+        let header = Header::decode(&mut reader)?;
+        if header.key_count == 0 {
+            return Err(format!(
+                "FalkorDB v19 graph {:?} declares zero RDB keys",
+                header.graph_name
+            ));
+        }
+        let schema = Schema::decode(&mut reader)?;
+
+        let payload_count = reader.read_unsigned()?;
+        let mut payloads = Vec::with_capacity(payload_count as usize);
+        for _ in 0..payload_count {
+            let state_raw = reader.read_unsigned()?;
+            let state = EncodeState::from_u64(state_raw)
+                .ok_or_else(|| format!("unknown graph encode state {state_raw}"))?;
+            let count = reader.read_unsigned()?;
+            payloads.push((state, count));
+        }
+
+        let graph_name = header.graph_name.clone();
+        if let Some(state) = pending.get(&graph_name) {
+            state.validate_fragment(&header, &schema)?;
+        } else {
+            pending.insert(
+                graph_name.clone(),
+                PendingGraphImport::new(header, schema),
+            );
+        }
+
+        let state = pending
+            .get_mut(&graph_name)
+            .ok_or_else(|| format!("pending graph {graph_name:?} disappeared"))?;
+        if state.processed_keys >= state.header.key_count {
+            return Err(format!(
+                "FalkorDB v19 graph {graph_name:?} has more fragments than declared"
+            ));
+        }
+        state.decode_payloads(&mut reader, &payloads)?;
+
+        if state.is_complete() {
+            let state = pending
+                .remove(&graph_name)
+                .ok_or_else(|| format!("pending graph {graph_name:?} disappeared"))?;
+            let graph = state.finish(&graph_name);
+            completed.push((graph_name, graph));
+        }
+    }
+
+    if !pending.is_empty() {
+        let mut missing: Vec<String> = pending
+            .iter()
+            .map(|(name, state)| {
+                format!(
+                    "{name:?} {}/{} fragments",
+                    state.processed_keys, state.header.key_count
+                )
+            })
+            .collect();
+        missing.sort();
+        return Err(format!(
+            "incomplete FalkorDB v19 RDB graph fragments: {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(completed)
 }
 
 fn save_graph(graph: &Graph, graph_name: &str) -> Vec<u8> {

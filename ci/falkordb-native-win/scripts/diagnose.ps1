@@ -122,6 +122,8 @@ $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_ap
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
+$UpstreamRdbFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.rdb"
+$RawRdbImporter = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "import_falkordb_rdb.py"))
 $MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
 $BundleUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "falkordb_bundle.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
@@ -191,6 +193,89 @@ function Start-MigrationDestination([string]$Suffix) {
 $Server = $null
 try {
     $Server = Start-NativeServer "first"
+
+    if (-not (Test-Path $UpstreamRdbFixture)) {
+        throw "Official upstream FalkorDB dump.rdb artifact is missing: $UpstreamRdbFixture"
+    }
+
+    python $RawRdbImporter inspect --rdb $UpstreamRdbFixture 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_inspect.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb inspect failed with exit code $LASTEXITCODE"
+    }
+
+    python $RawRdbImporter import `
+        --rdb $UpstreamRdbFixture `
+        --destination-host localhost `
+        --destination-port 6391 `
+        --destination-password native-ci-secret `
+        --destination-ssl `
+        --destination-ca (Join-Path $TlsDir "ca.pem") `
+        --destination-cert (Join-Path $TlsDir "client-cert.pem") `
+        --destination-key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_import.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb import failed with exit code $LASTEXITCODE"
+    }
+    $RawImportText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_import.txt") -Raw)
+    if ($RawImportText -notmatch "RAW_RDB_IMPORT_COMPLETE") {
+        throw "Official upstream FalkorDB dump.rdb import did not emit completion marker"
+    }
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --target-graph upstream-real-fixture `
+        --verify-udf `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_verify.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb query/UDF verification failed with exit code $LASTEXITCODE"
+    }
+    $RawVerifyText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_verify.txt") -Raw)
+    if ($RawVerifyText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS") {
+        throw "Official upstream FalkorDB dump.rdb did not preserve UDF library"
+    }
+    Write-Host "NATIVE_RAW_FALKORDB_RDB_IMPORT_PASS"
+
+    # Prove raw dump.rdb durability before the general client smoke deliberately
+    # executes FLUSHDB as part of its clean-room setup.
+    Stop-Process -Id $Server.Id -Force
+    Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    $Server = $null
+    Start-Sleep -Milliseconds 300
+
+    $Server = Start-NativeServer "raw-rdb-restart"
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --target-graph upstream-real-fixture `
+        --verify-udf `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb immediate restart verification failed with exit code $LASTEXITCODE"
+    }
+    $RawRestartText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_restart.txt") -Raw)
+    if ($RawRestartText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS" -or
+        $RawRestartText -notmatch "UPSTREAM_FALKORDB_RAW_RDB_MULTIGRAPH_PASS") {
+        throw "Official upstream FalkorDB dump.rdb data/UDFs did not survive native restart"
+    }
+    Write-Host "NATIVE_RAW_FALKORDB_RDB_RESTART_PASS"
+
     python $ClientSmoke write 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "10_official_client_write.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -371,6 +456,7 @@ try {
     Start-Sleep -Milliseconds 300
 
     $Server = Start-NativeServer "restart"
+
     python $ClientSmoke read 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "11_official_client_restart.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -424,4 +510,5 @@ Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_UPSTREAM_FALKORDB_DUMP_PASS"
+Write-Host "NATIVE_WINDOWS_RAW_FALKORDB_RDB_PASS"
 

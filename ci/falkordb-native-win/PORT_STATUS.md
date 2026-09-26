@@ -4,12 +4,17 @@
 
 Standalone native Windows FalkorDB-derived engine: **WORKING**
 
-Verified Windows CI run:
-- run `36190878880`
-- commit `3989ee1c8ec252bacd7e24fb51416cf7498c1874`
-- standalone marker `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
-- network marker `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
-- official client write/restart markers passed
+Verified Windows CI runs:
+- main migration/package gate: run `36260095287`, commit `7c93cd2affdc5144e0cec430e1511b53c625e42f`
+- raw current-FalkorDB RDB gate: run `36262121619`, commit `a80d9433944144398d79953fce15cfe853e6282e`
+- `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
+- `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
+- `NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS`
+- `NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS`
+- `NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS`
+- `NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS`
+- `NATIVE_RAW_FALKORDB_RDB_RESTART_PASS`
+- `NATIVE_WINDOWS_PACKAGE_PASS`
 
 ## Completed
 
@@ -46,6 +51,17 @@ Verified Windows CI run:
 - [x] Remote range/full-text index usage
 - [x] Server-process restart + official-client recovery
 - [x] Recovery for indexes created after existing data
+- [x] Durable snapshot/checkpoint + WAL compaction
+- [x] Automatic WAL-threshold checkpoint maintenance
+- [x] TLS and mutual-TLS RESP listener
+- [x] Authenticated ChatGPT HTTPS API
+- [x] Upstream Redis DUMP / RESTORE graph migration
+- [x] Whole-database live FalkorDB migration utility
+- [x] Offline portable migration bundle with hashes/signature verification
+- [x] Current FalkorDB dump.rdb direct import
+- [x] Multi-key/virtual-key RDB graph reassembly
+- [x] FalkorDB UDF RDB AUX import
+- [x] Deployable Windows ZIP packaging
 
 ## Not required in standalone mode
 
@@ -59,15 +75,12 @@ Verified Windows CI run:
 
 ## Remaining engineering, not feasibility blockers
 
-- [ ] compact snapshot/checkpoint format to cap WAL replay time
-- [ ] WAL rotation/compaction
 - [ ] crash-injection test matrix
 - [ ] long-running concurrency/stress suite
 - [ ] index performance tuning
 - [ ] vector index acceleration beyond correctness-first backend
 - [ ] full-text ranking/tokenization parity tuning if exact upstream behavior is required
-- [ ] installer/service/library packaging
-- [ ] optional direct TLS listener (use private network/VPN meanwhile)
+- [ ] Windows service/MSI installer packaging
 - [ ] CAS artifact store
 - [ ] universal reversal graph schema/migrations
 - [ ] benchmark native backend vs original Redis/RediSearch deployment
@@ -93,6 +106,8 @@ runner:
 14. verify full-text query
 15. emit `NATIVE_WINDOWS_FULL_STANDALONE_PASS`
 
-Run `36190878880` satisfies the standalone definition and additionally proves
-authenticated TCP/RESP access with the official FalkorDB Python client before
-and after a server-process restart.
+The current gates additionally prove official-client TCP/RESP + mTLS,
+checkpoint/WAL recovery, live whole-database migration, offline bundle
+migration, exact official FalkorDB DUMP import, direct current FalkorDB
+dump.rdb import (including forced multi-key graph splitting and UDF AUX data),
+hard restart recovery, and creation of a tested deployable Windows ZIP.

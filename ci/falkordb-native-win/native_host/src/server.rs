@@ -246,6 +246,43 @@ impl GraphCatalog {
         Ok(())
     }
 
+    /// Restore one current FalkorDB graph from the ordered module fragments
+    /// found in a Redis RDB file. This is intentionally migration-only and
+    /// refuses to overwrite an existing graph.
+    pub fn restore_rdb_fragments(&self, fragments: &[Vec<u8>]) -> Result<String, String> {
+        if fragments.is_empty() {
+            return Err("RDB fragment restore requires at least one fragment".to_string());
+        }
+
+        let mut decoded = snapshot::load_falkordb_v19_fragments(fragments)?;
+        if decoded.len() != 1 {
+            return Err(format!(
+                "RDB fragment restore expected exactly one graph, decoded {}",
+                decoded.len()
+            ));
+        }
+
+        let (name, graph) = decoded
+            .pop()
+            .ok_or_else(|| "RDB fragment restore decoded no graph".to_string())?;
+
+        if self.contains(&name)
+            || self.wal_path(&name).exists()
+            || snapshot::load_latest(&self.wal_path(&name), &name)?.is_some()
+        {
+            return Err(format!(
+                "destination graph {name:?} already exists; raw RDB import will not overwrite it"
+            ));
+        }
+
+        // Normalize the multi-key RDB representation into the same portable
+        // single-key v19 payload used by GRAPH.RESTORE, then let the normal
+        // durable import path create checkpoint/WAL storage.
+        let payload = snapshot::save_falkordb_v19_payload(&graph, &name);
+        self.restore_payload(&name, &payload)?;
+        Ok(name)
+    }
+
     /// Export one graph in FalkorDB's upstream v19 GRAPH.RESTORE payload
     /// format. This provides a lossless portable migration artifact.
     pub fn dump_payload(&self, name: &str) -> Result<Vec<u8>, String> {
@@ -594,6 +631,18 @@ fn dispatch(
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
         "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
         "GRAPH.PROFILE" => handle_graph_profile(&args, catalog),
+        "GRAPH.RESTORE.RDB" => {
+            if args.len() < 2 {
+                return Resp::Error(
+                    "ERR GRAPH.RESTORE.RDB requires one or more ordered graph fragments"
+                        .to_string(),
+                );
+            }
+            match catalog.restore_rdb_fragments(&args[1..]) {
+                Ok(name) => Resp::Bulk(name.into_bytes()),
+                Err(err) => Resp::Error(format!("ERR {err}")),
+            }
+        }
         "GRAPH.DUMP" => {
             if args.len() != 2 {
                 return Resp::Error("ERR wrong number of arguments for 'graph.dump' command".to_string());

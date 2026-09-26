@@ -21,6 +21,7 @@ from redis.exceptions import ResponseError
 
 GRAPH = "upstream-real-fixture"
 RESTORED = "upstream-real-fixture-restored"
+RDB_SECOND = "upstream-rdb-second"
 
 
 def endpoint_kwargs(args, *, include_protocol: bool) -> dict:
@@ -58,10 +59,11 @@ def generate(args) -> None:
     raw = redis_client(args)
     db = falkor_client(args)
     try:
-        try:
-            raw.execute_command("GRAPH.DELETE", GRAPH)
-        except ResponseError:
-            pass
+        for graph_name in (GRAPH, RDB_SECOND):
+            try:
+                raw.execute_command("GRAPH.DELETE", graph_name)
+            except ResponseError:
+                pass
 
         graph = db.select_graph(GRAPH)
         graph.create_node_range_index("Person", "age")
@@ -82,6 +84,12 @@ def generate(args) -> None:
             for c in constraints
         ), constraints
 
+        udf_script = """
+        function RdbAdd(x) { return x + 7; }
+        falkor.register("RdbAdd", RdbAdd);
+        """
+        assert db.udf_load("upstream_rdb_ci", udf_script, True) == "OK"
+
         graph.query(
             "CREATE (:Types {"
             "strval:'str', numval:5.5, boolval:true, array:[1,2,3], "
@@ -101,6 +109,15 @@ def generate(args) -> None:
             "CALL db.idx.fulltext.queryNodes('Person','Alice') "
             "YIELD node RETURN node.name"
         ).result_set == [["Alice"]]
+
+        second = db.select_graph(RDB_SECOND)
+        second.create_node_range_index("Second", "id")
+        second.query(
+            "CREATE (:Second {id:1,name:'one'}),(:Second {id:2,name:'two'})"
+        )
+        assert second.query(
+            "MATCH (n:Second) WHERE n.id >= 2 RETURN n.name"
+        ).result_set == [["two"]]
 
         payload = raw.dump(GRAPH)
         if not payload:
@@ -131,17 +148,18 @@ def verify(args) -> None:
     raw = redis_client(args)
     db = falkor_client(args)
     try:
+        target_graph = args.target_graph or RESTORED
         if not args.skip_restore:
             try:
-                raw.execute_command("GRAPH.DELETE", RESTORED)
+                raw.execute_command("GRAPH.DELETE", target_graph)
             except ResponseError:
                 pass
 
-            reply = raw.restore(RESTORED, 0, payload)
+            reply = raw.restore(target_graph, 0, payload)
             if reply not in (True, b"OK", "OK"):
                 raise RuntimeError(f"unexpected RESTORE reply: {reply!r}")
 
-        graph = db.select_graph(RESTORED)
+        graph = db.select_graph(target_graph)
 
         people = graph.query(
             "MATCH (n:Person) RETURN n.name,n.age ORDER BY n.name"
@@ -192,6 +210,21 @@ def verify(args) -> None:
         except ResponseError:
             pass
 
+        if args.verify_udf:
+            udf_result = graph.query("RETURN upstream_rdb_ci.RdbAdd(35)")
+            assert udf_result.result_set == [[42]], udf_result.result_set
+            udf_list = db.udf_list("upstream_rdb_ci", with_code=True)
+            assert len(udf_list) == 1, udf_list
+            assert "RdbAdd" in str(udf_list[0]), udf_list
+
+            second = db.select_graph(RDB_SECOND)
+            second_rows = second.query(
+                "MATCH (n:Second) WHERE n.id >= 1 RETURN n.id,n.name ORDER BY n.id"
+            ).result_set
+            assert second_rows == [[1, "one"], [2, "two"]], second_rows
+            print("UPSTREAM_FALKORDB_RDB_UDF_PASS")
+            print("UPSTREAM_FALKORDB_RAW_RDB_MULTIGRAPH_PASS")
+
         if args.skip_restore:
             print("UPSTREAM_FALKORDB_DUMP_RESTART_PASS")
         else:
@@ -226,6 +259,15 @@ def main() -> None:
         "--skip-restore",
         action="store_true",
         help="query an already-restored fixture, used after a hard server restart",
+    )
+    ver.add_argument(
+        "--target-graph",
+        help="graph name to query/restore; defaults to the ordinary DUMP test name",
+    )
+    ver.add_argument(
+        "--verify-udf",
+        action="store_true",
+        help="also verify the UDF library stored in a full dump.rdb AUX record",
     )
 
     args = parser.parse_args()

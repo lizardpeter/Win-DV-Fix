@@ -209,6 +209,35 @@ pub fn load_latest(
     }))
 }
 
+pub fn remove_all_checkpoints(wal_path: &Path) -> Result<usize, String> {
+    let Some(parent) = wal_path.parent() else {
+        return Ok(0);
+    };
+    if !parent.exists() {
+        return Ok(0);
+    }
+
+    let prefix = checkpoint_prefix(wal_path);
+    let mut removed = 0usize;
+    for entry in fs::read_dir(parent)
+        .map_err(|e| format!("scan checkpoint directory {}: {e}", parent.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read checkpoint directory entry: {e}"))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !rest.ends_with(".fgs") && !rest.contains(".fgs.tmp.") {
+            continue;
+        }
+        fs::remove_file(entry.path())
+            .map_err(|e| format!("remove graph checkpoint {}: {e}", entry.path().display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 pub fn cleanup_old_checkpoints(
     wal_path: &Path,
     keep: usize,

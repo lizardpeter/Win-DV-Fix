@@ -123,6 +123,55 @@ if (($AbsoluteOutput -join "`n") -notmatch "must be relative") {
     throw "Portable absolute-path rejection did not emit the expected diagnostic"
 }
 
+# Launch from outside the package and prove relative storage is still anchored
+# beside server.exe rather than to the caller's working directory.
+$RuntimeSmokeDirName = "data-runtime-smoke"
+$RuntimeSmokeDir = Join-Path $Stage $RuntimeSmokeDirName
+$ExternalLeakDir = Join-Path $OutputDir $RuntimeSmokeDirName
+Remove-Item -Recurse -Force $RuntimeSmokeDir -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $ExternalLeakDir -ErrorAction SilentlyContinue
+$RuntimeStdout = Join-Path $Stage "logs\portable-runtime-smoke-stdout.txt"
+$RuntimeStderr = Join-Path $Stage "logs\portable-runtime-smoke-stderr.txt"
+$PortableProc = Start-Process -FilePath (Join-Path $Stage "server.exe") `
+    -ArgumentList @("--portable", "--data-dir", $RuntimeSmokeDirName, "--port", "0") `
+    -WorkingDirectory $OutputDir `
+    -RedirectStandardOutput $RuntimeStdout `
+    -RedirectStandardError $RuntimeStderr `
+    -PassThru
+try {
+    Start-Sleep -Milliseconds 750
+    if ($PortableProc.HasExited) {
+        $ErrText = if (Test-Path $RuntimeStderr) { Get-Content $RuntimeStderr -Raw } else { "" }
+        throw "Portable runtime smoke exited unexpectedly: $ErrText"
+    }
+    if (-not (Test-Path $RuntimeSmokeDir)) {
+        throw "Portable server did not create runtime data beside server.exe"
+    }
+    if (Test-Path $ExternalLeakDir) {
+        throw "Portable server leaked runtime data into the caller working directory"
+    }
+} finally {
+    if (-not $PortableProc.HasExited) {
+        Stop-Process -Id $PortableProc.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $PortableProc.Id -ErrorAction SilentlyContinue
+    }
+}
+Remove-Item -Recurse -Force $RuntimeSmokeDir -ErrorAction SilentlyContinue
+
+# Verify the final PE does not depend on the separately installed MSVC runtime.
+$Link = Get-Command link.exe -ErrorAction SilentlyContinue
+if ($Link) {
+    $Deps = & $Link.Source /dump /dependents (Join-Path $Stage "server.exe") 2>&1
+    $Deps | Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
+    $DepsText = $Deps -join "`n"
+    if ($DepsText -match "(?i)VCRUNTIME140|MSVCP140") {
+        throw "Packaged server still depends on the external MSVC runtime"
+    }
+} else {
+    "link.exe unavailable during packaging; PE dependency audit skipped" |
+        Set-Content -Encoding UTF8 (Join-Path $Stage "DEPENDENCIES.txt")
+}
+
 # Prove the packaged executable itself starts and parses its CLI before zipping.
 $Help = & (Join-Path $Stage "server.exe") --help 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -140,6 +189,8 @@ server.exe sha256 $Hash
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 
+Write-Host "NATIVE_WINDOWS_PORTABLE_EXTERNAL_CWD_PASS"
+Write-Host "NATIVE_WINDOWS_STATIC_RUNTIME_AUDIT_PASS"
 Write-Host "NATIVE_WINDOWS_PORTABLE_CONFINEMENT_PASS"
 Write-Host "NATIVE_WINDOWS_PACKAGE_PASS"
 Write-Host "Package directory: $Stage"

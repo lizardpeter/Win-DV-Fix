@@ -182,8 +182,6 @@ def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -
     finally:
         source.close()
         destination.close()
-        source_db.close()
-        destination_db.close()
     return moved
 
 
@@ -266,6 +264,8 @@ def main() -> int:
     finally:
         source.close()
         destination.close()
+        source_db.close()
+        destination_db.close()
 
 
 if __name__ == "__main__":

@@ -180,31 +180,74 @@ def rollback_graph(
         ) from rollback_exc
 
 
+def parse_udf_rows(rows) -> dict[str, str]:
+    """Return library name -> source code from GRAPH.UDF LIST WITHCODE."""
+    parsed: dict[str, str] = {}
+    for row in rows:
+        # Current FalkorDB returns alternating labeled fields:
+        # ["library_name", name, "functions", [...],
+        #  "library_code", source].
+        if len(row) < 4 or len(row) % 2 != 0:
+            raise RuntimeError(f"unexpected GRAPH.UDF LIST WITHCODE row: {row!r}")
+        fields = {
+            text(row[i]).lower(): row[i + 1]
+            for i in range(0, len(row), 2)
+        }
+        if "library_name" not in fields or "library_code" not in fields:
+            raise RuntimeError(
+                f"GRAPH.UDF LIST WITHCODE omitted required fields: {row!r}"
+            )
+        parsed[text(fields["library_name"])] = text(fields["library_code"])
+    return parsed
+
+
 def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -> int:
     """Move process-global FalkorDB UDF libraries through the public API."""
     source = FalkorDB(**source_ep.falkor_kwargs())
     destination = FalkorDB(**destination_ep.falkor_kwargs())
     moved = 0
     try:
-        libraries = source.udf_list(with_code=True)
-        for row in libraries:
-            # Current FalkorDB returns alternating labeled fields:
-            # ["library_name", name, "functions", [...],
-            #  "library_code", source].
-            if len(row) < 4 or len(row) % 2 != 0:
-                raise RuntimeError(f"unexpected GRAPH.UDF LIST WITHCODE row: {row!r}")
-            fields = {
-                text(row[i]).lower(): row[i + 1]
-                for i in range(0, len(row), 2)
-            }
-            if "library_name" not in fields or "library_code" not in fields:
+        source_libraries = parse_udf_rows(source.udf_list(with_code=True))
+        destination_libraries = parse_udf_rows(
+            destination.udf_list(with_code=True)
+        )
+
+        for name, code in source_libraries.items():
+            previous_code = destination_libraries.get(name)
+            if previous_code is not None and not replace:
                 raise RuntimeError(
-                    f"GRAPH.UDF LIST WITHCODE omitted required fields: {row!r}"
+                    f"destination UDF library {name!r} already exists; "
+                    "rerun with --replace"
                 )
-            name = text(fields["library_name"])
-            code = text(fields["library_code"])
-            destination.udf_load(name, code, replace)
+
+            try:
+                destination.udf_load(name, code, replace)
+                verified = parse_udf_rows(
+                    destination.udf_list(name, with_code=True)
+                )
+                if verified.get(name) != code:
+                    raise RuntimeError(
+                        f"destination UDF library {name!r} did not preserve source code"
+                    )
+            except Exception as exc:
+                try:
+                    if previous_code is not None:
+                        destination.udf_load(name, previous_code, True)
+                    else:
+                        current = parse_udf_rows(
+                            destination.udf_list(name, with_code=True)
+                        )
+                        if name in current:
+                            destination.udf_delete(name)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"UDF migration failed for {name!r}: {exc}; "
+                        f"rollback also failed: {rollback_exc}"
+                    ) from exc
+                raise
+
             moved += 1
+            destination_libraries[name] = code
     finally:
         source.close()
         destination.close()

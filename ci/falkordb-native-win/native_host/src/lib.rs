@@ -222,6 +222,20 @@ impl NativeGraph {
 
             mvcc.commit(Arc::clone(&private));
             wait_for_recovered_indexes(&mvcc, Duration::from_secs(60))?;
+
+            // Effects replay uses FalkorDB's normal asynchronous CREATE INDEX
+            // path. Multiple index-DDL records for the same label can cause
+            // generation-safe population workers to cancel one another; once
+            // every worker has released its ticket (pending == 0), perform one
+            // deterministic final population from the fully replayed graph.
+            //
+            // The native Windows index store is id-keyed and ADD_REPLACE
+            // semantics make this pass idempotent: documents already populated
+            // by a background worker are replaced, while any index whose worker
+            // exited without populating is filled here. This keeps WAL recovery
+            // deterministic without re-introducing the snapshot progress-counter
+            // hang fixed by the pending-only readiness predicate.
+            private.borrow_mut().populate_indexes_sync();
         } else if has_snapshot {
             // MvccGraph::from_graph does not perform a commit, so publish the
             // restored graph Arc into its indexers explicitly for subsequent

@@ -227,6 +227,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Bundled migration Python runtime is not self-contained"
 }
 
+$OutsideFile = Join-Path $env:WINDIR "win.ini"
+if (Test-Path $OutsideFile) {
+    $ToolEscape = & "$Root\python\python.exe" "$Root\import_falkordb_rdb.py" inspect --rdb $OutsideFile 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($ToolEscape -join "`n") -notmatch "outside portable package root") {
+        throw "Portable migration helper accepted a file outside the package"
+    }
+}
+
 $Escape = & "$Root\server.exe" --portable --data-dir "..\escape" 2>&1
 if ($LASTEXITCODE -eq 0 -or ($Escape -join "`n") -notmatch "may not escape") {
     throw "Portable parent-directory confinement check failed"

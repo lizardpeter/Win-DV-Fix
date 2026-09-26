@@ -1,2 +1,2 @@
-falkordb
-redis
+falkordb==1.7.1
+redis==8.1.0

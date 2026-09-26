@@ -191,6 +191,17 @@ def phase_write():
         "YIELD node RETURN node.name"
     )
     assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
+
+    # A malformed REPLACE must not destroy the existing destination graph.
+    try:
+        raw.restore(REDIS_RESTORED_GRAPH, 0, b"not-a-valid-redis-dump", replace=True)
+        raise AssertionError("corrupt RESTORE REPLACE unexpectedly succeeded")
+    except ResponseError:
+        pass
+    preserved = restored_graph.query(
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name"
+    )
+    assert preserved.result_set == [["Alice"], ["Bob"]], preserved.result_set
     raw.close()
 
     # Read-only command must work for reads and reject writes.

@@ -23,17 +23,18 @@ GRAPH = "upstream-real-fixture"
 RESTORED = "upstream-real-fixture-restored"
 
 
-def redis_client(args) -> Redis:
+def endpoint_kwargs(args, *, include_protocol: bool) -> dict:
     kwargs = {
         "host": args.host,
         "port": args.port,
         "password": args.password,
-        "decode_responses": False,
-        "protocol": 2,
         "socket_connect_timeout": 10,
         "socket_timeout": 30,
         "ssl": args.ssl,
     }
+    if include_protocol:
+        kwargs["protocol"] = 2
+        kwargs["decode_responses"] = False
     if args.ssl:
         if args.ca:
             kwargs["ssl_ca_certs"] = args.ca
@@ -42,18 +43,15 @@ def redis_client(args) -> Redis:
             kwargs["ssl_certfile"] = args.cert
         if args.key:
             kwargs["ssl_keyfile"] = args.key
-    return Redis(**kwargs)
+    return kwargs
+
+
+def redis_client(args) -> Redis:
+    return Redis(**endpoint_kwargs(args, include_protocol=True))
 
 
 def falkor_client(args) -> FalkorDB:
-    kwargs = redis_client(args).connection_pool.connection_kwargs.copy()
-    kwargs.pop("decode_responses", None)
-    kwargs.pop("protocol", None)
-    kwargs.pop("health_check_interval", None)
-    kwargs.pop("client_name", None)
-    kwargs.pop("lib_name", None)
-    kwargs.pop("lib_version", None)
-    return FalkorDB(**kwargs)
+    return FalkorDB(**endpoint_kwargs(args, include_protocol=False))
 
 
 def generate(args) -> None:
@@ -108,8 +106,8 @@ def generate(args) -> None:
         manifest = {
             "graph": GRAPH,
             "dump_bytes": len(payload),
-            "redis_version": info.get("redis_version") or info.get(b"redis_version"),
-            "redis_mode": info.get("redis_mode") or info.get(b"redis_mode"),
+            "redis_version": str(info.get("redis_version") or info.get(b"redis_version") or ""),
+            "redis_mode": str(info.get("redis_mode") or info.get(b"redis_mode") or ""),
         }
         args.output.with_suffix(args.output.suffix + ".json").write_text(
             json.dumps(manifest, sort_keys=True, indent=2),

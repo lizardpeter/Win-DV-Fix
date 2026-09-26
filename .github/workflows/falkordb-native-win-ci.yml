@@ -61,6 +61,13 @@ jobs:
           python - <<'PY'
           from redis import Redis
           client = Redis(host="127.0.0.1", port=6379)
+          # Force this small fixture through FalkorDB's real multi-key RDB
+          # persistence path. DUMP remains single-key, but SAVE will create
+          # graphmeta virtual keys and split node/edge payloads.
+          reply = client.execute_command(
+              "GRAPH.CONFIG", "SET", "VKEY_MAX_ENTITY_COUNT", "2"
+          )
+          print("VKEY config reply:", reply)
           assert client.save() is True
           print("UPSTREAM_FALKORDB_RDB_SAVE_PASS")
           PY

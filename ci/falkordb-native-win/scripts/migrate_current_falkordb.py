@@ -12,6 +12,7 @@ without a custom export plugin on the source FalkorDB server.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 
@@ -78,6 +79,81 @@ def text(value) -> str:
     return str(value)
 
 
+def canonical(value):
+    """Convert FalkorDB/Redis response values into deterministic JSON-safe data."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, dict):
+        return {
+            text(key): canonical(item)
+            for key, item in sorted(value.items(), key=lambda pair: text(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [canonical(item) for item in value]
+    return value
+
+
+def canonical_rows(rows) -> list[str]:
+    return sorted(
+        json.dumps(canonical(row), sort_keys=True, separators=(",", ":"))
+        for row in rows
+    )
+
+
+def graph_signature(db: FalkorDB, name: str) -> dict:
+    """Capture migration-critical graph structure without depending on row order."""
+    graph = db.select_graph(name)
+
+    def scalar(query: str) -> int:
+        result = graph.ro_query(query).result_set
+        if len(result) != 1 or len(result[0]) != 1:
+            raise RuntimeError(
+                f"unexpected scalar result for {name!r}: {query!r} -> {result!r}"
+            )
+        return int(result[0][0])
+
+    labels = canonical_rows(graph.ro_query("CALL db.labels()").result_set)
+    relationship_types = canonical_rows(
+        graph.ro_query("CALL db.relationshipTypes()").result_set
+    )
+    property_keys = canonical_rows(
+        graph.ro_query("CALL db.propertyKeys()").result_set
+    )
+
+    # Exclude transient population status. Everything else here describes the
+    # persistent index definition and must survive a lossless migration.
+    indexes = canonical_rows(
+        graph.ro_query(
+            "CALL db.indexes() "
+            "YIELD label, properties, types, language, stopwords, entitytype, info "
+            "RETURN label, properties, types, language, stopwords, entitytype, info"
+        ).result_set
+    )
+
+    constraints = canonical_rows(graph.list_constraints())
+
+    return {
+        "nodes": scalar("MATCH (n) RETURN count(n)"),
+        "relationships": scalar("MATCH ()-[r]->() RETURN count(r)"),
+        "labels": labels,
+        "relationship_types": relationship_types,
+        "property_keys": property_keys,
+        "indexes": indexes,
+        "constraints": constraints,
+    }
+
+
+def verify_graph(source_db: FalkorDB, destination_db: FalkorDB, name: str) -> None:
+    source_signature = graph_signature(source_db, name)
+    destination_signature = graph_signature(destination_db, name)
+    if source_signature != destination_signature:
+        raise RuntimeError(
+            "semantic verification failed for "
+            f"{name!r}\nsource={json.dumps(source_signature, sort_keys=True)}"
+            f"\ndestination={json.dumps(destination_signature, sort_keys=True)}"
+        )
+
+
 def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -> int:
     """Move process-global FalkorDB UDF libraries through the public API."""
     source = FalkorDB(**source_ep.falkor_kwargs())
@@ -106,6 +182,8 @@ def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -
     finally:
         source.close()
         destination.close()
+        source_db.close()
+        destination_db.close()
     return moved
 
 
@@ -134,6 +212,11 @@ def main() -> int:
         action="store_true",
         help="migrate graph keys only",
     )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="skip semantic source/destination verification after each graph",
+    )
     args = parser.parse_args()
 
     source_ep = endpoint_from_args(args, "source")
@@ -141,6 +224,8 @@ def main() -> int:
 
     source = Redis(**source_ep.redis_kwargs())
     destination = Redis(**destination_ep.redis_kwargs())
+    source_db = FalkorDB(**source_ep.falkor_kwargs())
+    destination_db = FalkorDB(**destination_ep.falkor_kwargs())
 
     try:
         graph_names = source.execute_command("GRAPH.LIST")
@@ -167,6 +252,10 @@ def main() -> int:
             dest_graphs = {text(v) for v in destination.execute_command("GRAPH.LIST")}
             if name not in dest_graphs:
                 raise RuntimeError(f"destination did not register restored graph {name!r}")
+
+            if not args.skip_verify:
+                verify_graph(source_db, destination_db, name)
+                print(f"verified {name!r}: data/schema/index/constraint signature matches")
 
         if not args.skip_udfs:
             moved_udfs = migrate_udfs(source_ep, destination_ep, args.replace)

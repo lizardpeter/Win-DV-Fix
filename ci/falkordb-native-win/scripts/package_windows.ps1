@@ -248,6 +248,9 @@ if ($LASTEXITCODE -eq 0 -or ($Escape -join "`n") -notmatch "may not escape") {
     throw "Portable parent-directory confinement check failed"
 }
 
+# Negative confinement checks intentionally execute children that fail.
+# Clear their native exit status so callers see the verifier's actual success.
+$global:LASTEXITCODE = 0
 Write-Host "PORTABLE_FOLDER_VERIFY_PASS"
 '@ | Set-Content -Encoding UTF8 (Join-Path $Stage "verify-portable.ps1")
 
@@ -390,3 +393,8 @@ Write-Host "NATIVE_WINDOWS_PACKAGE_PASS"
 Write-Host "Package directory: $Stage"
 Write-Host "Package archive:   $Zip"
 Write-Host "server.exe SHA256: $Hash"
+
+# The package verification deliberately runs negative native-process tests.
+# Ensure the GitHub/PowerShell host exits according to this script's success,
+# not a stale child-process LASTEXITCODE.
+$global:LASTEXITCODE = 0

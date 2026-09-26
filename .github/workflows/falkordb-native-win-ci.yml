@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - chatgpt/falkordb-native-win-ci
-      - chatgpt/falkordb-raw-rdb-import
     paths:
       - 'ci/falkordb-native-win/**'
       - '.github/workflows/falkordb-native-win-ci.yml'
@@ -146,6 +145,18 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --upgrade falkordb trustme
 
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ci/falkordb-native-win/build/cargo-target
+          key: falkordb-native-rust-staticcrt-v1-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml', 'ci/falkordb-native-win/scripts/bootstrap_windows.ps1', 'ci/falkordb-native-win/scripts/diagnose.ps1', 'ci/falkordb-native-win/scripts/apply_windows_foundation.py', 'ci/falkordb-native-win/patches/**/*.rs') }}
+          restore-keys: |
+            falkordb-native-rust-staticcrt-v1-${{ runner.os }}-
+
       - name: Compile, link, and run smoke test
         shell: pwsh
         run: |
@@ -173,7 +184,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ci/falkordb-native-win/build/cargo-target
-          key: falkordb-native-rust-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml') }}
+          key: falkordb-native-rust-staticcrt-v1-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml', 'ci/falkordb-native-win/scripts/bootstrap_windows.ps1', 'ci/falkordb-native-win/scripts/diagnose.ps1', 'ci/falkordb-native-win/scripts/apply_windows_foundation.py', 'ci/falkordb-native-win/patches/**/*.rs') }}
 
       - name: Upload diagnostics
         if: always()

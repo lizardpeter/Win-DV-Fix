@@ -3,14 +3,48 @@
 This package contains the standalone Windows FalkorDB-derived server. Redis,
 Memurai, Docker, WSL, Hyper-V, and a VM are not required at runtime.
 
+## Portable one-folder layout
+
+The supported packaged launch mode is deliberately portable. **All runtime
+state stays inside the folder containing `server.exe`.** The launcher creates:
+
+```text
+falkordb-native-windows-x64\
+  server.exe
+  start-local.ps1
+  portable-env.ps1
+  run-tool.ps1
+  data\
+  logs\
+  tls\
+  tmp\
+  pycache\
+  imports\
+  exports\
+  migration\
+  ...migration/documentation files...
+```
+
+`start-local.ps1` enables `--portable`, roots the graph catalog at
+`.\data`, and redirects process/Python temporary and cache locations beneath
+this same folder. Portable mode rejects absolute data/TLS paths and any path
+containing `..` so runtime files cannot escape the package directory.
+
+The folder can therefore be moved as a unit. There is no application data
+directory under the user profile, ProgramData, AppData, or the Windows temp
+directory.
+
 ## Start locally
 
-Set a password and choose a durable data directory:
+Set a password and launch from the extracted package folder:
 
 ```powershell
 $env:FALKORDB_PASSWORD = "replace-with-a-long-random-secret"
-.\server.exe --bind 127.0.0.1:6379 --data-dir D:\FalkorDBNative\data
+.\start-local.ps1
 ```
+
+The persistent database is automatically stored in `.\data`; no external
+data path is needed or accepted in portable mode.
 
 Connect with the normal FalkorDB Python client:
 
@@ -33,11 +67,11 @@ present a certificate signed by your CA.
 
 ```powershell
 .\server.exe `
+  --portable `
   --bind 0.0.0.0:6379 `
-  --data-dir D:\FalkorDBNative\data `
   --password "replace-with-a-long-random-secret" `
-  --tls-cert D:\FalkorDBNative\tls\server-cert.pem `
-  --tls-key D:\FalkorDBNative\tls\server-key.pem
+  --tls-cert tls\server-cert.pem `
+  --tls-key tls\server-key.pem
 ```
 
 The server refuses unsafe unauthenticated non-loopback operation unless an
@@ -90,22 +124,22 @@ If source and destination cannot be online simultaneously, create a portable
 bundle on a machine that can reach the current FalkorDB source:
 
 ```powershell
-py .\falkordb_bundle.py export `
+.\run-tool.ps1 bundle export `
   --source-host SOURCE_HOST `
   --source-port 6379 `
   --source-password "SOURCE_PASSWORD" `
-  --output .\falkordb-migration.zip
+  --output .\exports\falkordb-migration.zip
 ```
 
 Move that ZIP to a machine that can reach the native Windows server and import
 it:
 
 ```powershell
-py .\falkordb_bundle.py import `
+.\run-tool.ps1 bundle import `
   --destination-host DESTINATION_HOST `
   --destination-port 6379 `
   --destination-password "DESTINATION_PASSWORD" `
-  --input .\falkordb-migration.zip
+  --input .\imports\falkordb-migration.zip
 ```
 
 The bundle contains the original graph DUMP bytes, SHA-256 hashes, semantic
@@ -121,14 +155,14 @@ For a current standalone FalkorDB RDB file, the original FalkorDB server does
 not need to be running. Inspect the file first:
 
 ```powershell
-py .\import_falkordb_rdb.py inspect --rdb D:\backup\dump.rdb
+.\run-tool.ps1 import-rdb inspect --rdb .\imports\dump.rdb
 ```
 
 Then import it into an empty/native destination:
 
 ```powershell
-py .\import_falkordb_rdb.py import `
-  --rdb D:\backup\dump.rdb `
+.\run-tool.ps1 import-rdb import `
+  --rdb .\imports\dump.rdb `
   --destination-host DESTINATION_HOST `
   --destination-port 6379 `
   --destination-password "DESTINATION_PASSWORD"
@@ -175,11 +209,11 @@ The same server can expose the authenticated HTTPS JSON API:
 
 ```powershell
 .\server.exe `
+  --portable `
   --bind 0.0.0.0:6379 `
-  --data-dir D:\FalkorDBNative\data `
   --password "RESP_PASSWORD" `
-  --tls-cert D:\FalkorDBNative\tls\server-cert.pem `
-  --tls-key D:\FalkorDBNative\tls\server-key.pem `
+  --tls-cert tls\server-cert.pem `
+  --tls-key tls\server-key.pem `
   --api-bind 0.0.0.0:8443 `
   --api-token "READ_WRITE_BEARER_TOKEN" `
   --api-read-token "READ_ONLY_BEARER_TOKEN"

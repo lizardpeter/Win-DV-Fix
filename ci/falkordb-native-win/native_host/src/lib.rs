@@ -839,9 +839,19 @@ fn wait_for_recovered_indexes(
         let snapshot = mvcc.read();
         let infos = snapshot.borrow().index_info();
 
+        // FalkorDB's actual operational predicate is the generation-scoped
+        // pending counter. The progress/total pair is informational metadata:
+        // synchronous RDB/checkpoint population can finish with pending == 0
+        // without advancing that counter, and sparse indexed properties can
+        // legitimately produce fewer documents than the label cardinality.
+        //
+        // Treating progress < total as "not recovered" therefore wedges a
+        // correctly rebuilt checkpoint forever (for example pending=0,
+        // progress=0/1). Waiting on pending preserves the same readiness
+        // contract used by Indexer::is_operational()/enabled().
         let incomplete: Vec<String> = infos
             .iter()
-            .filter(|info| info.pending > 0 || (info.total > 0 && info.progress < info.total))
+            .filter(|info| info.pending > 0)
             .map(|info| {
                 format!(
                     "{}:{} pending={} progress={}/{}",

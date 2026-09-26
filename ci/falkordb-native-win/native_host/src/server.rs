@@ -4,8 +4,12 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rustls::{
@@ -13,7 +17,7 @@ use rustls::{
     server::WebPkiClientVerifier,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
@@ -87,6 +91,54 @@ impl ServerConfig {
 
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct RunningQueryInfo {
+    id: u64,
+    received_at: i64,
+    graph_name: String,
+    query: String,
+    start: Instant,
+}
+
+static NEXT_RUNNING_QUERY_ID: AtomicU64 = AtomicU64::new(1);
+static RUNNING_QUERIES: LazyLock<Mutex<Vec<RunningQueryInfo>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+struct RunningQueryGuard {
+    id: u64,
+}
+
+impl RunningQueryGuard {
+    fn register(graph_name: &str, query: &str) -> Self {
+        let id = NEXT_RUNNING_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let received_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        RUNNING_QUERIES.lock().push(RunningQueryInfo {
+            id,
+            received_at,
+            graph_name: graph_name.to_string(),
+            query: query.to_string(),
+            start: Instant::now(),
+        });
+        Self { id }
+    }
+}
+
+impl Drop for RunningQueryGuard {
+    fn drop(&mut self) {
+        let mut running = RUNNING_QUERIES.lock();
+        if let Some(index) = running.iter().position(|query| query.id == self.id) {
+            running.swap_remove(index);
+        }
+    }
+}
+
+fn running_queries_snapshot() -> Vec<RunningQueryInfo> {
+    RUNNING_QUERIES.lock().clone()
 }
 
 pub struct GraphCatalog {
@@ -684,6 +736,7 @@ fn dispatch(
                 Resp::Simple("none".to_string())
             }
         }
+        "GRAPH.INFO" => handle_graph_info(&args),
         "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
@@ -1159,6 +1212,82 @@ fn handle_graph_profile(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
     }
 }
 
+fn handle_graph_info(args: &[Vec<u8>]) -> Resp {
+    let all = args.len() == 1;
+    let mut want_running = all;
+    let mut want_waiting = all;
+    let mut want_object_pool = all;
+
+    for section in args.iter().skip(1) {
+        match ascii_upper(section).as_str() {
+            "RUNNINGQUERIES" => want_running = true,
+            "WAITINGQUERIES" => want_waiting = true,
+            "OBJECTPOOL" => want_object_pool = true,
+            _ => {}
+        }
+    }
+
+    if !(want_running || want_waiting || want_object_pool) {
+        return bulk("no section found");
+    }
+
+    let mut out = Vec::new();
+
+    if want_running {
+        let now = Instant::now();
+        let rows = running_queries_snapshot()
+            .into_iter()
+            .map(|query| {
+                let duration_ms = now.duration_since(query.start).as_secs_f64() * 1000.0;
+                Resp::Array(vec![
+                    bulk("Received at"),
+                    Resp::Int(query.received_at),
+                    bulk("Graph name"),
+                    bulk(query.graph_name),
+                    bulk("Query"),
+                    bulk(query.query),
+                    bulk("Execution duration"),
+                    bulk(format_float(duration_ms)),
+                    bulk("Replicated command"),
+                    Resp::Int(0),
+                ])
+            })
+            .collect();
+        out.push(bulk("# Running queries"));
+        out.push(Resp::Array(rows));
+    }
+
+    if want_waiting {
+        // The standalone server does not enqueue queries in a thread pool:
+        // each authenticated connection executes directly on its connection
+        // thread. Consequently there is no server-side waiting-query queue.
+        out.push(bulk("# Waiting queries"));
+        out.push(Resp::Array(Vec::new()));
+    }
+
+    if want_object_pool {
+        let (count, average_refs) = graph::runtime::string_pool::global().stats();
+        let average = if average_refs.fract() == 0.0 {
+            format!("{}", average_refs as i64)
+        } else {
+            format!("{average_refs}")
+        };
+        out.push(bulk("Object Pool"));
+        out.push(Resp::Array(vec![
+            Resp::Array(vec![
+                bulk("Unique Objects in Pool"),
+                Resp::Int(count as i64),
+            ]),
+            Resp::Array(vec![
+                bulk("Average References per Object"),
+                bulk(average),
+            ]),
+        ]));
+    }
+
+    Resp::Array(out)
+}
+
 fn handle_graph_memory(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
     const MB: usize = 1 << 20;
 
@@ -1390,6 +1519,7 @@ fn handle_graph_query(args: &[Vec<u8>], catalog: &GraphCatalog, read_only: bool)
         }
     };
 
+    let _running_query = RunningQueryGuard::register(name, query);
     let result = if read_only {
         graph.query_read_only_with_timeout(query, timeout)
     } else {

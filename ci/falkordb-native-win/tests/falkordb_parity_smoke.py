@@ -80,7 +80,22 @@ def main():
         "SET a.embedding=vecf32([0.0,0.0]), b.embedding=vecf32([10.0,10.0])"
     )
     indexes = graph.list_indices().result_set
-    assert len(indexes) >= 3, indexes
+
+    # Current FalkorDB consolidates all index types for the same label/entity
+    # into one db.indexes() row. A property can itself have multiple index
+    # types, so row count is not the number of CREATE INDEX statements.
+    account_rows = [
+        row for row in indexes
+        if row[0] == "Account" and row[6] == "NODE"
+    ]
+    assert len(account_rows) == 1, indexes
+    account_index = account_rows[0]
+    assert set(account_index[1]) == {"id", "name", "embedding"}, account_index
+
+    index_types = account_index[2]
+    assert "RANGE" in index_types["id"], account_index
+    assert "FULLTEXT" in index_types["name"], account_index
+    assert "VECTOR" in index_types["embedding"], account_index
 
     result = graph.query("MATCH (n:Account) WHERE n.id=2 RETURN n.name")
     assert result.result_set == [["beta"]], result.result_set

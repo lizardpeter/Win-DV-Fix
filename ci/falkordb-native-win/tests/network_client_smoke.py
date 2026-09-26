@@ -193,6 +193,14 @@ def phase_write():
     )
     assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
 
+    # Schema migration must preserve UNIQUE constraint enforcement, not just
+    # graph data and indexes.
+    try:
+        restored_graph.query("CREATE (:Person {name:'Alice',age:99})")
+        raise AssertionError("restored UNIQUE constraint accepted duplicate Person.name")
+    except ResponseError:
+        pass
+
     # A malformed REPLACE must not destroy the existing destination graph.
     try:
         raw.restore(REDIS_RESTORED_GRAPH, 0, b"not-a-valid-redis-dump", replace=True)

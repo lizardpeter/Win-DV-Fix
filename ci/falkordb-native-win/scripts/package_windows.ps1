@@ -54,6 +54,20 @@ if (($Help -join "`n") -notmatch "falkordb-native-server") {
 }
 $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
+# Verify the portable binary does not depend on the separately-installed
+# Microsoft Visual C++ runtime. Windows system DLLs remain normal imports.
+$Link = Get-Command link.exe -ErrorAction SilentlyContinue
+if ($Link) {
+    $Dependents = & $Link.Source /dump /dependents (Join-Path $Stage "server.exe") 2>&1
+    $Dependents | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_DEPENDENCIES.txt")
+    $DependencyText = ($Dependents -join "`n")
+    if ($DependencyText -match "(?i)(VCRUNTIME|MSVCP|api-ms-win-crt-)") {
+        throw "Packaged server still depends on the dynamic Microsoft C/C++ runtime"
+    }
+} else {
+    Write-Warning "link.exe not found; skipping PE dependency assertion"
+}
+
 $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.ToLowerInvariant()
 @"
 server.exe sha256 $Hash

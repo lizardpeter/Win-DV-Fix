@@ -362,8 +362,11 @@ $MutableRoots = @(
 $ManifestPath = Join-Path $Stage "SHA256SUMS.txt"
 $ManifestLines = Get-ChildItem -Path $Stage -File -Recurse |
     Where-Object {
-        $_.FullName -ne $ManifestPath -and
-        -not ($MutableRoots | Where-Object { $_ -and $_.Length -gt 0 -and $_ -ne $Stage -and $PSItem.FullName.StartsWith($_ + [IO.Path]::DirectorySeparatorChar) })
+        $CurrentPath = $_.FullName
+        $UnderMutableRoot = $MutableRoots | Where-Object {
+            $CurrentPath.StartsWith($_ + [IO.Path]::DirectorySeparatorChar)
+        }
+        $CurrentPath -ne $ManifestPath -and -not $UnderMutableRoot
     } |
     Sort-Object FullName |
     ForEach-Object {
@@ -372,6 +375,11 @@ $ManifestLines = Get-ChildItem -Path $Stage -File -Recurse |
         "$Digest  $Relative"
     }
 $ManifestLines | Set-Content -Encoding ASCII $ManifestPath
+
+& (Join-Path $Stage "verify-portable.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Portable verifier failed after SHA256 manifest generation"
+}
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 

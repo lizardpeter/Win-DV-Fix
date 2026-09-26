@@ -84,6 +84,37 @@ Use `--replace` only when an existing destination graph/UDF with the same name
 should be replaced. Existing destination graph bytes are backed up before a
 replacement and restored on failure.
 
+## Offline portable bundle
+
+If source and destination cannot be online simultaneously, create a portable
+bundle on a machine that can reach the current FalkorDB source:
+
+```powershell
+py .\falkordb_bundle.py export `
+  --source-host SOURCE_HOST `
+  --source-port 6379 `
+  --source-password "SOURCE_PASSWORD" `
+  --output .\falkordb-migration.zip
+```
+
+Move that ZIP to a machine that can reach the native Windows server and import
+it:
+
+```powershell
+py .\falkordb_bundle.py import `
+  --destination-host DESTINATION_HOST `
+  --destination-port 6379 `
+  --destination-password "DESTINATION_PASSWORD" `
+  --input .\falkordb-migration.zip
+```
+
+The bundle contains the original graph DUMP bytes, SHA-256 hashes, semantic
+source signatures, and UDF source code. Import verifies the hashes and compares
+the restored graph against the recorded node/relationship counts, labels,
+relationship types, property keys, indexes, and constraints. Use
+`falkordb_bundle.py inspect --input <bundle.zip>` to inspect its manifest
+without connecting to a server.
+
 ## Import a single ordinary FalkorDB DUMP
 
 The native server implements Redis `RESTORE` for current FalkorDB

@@ -123,6 +123,7 @@ $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkord
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
 $MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
+$BundleUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "falkordb_bundle.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -281,6 +282,62 @@ try {
             throw "Whole-database migration --replace failed with exit code $LASTEXITCODE"
         }
 
+        # Prove the offline migration format as the final state before restart:
+        # export all graph DUMPs/signatures/UDF source to one portable ZIP, then
+        # import that bundle with replacement and semantic verification.
+        $BundlePath = Join-Path $WorkDir "falkordb-portable-migration.zip"
+        Remove-Item -Force $BundlePath -ErrorAction SilentlyContinue
+
+        $BundleExportArgs = @(
+            "export",
+            "--source-host", "localhost",
+            "--source-port", "6391",
+            "--source-password", "native-ci-secret",
+            "--source-ssl",
+            "--source-ca", (Join-Path $TlsDir "ca.pem"),
+            "--source-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--source-key", (Join-Path $TlsDir "client-key.pem"),
+            "--output", $BundlePath
+        )
+        python $BundleUtility @BundleExportArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_export.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle export failed with exit code $LASTEXITCODE"
+        }
+        $BundleExportText = (Get-Content (Join-Path $Logs "10_bundle_export.txt") -Raw)
+        if ($BundleExportText -notmatch "BUNDLE_EXPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle export did not emit completion marker"
+        }
+
+        python $BundleUtility inspect --input $BundlePath 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_inspect.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle inspect failed with exit code $LASTEXITCODE"
+        }
+
+        $BundleImportArgs = @(
+            "import",
+            "--destination-host", "localhost",
+            "--destination-port", "6392",
+            "--destination-password", "native-ci-secret",
+            "--destination-ssl",
+            "--destination-ca", (Join-Path $TlsDir "ca.pem"),
+            "--destination-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--destination-key", (Join-Path $TlsDir "client-key.pem"),
+            "--input", $BundlePath,
+            "--replace"
+        )
+        python $BundleUtility @BundleImportArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_import.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle import failed with exit code $LASTEXITCODE"
+        }
+        $BundleImportText = (Get-Content (Join-Path $Logs "10_bundle_import.txt") -Raw)
+        if ($BundleImportText -notmatch "BUNDLE_IMPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle import did not emit completion marker"
+        }
+        Write-Host "NATIVE_OFFLINE_BUNDLE_MIGRATION_PASS"
+
         Stop-Process -Id $MigrationServer.Id -Force
         Wait-Process -Id $MigrationServer.Id -ErrorAction SilentlyContinue
         $MigrationServer = $null
@@ -365,5 +422,6 @@ Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
+Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_UPSTREAM_FALKORDB_DUMP_PASS"
 

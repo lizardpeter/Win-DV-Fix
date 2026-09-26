@@ -134,6 +134,40 @@ def patch_udf_js_state_drop_order():
     print("patched QuickJS thread-local destruction order")
 
 
+def patch_upstream_time_decode_compat():
+    """Canonicalize FalkorDB TIME persistence to seconds since midnight.
+
+    Stable FalkorDB C releases serialize T_TIME as a time_t whose date anchor
+    may be 1900-01-01 (explicit time values) or the current date (Time_now).
+    The Rust graph engine models TIME as a date-less clock value anchored at
+    1970-01-01. Preserve the semantic clock value at the serialization boundary
+    by reducing every decoded T_TIME to [0, 86400) seconds since midnight.
+
+    This keeps native-created values, imported current FalkorDB DUMPs, and
+    re-exported graphdata v19 payloads mutually comparable while also avoiding
+    pre-1970 timestamps that Python's datetime.fromtimestamp rejects on Windows.
+    """
+    p = root / "graph/src/runtime/value.rs"
+    s = p.read_text(encoding="utf-8")
+
+    old = "            si_type::T_TIME => Ok(Self::Time(r.read_signed()?)),"
+    new = """            si_type::T_TIME => {
+                // TIME is date-less. Stable C FalkorDB persisted it using a
+                // 1900/current-date time_t anchor, while the Rust runtime uses
+                // 1970. Normalize the anchor away on decode.
+                let raw = r.read_signed()?;
+                Ok(Self::Time(raw.rem_euclid(86_400)))
+            }"""
+
+    if new in s:
+        return
+    if old not in s:
+        raise RuntimeError("graph/src/runtime/value.rs: T_TIME decoder not found")
+    s = s.replace(old, new, 1)
+    p.write_text(s, encoding="utf-8")
+    print("patched FalkorDB v19 TIME anchor normalization")
+
+
 def install_native_index():
     source = Path(__file__).resolve().parent.parent / "patches" / "native_index_mod.rs"
     if not source.exists():
@@ -241,5 +275,6 @@ patch_graphblas_bindings()
 patch_graphblas_matrix()
 patch_graph_build()
 patch_udf_js_state_drop_order()
+patch_upstream_time_decode_compat()
 install_native_index()
 print("Windows foundation patches applied")

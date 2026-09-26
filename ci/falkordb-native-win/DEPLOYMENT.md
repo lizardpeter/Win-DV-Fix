@@ -115,6 +115,39 @@ relationship types, property keys, indexes, and constraints. Use
 `falkordb_bundle.py inspect --input <bundle.zip>` to inspect its manifest
 without connecting to a server.
 
+## Import a current FalkorDB dump.rdb directly
+
+If the old FalkorDB server is offline but its Redis RDB file is available, the
+package can import the file without starting Redis/FalkorDB first.
+
+Inspect it without changing the destination:
+
+```powershell
+py .\import_falkordb_rdb.py inspect --rdb D:\backup\dump.rdb
+```
+
+Then import into an empty native destination:
+
+```powershell
+py .\import_falkordb_rdb.py import `
+  --rdb D:\backup\dump.rdb `
+  --destination-host 127.0.0.1 `
+  --destination-port 6379 `
+  --destination-password "DESTINATION_PASSWORD"
+```
+
+The importer understands current FalkorDB v19 `graphdata` and `graphmeta`
+module values, including graphs split across multiple virtual RDB keys, and it
+restores FalkorDB UDF libraries from the module AUX section. It validates the
+Redis checksum and graph fragment counts before writing.
+
+This path intentionally fails rather than silently dropping data when the RDB
+contains semantics the native graph host cannot preserve. In particular, raw
+import currently requires Redis DB 0 and rejects expiring graph keys, ordinary
+Redis keys, Redis FUNCTION libraries, unsupported module types, and non-v19
+FalkorDB graph encodings. It is non-destructive: an existing destination graph
+with the same name causes an error rather than replacement.
+
 ## Import a single ordinary FalkorDB DUMP
 
 The native server implements Redis `RESTORE` for current FalkorDB

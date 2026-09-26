@@ -2,6 +2,7 @@ import os
 import pathlib
 
 from falkordb import FalkorDB
+from redis import Redis
 from redis.exceptions import ResponseError
 
 HOST = "localhost"
@@ -30,8 +31,27 @@ def connect():
     )
 
 
+def connect_raw():
+    return Redis(
+        host=HOST,
+        port=PORT,
+        password=PASSWORD,
+        socket_connect_timeout=5,
+        socket_timeout=20,
+        protocol=2,
+        decode_responses=True,
+        ssl=True,
+        ssl_ca_certs=str(TLS_DIR / "ca.pem"),
+        ssl_cert_reqs="required",
+        ssl_check_hostname=True,
+        ssl_certfile=str(TLS_DIR / "client-cert.pem"),
+        ssl_keyfile=str(TLS_DIR / "client-key.pem"),
+    )
+
+
 def main():
     db = connect()
+    raw = connect_raw()
     graph = db.select_graph(GRAPH)
 
     # Clean up from a retried CI phase without flushing graphs used by other
@@ -168,7 +188,39 @@ def main():
     # when the setting is not relevant to the standalone deployment.
     assert db.config_get("RESULTSET_SIZE") is not None
 
+    # Operational command parity: GRAPH.MEMORY returns FalkorDB's flat
+    # nine-pair report and GRAPH.INFO supports the three upstream sections.
+    memory = raw.execute_command("GRAPH.MEMORY", "USAGE", GRAPH, "SAMPLES", 10)
+    assert len(memory) == 18, memory
+    memory_map = dict(zip(memory[0::2], memory[1::2]))
+    assert set(memory_map) == {
+        "total_graph_sz_mb",
+        "label_matrices_sz_mb",
+        "relation_matrices_sz_mb",
+        "amortized_node_block_sz_mb",
+        "amortized_node_attributes_by_label_sz_mb",
+        "amortized_unlabeled_nodes_attributes_sz_mb",
+        "amortized_edge_block_sz_mb",
+        "amortized_edge_attributes_by_type_sz_mb",
+        "indices_sz_mb",
+    }, memory_map
+    assert isinstance(memory_map["total_graph_sz_mb"], int), memory_map
+
+    info = raw.execute_command("GRAPH.INFO")
+    assert "# Running queries" in info, info
+    assert "# Waiting queries" in info, info
+    assert "Object Pool" in info, info
+
+    object_pool = raw.execute_command("GRAPH.INFO", "ObjectPool")
+    assert object_pool[0] == "Object Pool", object_pool
+    assert len(object_pool[1]) == 2, object_pool
+
+    no_section = raw.execute_command("GRAPH.INFO", "not-a-section")
+    assert no_section == "no section found", no_section
+
+    raw.close()
     db.close()
+    print("OFFICIAL_FALKORDB_MEMORY_INFO_PASS")
     print("OFFICIAL_FALKORDB_PARITY_GATE_PASS")
 
 

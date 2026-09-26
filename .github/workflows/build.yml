@@ -1,13 +1,6 @@
 name: Build WinDV ArchiveSafe
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/build.yml'
-      - 'tools/**'
-      - 'README.md'
-      - 'UPSTREAM_COMMIT.txt'
   workflow_dispatch:
 
 permissions:

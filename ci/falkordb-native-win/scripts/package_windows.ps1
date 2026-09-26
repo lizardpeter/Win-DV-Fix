@@ -30,6 +30,7 @@ Copy-Item -Force (Join-Path $Root "requirements-migration.txt") (Join-Path $Stag
 Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
 Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
+Copy-Item -Recurse -Force (Join-Path $Root "licenses") (Join-Path $Stage "licenses")
 
 @'
 param(

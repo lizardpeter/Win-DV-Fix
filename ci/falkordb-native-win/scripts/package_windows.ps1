@@ -107,6 +107,7 @@ foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports
 }
 
 $env:FALKORDB_PORTABLE = "1"
+$env:FALKORDB_PORTABLE_ROOT = $Root
 $env:FALKORDB_DATA_DIR = "data"
 $env:TEMP = Join-Path $Root "tmp"
 $env:TMP = Join-Path $Root "tmp"

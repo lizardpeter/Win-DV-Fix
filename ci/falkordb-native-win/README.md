@@ -162,6 +162,70 @@ print(graph.query("MATCH (n:Project) RETURN n.name").result_set)
 
 The server refuses an unauthenticated non-loopback bind by default. Remote deployment now supports TLS directly, including mutual TLS for the FalkorDB/RESP listener. The verified CI path requires a trusted client certificate plus Redis-style AUTH. A separate HTTPS JSON API with Bearer-token read-only/read-write scopes is available for ChatGPT/tool access.
 
+## Migrating an existing FalkorDB database
+
+The preferred migration path preserves FalkorDB's binary graph serialization.
+It does **not** recreate nodes and relationships row by row. Current FalkorDB
+`graphdata` v19 Redis `DUMP` payloads are decoded directly, validated before
+replacement, converted into native checkpoints/WAL, and then verified.
+
+### Live source -> native Windows server
+
+Both endpoints may use password authentication and TLS/mTLS.
+
+```powershell
+python .\scripts\migrate_current_falkordb.py `
+  --source-host OLD_FALKORDB_HOST --source-port 6379 `
+  --source-password "source-secret" `
+  --destination-host NEW_WINDOWS_HOST --destination-port 6379 `
+  --destination-password "destination-secret"
+```
+
+The utility:
+
+- enumerates every graph with `GRAPH.LIST`
+- obtains the exact Redis `DUMP` bytes for each graph
+- retries if the source graph changes while its semantic signature is captured
+- restores into the native server
+- compares node/relationship counts, labels, relationship types, property keys,
+  index definitions, and constraints
+- migrates process-global UDF libraries and verifies their source
+- backs up and rolls back replaced destination graphs/UDFs on failure
+
+Use `--replace` only when existing destination graphs/libraries should be
+replaced. Verification is on by default.
+
+### Offline portable archive
+
+When source and destination cannot be online at the same time, export one
+portable archive on the source side:
+
+```powershell
+python .\scripts\falkordb_portable_bundle.py export `
+  --source-host OLD_FALKORDB_HOST --source-port 6379 `
+  --source-password "source-secret" `
+  --bundle D:\Transfer\database.falkor.zip
+```
+
+Move that single file to the Windows host, then import it:
+
+```powershell
+python .\scripts\falkordb_portable_bundle.py import `
+  --destination-host 127.0.0.1 --destination-port 6379 `
+  --destination-password "destination-secret" `
+  --bundle D:\Transfer\database.falkor.zip
+```
+
+Bundle v1 stores each graph as its exact Redis `DUMP` payload plus a manifest
+containing SHA-256 hashes, semantic graph signatures, and UDF library source.
+Import validates every payload before mutation and rolls back already imported
+graphs/libraries if a later item fails.
+
+A standalone current FalkorDB endpoint is required for export/live migration.
+For an old on-disk `dump.rdb`, load it with a compatible current FalkorDB
+instance first; that instance will decode supported legacy graph encodings and
+emit current v19 `DUMP` payloads for migration.
+
 ## Design direction for the reversal graph
 
 This backend is intended to host the universal reversal graph for T6, Destiny,

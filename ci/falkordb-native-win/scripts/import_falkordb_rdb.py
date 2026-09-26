@@ -638,7 +638,18 @@ def import_rdb(args) -> None:
                 + "; raw dump.rdb import is intentionally non-destructive"
             )
 
+        if not args.skip_udfs:
+            existing_udfs = set(parse_udf_rows(db.udf_list(with_code=True)))
+            udf_conflicts = sorted(set(parsed.udfs) & existing_udfs)
+            if udf_conflicts:
+                raise RuntimeError(
+                    "destination already contains UDF library/libraries: "
+                    + ", ".join(repr(v) for v in udf_conflicts)
+                    + "; raw dump.rdb import is intentionally non-destructive"
+                )
+
         imported: list[str] = []
+        imported_udfs: list[str] = []
         try:
             for name, fragments in parsed.graphs.items():
                 print(
@@ -669,15 +680,7 @@ def import_rdb(args) -> None:
                     f"verified {name!r}: nodes={nodes}, relationships={edges}"
                 )
 
-            imported_udfs: list[str] = []
             if not args.skip_udfs:
-                existing_udfs = set(parse_udf_rows(db.udf_list(with_code=True)))
-                conflicts = sorted(set(parsed.udfs) & existing_udfs)
-                if conflicts:
-                    raise RuntimeError(
-                        "destination already contains UDF library/libraries: "
-                        + ", ".join(repr(v) for v in conflicts)
-                    )
                 for name, script in parsed.udfs.items():
                     db.udf_load(name, script, False)
                     verified = parse_udf_rows(db.udf_list(name, with_code=True))
@@ -691,7 +694,7 @@ def import_rdb(args) -> None:
         except Exception:
             # Raw import is non-destructive. Remove UDFs and graphs created by
             # this run if a later verification step fails.
-            for name in reversed(locals().get("imported_udfs", [])):
+            for name in reversed(imported_udfs):
                 try:
                     db.udf_delete(name)
                 except Exception:

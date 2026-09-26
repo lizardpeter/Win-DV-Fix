@@ -32,18 +32,96 @@ Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
 Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
 
 @'
+param()
+
+$ErrorActionPreference = "Stop"
+$Root = [IO.Path]::GetFullPath($PSScriptRoot)
+Set-Location $Root
+
+foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $Root $Name) | Out-Null
+}
+
+$env:FALKORDB_PORTABLE = "1"
+$env:FALKORDB_DATA_DIR = "data"
+$env:TEMP = Join-Path $Root "tmp"
+$env:TMP = Join-Path $Root "tmp"
+$env:PYTHONPYCACHEPREFIX = Join-Path $Root "pycache"
+$env:PYTHONDONTWRITEBYTECODE = "1"
+'@ | Set-Content -Encoding UTF8 (Join-Path $Stage "portable-env.ps1")
+
+@'
 param(
-    [string]$DataDir = "$PSScriptRoot\data",
     [string]$Bind = "127.0.0.1:6379"
 )
+
+$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\portable-env.ps1"
 
 if (-not $env:FALKORDB_PASSWORD) {
     throw "Set FALKORDB_PASSWORD before starting the server."
 }
 
-& "$PSScriptRoot\server.exe" --bind $Bind --data-dir $DataDir
+& "$PSScriptRoot\server.exe" --portable --bind $Bind
 exit $LASTEXITCODE
 '@ | Set-Content -Encoding UTF8 (Join-Path $Stage "start-local.ps1")
+
+@'
+param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidateSet("migrate-live", "bundle", "import-rdb")]
+    [string]$Tool,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+)
+
+$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\portable-env.ps1"
+
+$Python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $Python) {
+    $Python = Get-Command py -ErrorAction SilentlyContinue
+}
+if (-not $Python) {
+    throw "Python is required only for migration helper tools. The database server itself does not require Python."
+}
+
+$Script = switch ($Tool) {
+    "migrate-live" { "migrate_current_falkordb.py" }
+    "bundle"       { "falkordb_bundle.py" }
+    "import-rdb"   { "import_falkordb_rdb.py" }
+}
+
+& $Python.Source (Join-Path $PSScriptRoot $Script) @Arguments
+exit $LASTEXITCODE
+'@ | Set-Content -Encoding UTF8 (Join-Path $Stage "run-tool.ps1")
+
+# Create the complete portable folder layout at package time as well as on launch.
+& (Join-Path $Stage "portable-env.ps1")
+foreach ($Name in @("data", "logs", "tls", "tmp", "pycache", "imports", "exports", "migration")) {
+    if (-not (Test-Path (Join-Path $Stage $Name))) {
+        throw "Portable package directory missing: $Name"
+    }
+}
+
+# Portable mode must reject any runtime path that could escape the package.
+$EscapeOutput = & (Join-Path $Stage "server.exe") --portable --data-dir "..\escape" 2>&1
+if ($LASTEXITCODE -eq 0) {
+    throw "Portable server unexpectedly accepted parent-directory data path"
+}
+if (($EscapeOutput -join "`n") -notmatch "may not escape") {
+    throw "Portable escape-path rejection did not emit the expected diagnostic"
+}
+
+$AbsoluteEscape = Join-Path ([IO.Path]::GetTempPath()) "falkordb-portable-escape"
+$AbsoluteOutput = & (Join-Path $Stage "server.exe") --portable --data-dir $AbsoluteEscape 2>&1
+if ($LASTEXITCODE -eq 0) {
+    throw "Portable server unexpectedly accepted absolute external data path"
+}
+if (($AbsoluteOutput -join "`n") -notmatch "must be relative") {
+    throw "Portable absolute-path rejection did not emit the expected diagnostic"
+}
 
 # Prove the packaged executable itself starts and parses its CLI before zipping.
 $Help = & (Join-Path $Stage "server.exe") --help 2>&1
@@ -62,6 +140,7 @@ server.exe sha256 $Hash
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 
+Write-Host "NATIVE_WINDOWS_PORTABLE_CONFINEMENT_PASS"
 Write-Host "NATIVE_WINDOWS_PACKAGE_PASS"
 Write-Host "Package directory: $Stage"
 Write-Host "Package archive:   $Zip"

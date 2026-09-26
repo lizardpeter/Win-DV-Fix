@@ -130,7 +130,15 @@ def graph_signature(db: FalkorDB, name: str) -> dict:
         ).result_set
     )
 
-    constraints = canonical_rows(graph.list_constraints())
+    constraints = canonical_rows(
+        {
+            "type": c["type"],
+            "label": c["label"],
+            "properties": c["properties"],
+            "entitytype": c["entitytype"],
+        }
+        for c in graph.list_constraints()
+    )
 
     return {
         "nodes": scalar("MATCH (n) RETURN count(n)"),

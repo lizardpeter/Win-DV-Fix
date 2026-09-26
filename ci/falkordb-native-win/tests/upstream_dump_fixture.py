@@ -65,6 +65,7 @@ def generate(args) -> None:
 
         graph = db.select_graph(GRAPH)
         graph.create_node_range_index("Person", "age")
+        graph.create_node_range_index("Person", "name", "age")
         graph.create_node_fulltext_index("Person", "name")
         graph.query(
             "CREATE (a:Person {name:'Alice',age:40}),"
@@ -73,7 +74,14 @@ def generate(args) -> None:
             "(a)-[:PARALLEL {slot:1}]->(b),"
             "(a)-[:PARALLEL {slot:2}]->(b)"
         )
-        assert graph.create_node_unique_constraint("Person", "name") == "OK"
+        graph.create_node_unique_constraint("Person", "name")
+        constraints = graph.list_constraints()
+        assert any(
+            c["type"] == "UNIQUE"
+            and c["label"] == "Person"
+            and "name" in c["properties"]
+            for c in constraints
+        ), constraints
 
         graph.query(
             "CREATE (:Types {"
@@ -83,9 +91,25 @@ def generate(args) -> None:
             "date:date({year:1984,month:10,day:21}), "
             "time:localtime({hour:10,minute:30,second:10}), "
             "datetime:localdatetime({year:1984,month:10,day:21,hour:5,minute:30,second:10}), "
-            "duration:duration({years:1,months:1,days:1,hours:1,minutes:1,seconds:1})"
+            "duration:duration({years:1,months:1,days:1,hours:1,minutes:1,seconds:1}), "
+            "unicode:'Δ🚀漢字'"
             "})"
         )
+
+        # Force FalkorDB's >256 KiB standalone blob serializer path. The
+        # repeating pattern also makes Redis apply LZF to the surrounding DUMP
+        # chunks, so this one fixture exercises both layers.
+        large_payload = "0123456789abcdef" * 20_000
+        graph.query(
+            "CREATE (:Large {payload:$payload})",
+            params={"payload": large_payload},
+        )
+
+        # Leave deleted entity IDs/tombstones in the graph before persistence.
+        graph.query(
+            "CREATE (a:Transient {id:1})-[r:TMP]->(b:Transient {id:2})"
+        )
+        graph.query("MATCH (n:Transient) DETACH DELETE n")
 
         assert graph.query(
             "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"
@@ -156,9 +180,30 @@ def verify(args) -> None:
         types = graph.query(
             "MATCH (p:Types) RETURN "
             "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,"
-            "p.date,p.time,p.datetime,p.duration"
+            "p.date,p.time,p.datetime,p.duration,p.unicode"
         ).result_set
         assert len(types) == 1, types
+        assert types[0][-1] == "Δ🚀漢字", types
+
+        large = graph.query(
+            "MATCH (n:Large) RETURN size(n.payload), "
+            "substring(n.payload,0,16), substring(n.payload,size(n.payload)-16)"
+        ).result_set
+        assert large == [[320000, "0123456789abcdef", "0123456789abcdef"]], large
+
+        transient = graph.query(
+            "MATCH (n:Transient) RETURN count(n)"
+        ).result_set
+        assert transient == [[0]], transient
+
+        indexes = graph.query(
+            "CALL db.indexes() YIELD label,properties,types "
+            "WHERE label='Person' RETURN properties,types"
+        ).result_set
+        assert any(
+            row[0] == ["name", "age"] or row[0] == ["age", "name"]
+            for row in indexes
+        ), indexes
 
         ranged = graph.query(
             "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"
@@ -184,6 +229,16 @@ def verify(args) -> None:
             raise AssertionError("restored upstream UNIQUE constraint accepted duplicate")
         except ResponseError:
             pass
+
+        # Prove that deleted-ID bookkeeping did not corrupt allocation after
+        # import. Only mutate during the first verification; restart mode then
+        # proves this native post-import write is durable too.
+        if not args.skip_restore:
+            graph.query("CREATE (:AfterDelete {v:1})")
+        after_delete = graph.query(
+            "MATCH (n:AfterDelete) RETURN count(n)"
+        ).result_set
+        assert after_delete == [[1]], after_delete
 
         if args.skip_restore:
             print("UPSTREAM_FALKORDB_DUMP_RESTART_PASS")

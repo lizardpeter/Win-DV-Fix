@@ -143,8 +143,11 @@ def graph_signature(db: FalkorDB, name: str) -> dict:
     }
 
 
-def verify_graph(source_db: FalkorDB, destination_db: FalkorDB, name: str) -> None:
-    source_signature = graph_signature(source_db, name)
+def verify_graph(
+    destination_db: FalkorDB,
+    name: str,
+    source_signature: dict,
+) -> None:
     destination_signature = graph_signature(destination_db, name)
     if source_signature != destination_signature:
         raise RuntimeError(
@@ -254,9 +257,35 @@ def main() -> int:
 
         for raw_name in graph_names:
             name = text(raw_name)
-            payload = source.dump(raw_name)
-            if payload is None:
-                raise RuntimeError(f"graph disappeared during migration: {name}")
+            source_signature = None
+
+            if args.skip_verify:
+                payload = source.dump(raw_name)
+                if payload is None:
+                    raise RuntimeError(f"graph disappeared during migration: {name}")
+            else:
+                payload = None
+                for attempt in range(1, 4):
+                    before = graph_signature(source_db, name)
+                    candidate = source.dump(raw_name)
+                    if candidate is None:
+                        raise RuntimeError(
+                            f"graph disappeared during migration: {name}"
+                        )
+                    after = graph_signature(source_db, name)
+                    if before == after:
+                        payload = candidate
+                        source_signature = after
+                        break
+                    print(
+                        f"source graph {name!r} changed while being dumped; "
+                        f"retrying ({attempt}/3)"
+                    )
+                if payload is None or source_signature is None:
+                    raise RuntimeError(
+                        f"source graph {name!r} kept changing during migration; "
+                        "quiesce writers and retry"
+                    )
 
             destination_graphs_before = {
                 text(v) for v in destination.execute_command("GRAPH.LIST")
@@ -294,7 +323,8 @@ def main() -> int:
                     )
 
                 if not args.skip_verify:
-                    verify_graph(source_db, destination_db, name)
+                    assert source_signature is not None
+                    verify_graph(destination_db, name, source_signature)
                     print(
                         f"verified {name!r}: "
                         "data/schema/index/constraint signature matches"

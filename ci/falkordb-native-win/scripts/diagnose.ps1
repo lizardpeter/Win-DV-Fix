@@ -122,6 +122,7 @@ $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_ap
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
+$NativeRoundtripDump = Join-Path $WorkDir "upstream-fixture\native-roundtrip.dump"
 $MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
 $PortableBundleUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "falkordb_portable_bundle.py"))
 $PortableBundle = Join-Path $WorkDir "upstream-fixture\upstream-real.falkor.zip"
@@ -232,7 +233,8 @@ try {
         --ssl `
         --ca (Join-Path $TlsDir "ca.pem") `
         --cert (Join-Path $TlsDir "client-cert.pem") `
-        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        --key (Join-Path $TlsDir "client-key.pem") `
+        --roundtrip-output $NativeRoundtripDump 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "10_upstream_dump_restore.txt")
     if ($LASTEXITCODE -ne 0) {
         throw "Official upstream FalkorDB DUMP restore verification failed with exit code $LASTEXITCODE"

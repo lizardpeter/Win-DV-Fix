@@ -13,12 +13,41 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from falkordb import FalkorDB
 from redis import Redis
 from redis.exceptions import ResponseError
+
+
+def portable_local_path(
+    value: str | Path | None,
+    label: str,
+    *,
+    must_exist: bool = False,
+) -> str | None:
+    """Confine local helper-tool paths to the packaged folder in portable mode."""
+    if value is None:
+        return None
+    raw_root = os.environ.get("FALKORDB_PORTABLE_ROOT")
+    if not raw_root:
+        return str(value)
+
+    root = Path(raw_root).resolve()
+    path = Path(value)
+    candidate = (root / path).resolve() if not path.is_absolute() else path.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{label} resolves outside portable package root {root}: {candidate}"
+        ) from exc
+    if must_exist and not candidate.exists():
+        raise RuntimeError(f"{label} does not exist: {candidate}")
+    return str(candidate)
 
 
 @dataclass
@@ -67,9 +96,21 @@ def endpoint_from_args(args, prefix: str) -> Endpoint:
         username=getattr(args, f"{prefix}_username"),
         password=getattr(args, f"{prefix}_password"),
         ssl=getattr(args, f"{prefix}_ssl"),
-        ca=getattr(args, f"{prefix}_ca"),
-        cert=getattr(args, f"{prefix}_cert"),
-        key=getattr(args, f"{prefix}_key"),
+        ca=portable_local_path(
+            getattr(args, f"{prefix}_ca"),
+            f"--{prefix}-ca",
+            must_exist=True,
+        ),
+        cert=portable_local_path(
+            getattr(args, f"{prefix}_cert"),
+            f"--{prefix}-cert",
+            must_exist=True,
+        ),
+        key=portable_local_path(
+            getattr(args, f"{prefix}_key"),
+            f"--{prefix}-key",
+            must_exist=True,
+        ),
     )
 
 

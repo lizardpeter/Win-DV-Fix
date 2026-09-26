@@ -103,10 +103,17 @@ def phase_write():
     profile = graph.profile("MATCH (n:Person) RETURN n.name")
     assert profile.plan and len(profile.plan) > 0, profile.plan
 
-    # Real per-graph slowlog plus reset.
-    graph.query("MATCH (n:Person) RETURN n.name")
-    slow = graph.slowlog()
-    assert len(slow) > 0, slow
+    # Real per-graph slowlog plus reset. Upstream FalkorDB intentionally
+    # ignores queries faster than 10 ms, so use progressively larger work
+    # rather than relying on CI runner timing for a tiny MATCH.
+    graph.slowlog_reset()
+    slow = []
+    for upper in (50_000, 200_000, 800_000):
+        graph.query(f"UNWIND range(1,{upper}) AS x RETURN sum(x)")
+        slow = graph.slowlog()
+        if slow:
+            break
+    assert len(slow) > 0, "no query crossed FalkorDB's 10 ms slowlog threshold"
     graph.slowlog_reset()
     assert graph.slowlog() == [], graph.slowlog()
 

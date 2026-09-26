@@ -108,6 +108,7 @@ def export_bundle(args) -> int:
     bundle = args.bundle.resolve()
     bundle.parent.mkdir(parents=True, exist_ok=True)
 
+    temp_path: Path | None = None
     try:
         require_standalone(source, "source")
         raw_graph_names = source.execute_command("GRAPH.LIST")
@@ -117,55 +118,6 @@ def export_bundle(args) -> int:
             else parse_udf_rows(source_db.udf_list(with_code=True))
         )
 
-        graph_entries: list[dict] = []
-        graph_payloads: list[tuple[str, bytes]] = []
-
-        for index, raw_name in enumerate(raw_graph_names):
-            name = text(raw_name)
-            payload, signature = consistent_dump(
-                source,
-                source_db,
-                raw_name,
-                name,
-                verify=not args.skip_verify,
-            )
-            archive_path = f"graphs/{index:06d}.dump"
-            graph_payloads.append((archive_path, payload))
-            graph_entries.append(
-                {
-                    "name": name,
-                    "archive_path": archive_path,
-                    "bytes": len(payload),
-                    "sha256": sha256(payload),
-                    "signature": signature,
-                }
-            )
-            print(
-                f"exported {name!r}: {len(payload):,} bytes "
-                f"sha256={sha256(payload)[:16]}..."
-            )
-
-        server_info = source.info(section="server")
-        manifest = {
-            "bundle_version": BUNDLE_VERSION,
-            "format": "falkordb-portable-dump-bundle",
-            "graphdata_encoding": 19,
-            "source": {
-                "redis_version": text(
-                    server_info.get("redis_version")
-                    or server_info.get(b"redis_version")
-                    or ""
-                ),
-                "redis_mode": text(
-                    server_info.get("redis_mode")
-                    or server_info.get(b"redis_mode")
-                    or ""
-                ),
-            },
-            "graphs": graph_entries,
-            "udf_libraries": udf_libraries,
-        }
-
         fd, temp_name = tempfile.mkstemp(
             prefix=bundle.name + ".tmp-",
             suffix=".zip",
@@ -173,31 +125,79 @@ def export_bundle(args) -> int:
         )
         os.close(fd)
         temp_path = Path(temp_name)
-        try:
-            with zipfile.ZipFile(
-                temp_path,
-                "w",
-                compression=zipfile.ZIP_STORED,
-                allowZip64=True,
-            ) as archive:
-                archive.writestr(
-                    "manifest.json",
-                    json.dumps(
-                        manifest,
-                        sort_keys=True,
-                        ensure_ascii=False,
-                        indent=2,
-                    ).encode("utf-8"),
-                )
-                for archive_path, payload in graph_payloads:
-                    archive.writestr(archive_path, payload)
 
-            with open(temp_path, "rb") as handle:
-                os.fsync(handle.fileno())
-            os.replace(temp_path, bundle)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+        graph_entries: list[dict] = []
+        with zipfile.ZipFile(
+            temp_path,
+            "w",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=True,
+        ) as archive:
+            for index, raw_name in enumerate(raw_graph_names):
+                name = text(raw_name)
+                payload, signature = consistent_dump(
+                    source,
+                    source_db,
+                    raw_name,
+                    name,
+                    verify=not args.skip_verify,
+                )
+                archive_path = f"graphs/{index:06d}.dump"
+                payload_hash = sha256(payload)
+
+                # Write each DUMP immediately. Export memory therefore scales
+                # with the largest graph rather than the sum of all graphs.
+                archive.writestr(archive_path, payload)
+                graph_entries.append(
+                    {
+                        "name": name,
+                        "archive_path": archive_path,
+                        "bytes": len(payload),
+                        "sha256": payload_hash,
+                        "signature": signature,
+                    }
+                )
+                print(
+                    f"exported {name!r}: {len(payload):,} bytes "
+                    f"sha256={payload_hash[:16]}..."
+                )
+                del payload
+
+            server_info = source.info(section="server")
+            manifest = {
+                "bundle_version": BUNDLE_VERSION,
+                "format": "falkordb-portable-dump-bundle",
+                "graphdata_encoding": 19,
+                "source": {
+                    "redis_version": text(
+                        server_info.get("redis_version")
+                        or server_info.get(b"redis_version")
+                        or ""
+                    ),
+                    "redis_mode": text(
+                        server_info.get("redis_mode")
+                        or server_info.get(b"redis_mode")
+                        or ""
+                    ),
+                },
+                "graphs": graph_entries,
+                "udf_libraries": udf_libraries,
+            }
+            archive.writestr(
+                "manifest.json",
+                json.dumps(
+                    manifest,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+
+        # Flush the completed archive before atomically publishing its name.
+        with open(temp_path, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, bundle)
+        temp_path = None
 
         print(
             f"BUNDLE_EXPORT_COMPLETE path={bundle} "
@@ -205,6 +205,8 @@ def export_bundle(args) -> int:
         )
         return 0
     finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
         source.close()
         source_db.close()
 

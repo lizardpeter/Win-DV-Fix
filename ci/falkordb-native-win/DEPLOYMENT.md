@@ -70,6 +70,7 @@ server certificate and key. Add `--tls-client-ca` if RESP clients must also
 present a certificate signed by your CA.
 
 ```powershell
+. .\portable-env.ps1
 .\server.exe `
   --portable `
   --bind 0.0.0.0:6379 `
@@ -209,6 +210,7 @@ threshold.
 The same server can expose the authenticated HTTPS JSON API:
 
 ```powershell
+. .\portable-env.ps1
 .\server.exe `
   --portable `
   --bind 0.0.0.0:6379 `

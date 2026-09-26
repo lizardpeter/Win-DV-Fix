@@ -120,6 +120,7 @@ New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
+$MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
 $TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
 $TlsDir = Join-Path $WorkDir "tls-fixtures"
 Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
@@ -165,6 +166,25 @@ function Start-NativeServer([string]$Suffix) {
     return $proc
 }
 
+$MigrationData = Join-Path $WorkDir "migration-destination-data"
+Remove-Item -Recurse -Force $MigrationData -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $MigrationData | Out-Null
+
+function Start-MigrationDestination([string]$Suffix) {
+    $out = Join-Path $Logs ("10_migration_dest_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("10_migration_dest_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        "--bind", "127.0.0.1:6392",
+        "--data-dir", $MigrationData,
+        "--password", "native-ci-secret",
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6392
+    return $proc
+}
+
 $Server = $null
 try {
     $Server = Start-NativeServer "first"
@@ -196,6 +216,71 @@ try {
     $ParityText = (Get-Content (Join-Path $Logs "10_official_client_parity.txt") -Raw)
     if ($ParityText -notmatch "OFFICIAL_FALKORDB_PARITY_GATE_PASS") {
         throw "Official FalkorDB parity gate did not emit success marker"
+    }
+
+    # Prove the actual whole-database migration utility, not only the
+    # server-side DUMP/RESTORE primitives. Use a second independent native
+    # process and hard-restart it before the normal restart verifier.
+    $MigrationServer = $null
+    try {
+        $MigrationServer = Start-MigrationDestination "first"
+        $MigrationArgs = @(
+            "--source-host", "localhost",
+            "--source-port", "6391",
+            "--source-password", "native-ci-secret",
+            "--source-ssl",
+            "--source-ca", (Join-Path $TlsDir "ca.pem"),
+            "--source-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--source-key", (Join-Path $TlsDir "client-key.pem"),
+            "--destination-host", "localhost",
+            "--destination-port", "6392",
+            "--destination-password", "native-ci-secret",
+            "--destination-ssl",
+            "--destination-ca", (Join-Path $TlsDir "ca.pem"),
+            "--destination-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--destination-key", (Join-Path $TlsDir "client-key.pem")
+        )
+
+        python $MigrationUtility @MigrationArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_first.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Whole-database migration utility failed with exit code $LASTEXITCODE"
+        }
+        $MigrationText = (Get-Content (Join-Path $Logs "10_migration_utility_first.txt") -Raw)
+        if ($MigrationText -notmatch "MIGRATION_COMPLETE") {
+            throw "Whole-database migration utility did not emit completion marker"
+        }
+
+        # Exercise replacement backup and verification against populated data.
+        python $MigrationUtility @MigrationArgs --replace 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_replace.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Whole-database migration --replace failed with exit code $LASTEXITCODE"
+        }
+
+        Stop-Process -Id $MigrationServer.Id -Force
+        Wait-Process -Id $MigrationServer.Id -ErrorAction SilentlyContinue
+        $MigrationServer = $null
+        Start-Sleep -Milliseconds 300
+
+        $MigrationServer = Start-MigrationDestination "restart"
+        $env:FALKORDB_TEST_PORT = "6392"
+        python $ClientSmoke read 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_restart_verify.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Migrated destination restart verification failed with exit code $LASTEXITCODE"
+        }
+        $MigrationRestartText = (Get-Content (Join-Path $Logs "10_migration_utility_restart_verify.txt") -Raw)
+        if ($MigrationRestartText -notmatch "NATIVE_REDIS_DUMP_RESTORE_RESTART_PASS") {
+            throw "Migrated destination did not pass restart verification"
+        }
+        Write-Host "NATIVE_WHOLE_DATABASE_MIGRATION_PASS"
+    } finally {
+        Remove-Item Env:FALKORDB_TEST_PORT -ErrorAction SilentlyContinue
+        if ($null -ne $MigrationServer -and -not $MigrationServer.HasExited) {
+            Stop-Process -Id $MigrationServer.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $MigrationServer.Id -ErrorAction SilentlyContinue
+        }
     }
 
     # Hard-stop the server to prove committed graph state is recoverable solely
@@ -237,4 +322,5 @@ Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
+Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 

@@ -17,7 +17,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  upstream-falkordb-dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FalkorDB clients
+        run: python -m pip install --disable-pip-version-check --upgrade falkordb redis
+
+      - name: Generate DUMP with official FalkorDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name upstream-falkordb -p 6379:6379 falkordb/falkordb-server:v4.20.6
+          trap 'docker logs upstream-falkordb || true; docker rm -f upstream-falkordb || true' EXIT
+          python - <<'PY'
+          import time
+          from redis import Redis
+          client = Redis(host="127.0.0.1", port=6379, socket_connect_timeout=1)
+          for _ in range(120):
+              try:
+                  if client.ping():
+                      break
+              except Exception:
+                  pass
+              time.sleep(0.25)
+          else:
+              raise SystemExit("official FalkorDB container did not become ready")
+          PY
+          python ci/falkordb-native-win/tests/upstream_dump_fixture.py generate \
+            --host 127.0.0.1 \
+            --port 6379 \
+            --output ci/falkordb-native-win/build/upstream-fixture/upstream-real.dump
+
+      - name: Upload upstream FalkorDB DUMP
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-falkordb-v4.20.6-dump
+          path: |
+            ci/falkordb-native-win/build/upstream-fixture/upstream-real.dump
+            ci/falkordb-native-win/build/upstream-fixture/upstream-real.dump.json
+          if-no-files-found: error
+
   windows-native:
+    needs: upstream-falkordb-dump
     runs-on: windows-2025
     timeout-minutes: 120
 
@@ -25,6 +76,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Download upstream FalkorDB DUMP
+        uses: actions/download-artifact@v4
+        with:
+          name: upstream-falkordb-v4.20.6-dump
+          path: ci/falkordb-native-win/build/upstream-fixture
 
       - name: Install Rust MSVC
         uses: dtolnay/rust-toolchain@stable

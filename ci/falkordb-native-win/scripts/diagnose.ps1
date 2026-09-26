@@ -29,6 +29,14 @@ $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
 $env:LAGRAPH_LIB_DIR = $NativeLibDir
 
 $env:FALKORDB_NATIVE_NO_OPENMP = "1"
+# Keep the deployable EXEs independent of the separately installed MSVC
+# redistributable. GraphBLAS/LAGraph are also built with the static CRT.
+$StaticCrtFlag = "-C target-feature=+crt-static"
+if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+    $env:RUSTFLAGS = $StaticCrtFlag
+} elseif (-not $env:RUSTFLAGS.Contains("target-feature=+crt-static")) {
+    $env:RUSTFLAGS = "$($env:RUSTFLAGS) $StaticCrtFlag"
+}
 $env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
 $env:FALKORDB_SKIP_REDISEARCH = "1"
 Remove-Item Env:FALKORDB_NATIVE_REDISEARCH_SHIM_DIR -ErrorAction SilentlyContinue

@@ -180,6 +180,7 @@ impl NativeGraph {
     ) -> Result<Self, String> {
         let wal_path = wal_path.as_ref().to_path_buf();
         let loaded_snapshot = snapshot::load_latest(&wal_path, name)?;
+        let has_snapshot = loaded_snapshot.is_some();
         let snapshot_sequence = loaded_snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.sequence);
@@ -220,10 +221,12 @@ impl NativeGraph {
 
             mvcc.commit(Arc::clone(&private));
             wait_for_recovered_indexes(&mvcc, Duration::from_secs(60))?;
-        } else if snapshot_sequence > 0 {
+        } else if has_snapshot {
             // MvccGraph::from_graph does not perform a commit, so publish the
             // restored graph Arc into its indexers explicitly for subsequent
-            // background index work.
+            // background index work. Sequence 0 is valid for an imported
+            // upstream GRAPH.RESTORE payload, so key this on snapshot presence
+            // rather than sequence > 0.
             let committed = mvcc.read();
             committed.borrow().set_indexer_graph(Arc::clone(&committed));
         }
@@ -238,6 +241,70 @@ impl NativeGraph {
             slow_log: SlowLog::new(),
         })
     }
+
+    /// Export the current committed graph in FalkorDB's upstream v19
+    /// single-key GRAPH.RESTORE payload format.
+    #[must_use]
+    pub fn export_falkordb_v19_payload(&self) -> Vec<u8> {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        let graph = committed.borrow();
+        snapshot::save_falkordb_v19_payload(&graph, &self.name)
+    }
+
+    /// Install an upstream FalkorDB v19 GRAPH.RESTORE payload as a durable
+    /// native graph. The import is a one-time conversion: after this returns,
+    /// normal native checkpoints/WAL provide durability.
+    pub fn restore_falkordb_v19_payload(
+        name: &str,
+        wal_path: impl AsRef<Path>,
+        payload: &[u8],
+    ) -> Result<Self, String> {
+        let wal_path = wal_path.as_ref().to_path_buf();
+
+        if wal_path.exists() {
+            return Err(format!(
+                "destination graph storage already exists: {}",
+                wal_path.display()
+            ));
+        }
+        if snapshot::load_latest(&wal_path, name)?.is_some() {
+            return Err(format!(
+                "destination graph checkpoint already exists for {name:?}"
+            ));
+        }
+
+        let graph = snapshot::load_falkordb_v19_payload(payload, name)?;
+        if let Some(parent) = wal_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create graph storage directory {}: {e}", parent.display()))?;
+        }
+
+        std::fs::File::create(&wal_path)
+            .map_err(|e| format!("create imported graph WAL {}: {e}", wal_path.display()))?;
+
+        // Sequence 0 means the checkpoint is the imported baseline and the
+        // first native mutation starts at WAL sequence 1.
+        let checkpoint = match snapshot::write_checkpoint(&wal_path, name, 0, &graph) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = std::fs::remove_file(&wal_path);
+                return Err(err);
+            }
+        };
+
+        match Self::open_persistent(name, &wal_path) {
+            Ok(graph) => Ok(graph),
+            Err(err) => {
+                let _ = std::fs::remove_file(&wal_path);
+                let _ = std::fs::remove_file(&checkpoint);
+                Err(err)
+            }
+        }
+    }
+
 
     /// Create a durable full-graph checkpoint and compact all WAL history that
     /// the checkpoint contains. The graph stays query-consistent throughout:

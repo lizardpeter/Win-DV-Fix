@@ -71,6 +71,8 @@ try {
         --python-version 3.12 `
         --implementation cp `
         --abi cp312 `
+        --abi abi3 `
+        --abi none `
         --only-binary=:all: `
         -r (Join-Path $Root "requirements-migration.txt")
     if ($LASTEXITCODE -ne 0) {

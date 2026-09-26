@@ -29,6 +29,9 @@ $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
 $env:LAGRAPH_LIB_DIR = $NativeLibDir
 
 $env:FALKORDB_NATIVE_NO_OPENMP = "1"
+# Produce a truly redistributable Windows binary: Rust and all native C
+# dependencies use the static MSVC CRT instead of requiring VCRUNTIME140.dll.
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
 $env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
 $env:FALKORDB_SKIP_REDISEARCH = "1"
 Remove-Item Env:FALKORDB_NATIVE_REDISEARCH_SHIM_DIR -ErrorAction SilentlyContinue

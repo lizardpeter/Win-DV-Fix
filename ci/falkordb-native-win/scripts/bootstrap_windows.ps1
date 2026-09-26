@@ -93,6 +93,7 @@ if (-not $SkipNativeDeps) {
     $GBBuild = Join-Path $WorkDir "graphblas-build"
     cmake -S $GB -B $GBBuild -G "$VSGenerator" -A x64 `
         -DCMAKE_C_FLAGS=/MP `
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
         -DCMAKE_INSTALL_PREFIX="$Prefix" `
         -DSUITESPARSE_USE_FORTRAN=OFF `
         -DBUILD_STATIC_LIBS=ON `
@@ -126,6 +127,7 @@ if (-not $SkipNativeDeps) {
     $LABuild = Join-Path $WorkDir "lagraph-build"
     cmake -S $LA -B $LABuild -G "$VSGenerator" -A x64 `
         -DCMAKE_C_FLAGS=/MP `
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
         -DCMAKE_INSTALL_PREFIX="$Prefix" `
         -DBUILD_STATIC_LIBS=ON `
         -DBUILD_SHARED_LIBS=OFF `

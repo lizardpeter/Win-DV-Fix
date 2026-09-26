@@ -3,6 +3,7 @@
 pub mod api;
 pub mod property_index;
 pub mod range_index;
+pub mod redis_dump;
 pub mod server;
 pub mod native_config;
 pub mod udf_store;

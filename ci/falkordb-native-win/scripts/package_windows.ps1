@@ -56,16 +56,28 @@ $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
 # Verify the portable binary does not depend on the separately-installed
 # Microsoft Visual C++ runtime. Windows system DLLs remain normal imports.
-$Link = Get-Command link.exe -ErrorAction SilentlyContinue
-if ($Link) {
-    $Dependents = & $Link.Source /dump /dependents (Join-Path $Stage "server.exe") 2>&1
-    $Dependents | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_DEPENDENCIES.txt")
-    $DependencyText = ($Dependents -join "`n")
-    if ($DependencyText -match "(?i)(VCRUNTIME|MSVCP|api-ms-win-crt-)") {
-        throw "Packaged server still depends on the dynamic Microsoft C/C++ runtime"
-    }
-} else {
-    Write-Warning "link.exe not found; skipping PE dependency assertion"
+$VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $VsWhere)) {
+    throw "vswhere.exe is required to locate the MSVC linker for PE verification"
+}
+$VsInstall = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($VsInstall)) {
+    throw "Visual Studio C++ tools were not found for PE dependency verification"
+}
+$MsvcLink = Get-ChildItem -Path (Join-Path $VsInstall "VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe") -File |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+if (-not $MsvcLink) {
+    throw "MSVC link.exe was not found below $VsInstall"
+}
+$Dependents = & $MsvcLink.FullName /dump /dependents (Join-Path $Stage "server.exe") 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "MSVC link.exe /dump /dependents failed with exit code $LASTEXITCODE"
+}
+$Dependents | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_DEPENDENCIES.txt")
+$DependencyText = ($Dependents -join "`n")
+if ($DependencyText -match "(?i)(VCRUNTIME|MSVCP|api-ms-win-crt-)") {
+    throw "Packaged server still depends on the dynamic Microsoft C/C++ runtime"
 }
 
 $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.ToLowerInvariant()

@@ -21,6 +21,7 @@ from redis.exceptions import ResponseError
 
 GRAPH = "upstream-real-fixture"
 RESTORED = "upstream-real-fixture-restored"
+RDB_SECOND = "upstream-rdb-second"
 
 
 def endpoint_kwargs(args, *, include_protocol: bool) -> dict:
@@ -58,10 +59,11 @@ def generate(args) -> None:
     raw = redis_client(args)
     db = falkor_client(args)
     try:
-        try:
-            raw.execute_command("GRAPH.DELETE", GRAPH)
-        except ResponseError:
-            pass
+        for graph_name in (GRAPH, RDB_SECOND):
+            try:
+                raw.execute_command("GRAPH.DELETE", graph_name)
+            except ResponseError:
+                pass
 
         graph = db.select_graph(GRAPH)
         graph.create_node_range_index("Person", "age")
@@ -107,6 +109,15 @@ def generate(args) -> None:
             "CALL db.idx.fulltext.queryNodes('Person','Alice') "
             "YIELD node RETURN node.name"
         ).result_set == [["Alice"]]
+
+        second = db.select_graph(RDB_SECOND)
+        second.create_node_range_index("Second", "id")
+        second.query(
+            "CREATE (:Second {id:1,name:'one'}),(:Second {id:2,name:'two'})"
+        )
+        assert second.query(
+            "MATCH (n:Second) WHERE n.id >= 2 RETURN n.name"
+        ).result_set == [["two"]]
 
         payload = raw.dump(GRAPH)
         if not payload:
@@ -205,7 +216,14 @@ def verify(args) -> None:
             udf_list = db.udf_list("upstream_rdb_ci", with_code=True)
             assert len(udf_list) == 1, udf_list
             assert "RdbAdd" in str(udf_list[0]), udf_list
+
+            second = db.select_graph(RDB_SECOND)
+            second_rows = second.query(
+                "MATCH (n:Second) WHERE n.id >= 1 RETURN n.id,n.name ORDER BY n.id"
+            ).result_set
+            assert second_rows == [[1, "one"], [2, "two"]], second_rows
             print("UPSTREAM_FALKORDB_RDB_UDF_PASS")
+            print("UPSTREAM_FALKORDB_RAW_RDB_MULTIGRAPH_PASS")
 
         if args.skip_restore:
             print("UPSTREAM_FALKORDB_DUMP_RESTART_PASS")

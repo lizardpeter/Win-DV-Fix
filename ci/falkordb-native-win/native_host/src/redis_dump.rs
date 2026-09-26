@@ -398,11 +398,10 @@ fn lzf_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String> 
 
         let mut len = ctrl >> 5;
         let high = (ctrl & 0x1f) << 8;
-        let low = *input
-            .get(ip)
-            .ok_or_else(|| "truncated Redis LZF back-reference".to_string())? as usize;
-        ip += 1;
 
+        // liblzf encodes the optional extended match length before the low
+        // offset byte. This order matters for long runs, which are common in
+        // compressed 256 KiB FalkorDB RDB chunks.
         if len == 7 {
             len += *input
                 .get(ip)
@@ -410,6 +409,11 @@ fn lzf_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String> 
                 as usize;
             ip += 1;
         }
+
+        let low = *input
+            .get(ip)
+            .ok_or_else(|| "truncated Redis LZF back-reference".to_string())? as usize;
+        ip += 1;
         len += 2;
 
         let offset = high | low;
@@ -473,6 +477,22 @@ mod tests {
         ];
         let dump = create_falkordb_dump(&payload);
         assert_eq!(extract_falkordb_v19_payload(&dump).unwrap(), payload);
+    }
+
+    #[test]
+    fn lzf_literal_and_back_reference() {
+        // literal "a", then a 3-byte overlapping back-reference => "aaaa"
+        assert_eq!(lzf_decompress(&[0, b'a', 0x20, 0], 4).unwrap(), b"aaaa");
+    }
+
+    #[test]
+    fn lzf_extended_length_precedes_offset() {
+        // literal "a", then ctrl(len=7, offset-high=0), extension=1,
+        // offset-low=0 => 10 copied bytes for 11 total 'a' bytes.
+        assert_eq!(
+            lzf_decompress(&[0, b'a', 0xe0, 1, 0], 11).unwrap(),
+            vec![b'a'; 11]
+        );
     }
 
     #[test]

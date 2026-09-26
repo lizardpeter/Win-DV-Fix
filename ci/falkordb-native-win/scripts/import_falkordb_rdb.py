@@ -572,9 +572,6 @@ def parse_rdb(path: Path) -> ParsedRdb:
                 f"{len(fragments)}/{expected} fragments"
             )
 
-    if not graphs:
-        raise ValueError("RDB contains no current FalkorDB graphdata/graphmeta keys")
-
     return ParsedRdb(version, graphs, headers, udfs)
 
 

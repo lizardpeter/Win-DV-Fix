@@ -22,6 +22,7 @@ falkordb-native-windows-x64\
   imports\
   exports\
   migration\
+  python\                 # embedded migration runtime + packages
   ...migration/documentation files...
 ```
 
@@ -79,18 +80,15 @@ explicit override flag is supplied.
 
 ## Migrate a current FalkorDB deployment
 
-Install the migration client dependencies on the machine from which migration
-will be run:
+The packaged folder includes its own embedded Python runtime and pinned
+FalkorDB/Redis client libraries under `.\python`. No machine-wide Python or
+pip installation is needed for the supported migration wrappers.
 
-```powershell
-py -m pip install -r requirements-migration.txt
-```
-
-Then migrate all graphs plus UDF libraries directly from a current standalone
+Migrate all graphs plus UDF libraries directly from a current standalone
 FalkorDB source into the native Windows destination:
 
 ```powershell
-py .\migrate_current_falkordb.py `
+.\run-tool.ps1 migrate-live `
   --source-host SOURCE_HOST `
   --source-port 6379 `
   --source-password "SOURCE_PASSWORD" `

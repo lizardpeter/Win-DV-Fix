@@ -340,10 +340,10 @@ if (($Help -join "`n") -notmatch "falkordb-native-server") {
 }
 $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
+# verify-portable.ps1 throws on a real failure. It deliberately runs
+# negative child-process tests that return nonzero, so neither $? nor
+# $LASTEXITCODE is a valid summary of the script after those assertions.
 & (Join-Path $Stage "verify-portable.ps1")
-if (-not $?) {
-    throw "Packaged portable verifier failed"
-}
 
 $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.ToLowerInvariant()
 
@@ -378,9 +378,6 @@ $ManifestLines = Get-ChildItem -Path $Stage -File -Recurse |
 $ManifestLines | Set-Content -Encoding ASCII $ManifestPath
 
 & (Join-Path $Stage "verify-portable.ps1")
-if (-not $?) {
-    throw "Portable verifier failed after SHA256 manifest generation"
-}
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 

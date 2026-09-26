@@ -87,6 +87,14 @@ $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.To
 server.exe sha256 $Hash
 "@ | Set-Content -Encoding ASCII (Join-Path $Stage "SHA256SUMS.txt")
 
+$Commit = (git -C $Root rev-parse HEAD).Trim()
+$RustVersion = (rustc -V).Trim()
+@"
+commit=$Commit
+rustc=$RustVersion
+server_sha256=$Hash
+"@ | Set-Content -Encoding ASCII (Join-Path $Stage "BUILD_INFO.txt")
+
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 
 Write-Host "NATIVE_WINDOWS_PACKAGE_PASS"

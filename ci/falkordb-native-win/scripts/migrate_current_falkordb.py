@@ -79,6 +79,24 @@ def text(value) -> str:
     return str(value)
 
 
+def redis_mode(client: Redis) -> str:
+    info = client.info(section="server")
+    value = info.get("redis_mode")
+    if value is None:
+        value = info.get(b"redis_mode", "standalone")
+    return text(value).lower()
+
+
+def require_standalone(client: Redis, role: str) -> None:
+    mode = redis_mode(client)
+    if mode != "standalone":
+        raise RuntimeError(
+            f"{role} endpoint reports redis_mode={mode!r}; "
+            "this migration utility currently requires a standalone FalkorDB "
+            "endpoint so binary DUMP routing is unambiguous"
+        )
+
+
 def canonical(value):
     """Convert FalkorDB/Redis response values into deterministic JSON-safe data."""
     if isinstance(value, bytes):
@@ -303,6 +321,9 @@ def main() -> int:
     destination_db = FalkorDB(**destination_ep.falkor_kwargs())
 
     try:
+        require_standalone(source, "source")
+        require_standalone(destination, "destination")
+
         graph_names = source.execute_command("GRAPH.LIST")
         print(f"found {len(graph_names)} graph(s)")
 

@@ -260,22 +260,31 @@ impl GraphCatalog {
         dump: &[u8],
         replace: bool,
     ) -> Result<(), String> {
+        // Validate the Redis/module envelope before touching an existing key.
+        // This matches Redis RESTORE's important failure property: malformed
+        // input must not destroy the value being replaced.
+        let payload = redis_dump::extract_falkordb_v19_payload(dump)?;
+
         if self.contains(destination) {
             if !replace {
                 return Err("BUSYKEY Target key name already exists.".to_string());
             }
             self.delete(destination)?;
-        } else if self.wal_path(destination).exists() {
-            if !replace {
-                return Err("BUSYKEY Target key name already exists.".to_string());
-            }
+        } else {
             let wal = self.wal_path(destination);
-            fs::remove_file(&wal)
-                .map_err(|e| format!("remove replaced graph WAL {}: {e}", wal.display()))?;
-            snapshot::remove_all_checkpoints(&wal)?;
+            let has_checkpoint = snapshot::load_latest(&wal, destination)?.is_some();
+            if wal.exists() || has_checkpoint {
+                if !replace {
+                    return Err("BUSYKEY Target key name already exists.".to_string());
+                }
+                if wal.exists() {
+                    fs::remove_file(&wal)
+                        .map_err(|e| format!("remove replaced graph WAL {}: {e}", wal.display()))?;
+                }
+                snapshot::remove_all_checkpoints(&wal)?;
+            }
         }
 
-        let payload = redis_dump::extract_falkordb_v19_payload(dump)?;
         self.restore_payload(destination, &payload)
     }
 

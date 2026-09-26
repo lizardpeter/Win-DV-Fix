@@ -138,15 +138,23 @@ def graph_signature(db: FalkorDB, name: str) -> dict:
         graph.ro_query("CALL db.propertyKeys()").result_set
     )
 
-    # Exclude transient population status. Everything else here describes the
-    # persistent index definition and must survive a lossless migration.
-    indexes = canonical_rows(
-        graph.ro_query(
+    # Exclude transient population status. Stable upstream FalkorDB calls the
+    # vector/full-text metadata column "info"; some compatibility builds exposed
+    # the same value as "options". Prefer upstream nomenclature and fall back so
+    # source/destination signatures remain comparable across both.
+    try:
+        index_rows = graph.ro_query(
+            "CALL db.indexes() "
+            "YIELD label, properties, types, info, language, stopwords, entitytype "
+            "RETURN label, properties, types, info, language, stopwords, entitytype"
+        ).result_set
+    except ResponseError:
+        index_rows = graph.ro_query(
             "CALL db.indexes() "
             "YIELD label, properties, types, options, language, stopwords, entitytype "
             "RETURN label, properties, types, options, language, stopwords, entitytype"
         ).result_set
-    )
+    indexes = canonical_rows(index_rows)
 
     constraints = canonical_rows(
         {

@@ -147,6 +147,10 @@ impl WriteEscalation for PrelockedWriteEscalation {
     }
 }
 
+pub struct PreparedFalkorImport {
+    graph: graph::graph::graph::Graph,
+}
+
 pub struct NativeGraph {
     inner: RwLock<MvccGraph>,
     name: String,
@@ -267,13 +271,23 @@ impl NativeGraph {
         snapshot::save_falkordb_v19_payload(&graph, &self.name)
     }
 
-    /// Install an upstream FalkorDB v19 GRAPH.RESTORE payload as a durable
-    /// native graph. The import is a one-time conversion: after this returns,
-    /// normal native checkpoints/WAL provide durability.
-    pub fn restore_falkordb_v19_payload(
+    /// Fully decode and validate an upstream FalkorDB v19 payload without
+    /// touching destination persistence. RESTORE REPLACE uses this phase so a
+    /// corrupt-but-well-framed Redis DUMP cannot destroy the existing graph.
+    pub fn prepare_falkordb_v19_payload(
+        name: &str,
+        payload: &[u8],
+    ) -> Result<PreparedFalkorImport, String> {
+        Ok(PreparedFalkorImport {
+            graph: snapshot::load_falkordb_v19_payload(payload, name)?,
+        })
+    }
+
+    /// Persist a graph that has already passed the complete v19 decoder.
+    pub fn restore_prepared_falkordb(
         name: &str,
         wal_path: impl AsRef<Path>,
-        payload: &[u8],
+        prepared: PreparedFalkorImport,
     ) -> Result<Self, String> {
         let wal_path = wal_path.as_ref().to_path_buf();
 
@@ -289,7 +303,7 @@ impl NativeGraph {
             ));
         }
 
-        let graph = snapshot::load_falkordb_v19_payload(payload, name)?;
+        let graph = prepared.graph;
         if let Some(parent) = wal_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -318,6 +332,18 @@ impl NativeGraph {
                 Err(err)
             }
         }
+    }
+
+    /// Install an upstream FalkorDB v19 GRAPH.RESTORE payload as a durable
+    /// native graph. The import is a one-time conversion: after this returns,
+    /// normal native checkpoints/WAL provide durability.
+    pub fn restore_falkordb_v19_payload(
+        name: &str,
+        wal_path: impl AsRef<Path>,
+        payload: &[u8],
+    ) -> Result<Self, String> {
+        let prepared = Self::prepare_falkordb_v19_payload(name, payload)?;
+        Self::restore_prepared_falkordb(name, wal_path, prepared)
     }
 
 

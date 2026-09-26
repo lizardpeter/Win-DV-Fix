@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, QueryOutput, native_config, redis_dump, snapshot, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, native_config, redis_dump, snapshot, udf_store, wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -222,16 +222,25 @@ impl GraphCatalog {
         destination: &str,
         payload: &[u8],
     ) -> Result<(), String> {
+        let prepared = NativeGraph::prepare_falkordb_v19_payload(destination, payload)?;
+        self.restore_prepared_payload(destination, prepared)
+    }
+
+    fn restore_prepared_payload(
+        &self,
+        destination: &str,
+        prepared: PreparedFalkorImport,
+    ) -> Result<(), String> {
         let mut graphs = self.graphs.write();
         let wal_path = self.wal_path(destination);
         if graphs.contains_key(destination) || wal_path.exists() {
             return Err("restore graph failed, key already exists".to_string());
         }
 
-        let graph = Arc::new(NativeGraph::restore_falkordb_v19_payload(
+        let graph = Arc::new(NativeGraph::restore_prepared_falkordb(
             destination,
             &wal_path,
-            payload,
+            prepared,
         )?);
         graphs.insert(destination.to_string(), graph);
         Ok(())
@@ -260,10 +269,11 @@ impl GraphCatalog {
         dump: &[u8],
         replace: bool,
     ) -> Result<(), String> {
-        // Validate the Redis/module envelope before touching an existing key.
-        // This matches Redis RESTORE's important failure property: malformed
-        // input must not destroy the value being replaced.
+        // Validate both the Redis/module envelope and the complete FalkorDB
+        // graph before touching an existing key. A payload can have a valid
+        // Redis CRC/module wrapper and still contain corrupt graph bytes.
         let payload = redis_dump::extract_falkordb_v19_payload(dump)?;
+        let prepared = NativeGraph::prepare_falkordb_v19_payload(destination, &payload)?;
 
         if self.contains(destination) {
             if !replace {
@@ -285,7 +295,7 @@ impl GraphCatalog {
             }
         }
 
-        self.restore_payload(destination, &payload)
+        self.restore_prepared_payload(destination, prepared)
     }
 
 

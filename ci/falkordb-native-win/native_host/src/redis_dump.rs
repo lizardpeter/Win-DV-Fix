@@ -10,7 +10,12 @@
 //! native host. It also performs the inverse operation for DUMP.
 
 const RDB_TYPE_MODULE_2: u8 = 7;
-const RDB_VERSION: u16 = 12;
+
+// Write an older, broadly restorable footer, but accept every Redis RDB
+// version through current Redis 8.10.x. The module graph payload itself is
+// independently versioned as FalkorDB graphdata v19.
+const DUMP_WRITE_RDB_VERSION: u16 = 12;
+const MAX_ACCEPTED_RDB_VERSION: u16 = 15;
 
 const RDB_MODULE_OPCODE_EOF: u64 = 0;
 const RDB_MODULE_OPCODE_STRING: u64 = 5;
@@ -100,7 +105,7 @@ pub fn create_falkordb_dump(v19_payload: &[u8]) -> Vec<u8> {
     write_raw_string_uncompressed(&mut out, v19_payload);
     write_len(&mut out, RDB_MODULE_OPCODE_EOF);
 
-    out.extend_from_slice(&RDB_VERSION.to_le_bytes());
+    out.extend_from_slice(&DUMP_WRITE_RDB_VERSION.to_le_bytes());
     let crc = redis_crc64(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
@@ -112,9 +117,9 @@ fn verify_dump_footer(dump: &[u8]) -> Result<(), String> {
     }
     let footer = dump.len() - 10;
     let version = u16::from_le_bytes([dump[footer], dump[footer + 1]]);
-    if version == 0 || version > RDB_VERSION {
+    if version == 0 || version > MAX_ACCEPTED_RDB_VERSION {
         return Err(format!(
-            "DUMP payload RDB version {version} is unsupported (max {RDB_VERSION})"
+            "DUMP payload RDB version {version} is unsupported (max {MAX_ACCEPTED_RDB_VERSION})"
         ));
     }
 
@@ -493,6 +498,20 @@ mod tests {
             lzf_decompress(&[0, b'a', 0xe0, 1, 0], 11).unwrap(),
             vec![b'a'; 11]
         );
+    }
+
+    #[test]
+    fn accepts_current_redis_8_10_rdb_v15_footer() {
+        let payload = [
+            TYPE_UNSIGNED, 1, 0, 0, 0, 0, 0, 0, 0,
+            TYPE_BYTES, 3, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c',
+        ];
+        let mut dump = create_falkordb_dump(&payload);
+        let footer = dump.len() - 10;
+        dump[footer..footer + 2].copy_from_slice(&15u16.to_le_bytes());
+        let crc = redis_crc64(&dump[..dump.len() - 8]);
+        dump[footer + 2..footer + 10].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(extract_falkordb_v19_payload(&dump).unwrap(), payload);
     }
 
     #[test]

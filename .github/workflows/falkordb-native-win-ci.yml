@@ -132,6 +132,19 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass
           & '.\ci\falkordb-native-win\scripts\diagnose.ps1'
 
+      - name: Build deployable Windows package
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\package_windows.ps1'
+
+      - name: Upload deployable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: falkordb-native-windows-x64
+          path: ci/falkordb-native-win/build/package/falkordb-native-windows-x64.zip
+          if-no-files-found: error
+
       - name: Save Rust build cache
         if: always() && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

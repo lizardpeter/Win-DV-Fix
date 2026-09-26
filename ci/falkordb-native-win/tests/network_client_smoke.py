@@ -90,11 +90,16 @@ def phase_write():
 
     graph.create_node_range_index("Person", "age")
     graph.create_node_fulltext_index("Person", "name")
+    graph.create_node_vector_index("Person", "embedding", dim=2)
+    graph.create_edge_range_index("KNOWS", "since")
+    graph.create_edge_fulltext_index("KNOWS", "note")
+    graph.create_edge_vector_index("KNOWS", "embedding", dim=2)
 
     graph.query(
-        "CREATE (a:Person {name:'Alice',age:40}), "
-        "(b:Person {name:'Bob',age:30}), "
-        "(a)-[:KNOWS {since:2026}]->(b)"
+        "CREATE (a:Person {name:'Alice',age:40,embedding:vecf32([0.0,0.0])}), "
+        "(b:Person {name:'Bob',age:30,embedding:vecf32([10.0,10.0])}), "
+        "(a)-[:KNOWS {since:2026,note:'long term colleague',"
+        "embedding:vecf32([1.0,1.0])}]->(b)"
     )
 
     # Explain/profile are parsed into the official client's ExecutionPlan type.
@@ -193,6 +198,29 @@ def phase_write():
     )
     assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
 
+    restored_vec = restored_graph.query(
+        "CALL db.idx.vector.queryNodes('Person','embedding',1,vecf32([0.1,0.1])) "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_vec.result_set == [["Alice"]], restored_vec.result_set
+
+    restored_edge_range = restored_graph.query(
+        "MATCH ()-[r:KNOWS]->() WHERE r.since = 2026 RETURN r.note"
+    )
+    assert restored_edge_range.result_set == [["long term colleague"]], restored_edge_range.result_set
+
+    restored_edge_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryRelationships('KNOWS','colleague') "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_ft.result_set == [[2026]], restored_edge_ft.result_set
+
+    restored_edge_vec = restored_graph.query(
+        "CALL db.idx.vector.queryRelationships('KNOWS','embedding',1,vecf32([1.1,1.1])) "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
+
     # Schema migration must preserve UNIQUE constraint enforcement, not just
     # graph data and indexes.
     try:
@@ -274,6 +302,43 @@ def phase_read():
         "MATCH (n:Person) RETURN n.name ORDER BY n.name"
     )
     assert restored_result.result_set == [["Alice"], ["Bob"]], restored_result.result_set
+
+    restored_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
+
+    restored_vec = restored_graph.query(
+        "CALL db.idx.vector.queryNodes('Person','embedding',1,vecf32([0.1,0.1])) "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_vec.result_set == [["Alice"]], restored_vec.result_set
+
+    restored_edge_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryRelationships('KNOWS','colleague') "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_ft.result_set == [[2026]], restored_edge_ft.result_set
+
+    restored_edge_vec = restored_graph.query(
+        "CALL db.idx.vector.queryRelationships('KNOWS','embedding',1,vecf32([1.1,1.1])) "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
+
+    restored_constraints = restored_graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in restored_constraints
+    ), restored_constraints
+    try:
+        restored_graph.query("CREATE (:Person {name:'Alice',age:999})")
+        raise AssertionError("restarted restored UNIQUE constraint accepted duplicate")
+    except ResponseError:
+        pass
 
     result = graph.query(
         "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"

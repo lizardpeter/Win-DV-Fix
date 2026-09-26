@@ -25,6 +25,7 @@ from migrate_current_falkordb import (
     canonical,
     graph_signature,
     parse_udf_rows,
+    portable_local_path,
     require_standalone,
     text,
 )
@@ -51,9 +52,21 @@ def endpoint_from_args(args, prefix: str) -> Endpoint:
         username=getattr(args, f"{prefix}_username"),
         password=getattr(args, f"{prefix}_password"),
         ssl=getattr(args, f"{prefix}_ssl"),
-        ca=getattr(args, f"{prefix}_ca"),
-        cert=getattr(args, f"{prefix}_cert"),
-        key=getattr(args, f"{prefix}_key"),
+        ca=portable_local_path(
+            getattr(args, f"{prefix}_ca"),
+            f"--{prefix}-ca",
+            must_exist=True,
+        ),
+        cert=portable_local_path(
+            getattr(args, f"{prefix}_cert"),
+            f"--{prefix}-cert",
+            must_exist=True,
+        ),
+        key=portable_local_path(
+            getattr(args, f"{prefix}_key"),
+            f"--{prefix}-key",
+            must_exist=True,
+        ),
     )
 
 
@@ -89,7 +102,9 @@ def export_bundle(args) -> None:
     ep = endpoint_from_args(args, "source")
     raw = Redis(**ep.redis_kwargs())
     db = FalkorDB(**ep.falkor_kwargs())
-    output = args.output.resolve()
+    output = Path(
+        portable_local_path(args.output, "--output")
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -286,7 +301,10 @@ def import_bundle(args) -> None:
     ep = endpoint_from_args(args, "destination")
     raw = Redis(**ep.redis_kwargs())
     db = FalkorDB(**ep.falkor_kwargs())
-    manifest, zf = load_bundle(args.input.resolve())
+    input_path = Path(
+        portable_local_path(args.input, "--input", must_exist=True)
+    )
+    manifest, zf = load_bundle(input_path)
 
     try:
         require_standalone(raw, "destination")
@@ -342,7 +360,7 @@ def import_bundle(args) -> None:
 
         print(
             f"BUNDLE_IMPORT_COMPLETE graphs={len(manifest['graphs'])} "
-            f"path={args.input.resolve()}"
+            f"path={input_path}"
         )
     finally:
         zf.close()
@@ -351,7 +369,10 @@ def import_bundle(args) -> None:
 
 
 def inspect_bundle(args) -> None:
-    manifest, zf = load_bundle(args.input.resolve())
+    input_path = Path(
+        portable_local_path(args.input, "--input", must_exist=True)
+    )
+    manifest, zf = load_bundle(input_path)
     try:
         print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
     finally:

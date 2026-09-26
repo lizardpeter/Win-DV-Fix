@@ -55,6 +55,19 @@ if (($Help -join "`n") -notmatch "falkordb-native-server") {
 }
 $Help | Set-Content -Encoding UTF8 (Join-Path $Stage "SERVER_HELP.txt")
 
+foreach ($ScriptName in @(
+    "migrate_current_falkordb.py",
+    "falkordb_bundle.py",
+    "import_falkordb_rdb.py"
+)) {
+    $ScriptPath = Join-Path $Stage $ScriptName
+    $ScriptHelp = python $ScriptPath --help 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Packaged migration utility $ScriptName --help failed with exit code $LASTEXITCODE"
+    }
+    $ScriptHelp | Set-Content -Encoding UTF8 (Join-Path $Stage ($ScriptName + ".HELP.txt"))
+}
+
 # Prove the package does not need a separately-installed Microsoft C/C++
 # runtime. Normal Windows system DLLs remain dynamic imports.
 $Link = Get-Command link.exe -ErrorAction SilentlyContinue

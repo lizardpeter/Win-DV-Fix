@@ -73,7 +73,14 @@ def generate(args) -> None:
             "(a)-[:PARALLEL {slot:1}]->(b),"
             "(a)-[:PARALLEL {slot:2}]->(b)"
         )
-        assert graph.create_node_unique_constraint("Person", "name") == "OK"
+        graph.create_node_unique_constraint("Person", "name")
+        constraints = graph.list_constraints()
+        assert any(
+            c["type"] == "UNIQUE"
+            and c["label"] == "Person"
+            and "name" in c["properties"]
+            for c in constraints
+        ), constraints
 
         graph.query(
             "CREATE (:Types {"

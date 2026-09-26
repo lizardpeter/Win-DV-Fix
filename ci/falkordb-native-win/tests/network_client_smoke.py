@@ -9,9 +9,9 @@ from falkordb.edge import Edge
 from redis import Redis
 from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 
-HOST = "localhost"
-PORT = 6391
-PASSWORD = "native-ci-secret"
+HOST = os.environ.get("FALKORDB_TEST_HOST", "localhost")
+PORT = int(os.environ.get("FALKORDB_TEST_PORT", "6391"))
+PASSWORD = os.environ.get("FALKORDB_TEST_PASSWORD", "native-ci-secret")
 GRAPH = "network-official-client"
 REDIS_RESTORED_GRAPH = "network-redis-dump-restored"
 
@@ -100,6 +100,35 @@ def phase_write():
         "(b:Person {name:'Bob',age:30,embedding:vecf32([10.0,10.0])}), "
         "(a)-[:KNOWS {since:2026,note:'long term colleague',"
         "embedding:vecf32([1.0,1.0])}]->(b)"
+    )
+
+    # Mirror upstream FalkorDB's persistence corpus so the migration path proves
+    # every currently persisted SIValue family rather than only scalars.
+    graph.query(
+        "CREATE (:Types {"
+        "strval:'str', numval:5.5, boolval:true, array:[1,2,3], "
+        "pointval:point({latitude:5.5, longitude:6}), "
+        "vector:vecf32([1,0,3]), "
+        "arr_of_vecs:[vecf32([1,8,3]),vecf32([1,-1,4]),vecf32([2,2,3])], "
+        "date:date({year:1984,month:10,day:21}), "
+        "time:localtime({hour:10,minute:30,second:10}), "
+        "datetime:localdatetime({year:1984,month:10,day:21,hour:5,minute:30,second:10}), "
+        "duration:duration({years:1,months:1,days:1,hours:1,minutes:1,seconds:1})"
+        "})"
+    )
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+
+    # Parallel relationships use FalkorDB's multi-edge tensor serialization,
+    # which is distinct from the ordinary single-edge relationship matrix.
+    graph.query(
+        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) "
+        "CREATE (a)-[:PARALLEL {slot:1}]->(b),"
+        "(a)-[:PARALLEL {slot:2}]->(b)"
     )
 
     # Explain/profile are parsed into the official client's ExecutionPlan type.
@@ -221,6 +250,15 @@ def phase_write():
     )
     assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
 
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
+
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
+
     # Schema migration must preserve UNIQUE constraint enforcement, not just
     # graph data and indexes.
     try:
@@ -302,6 +340,21 @@ def phase_read():
         "MATCH (n:Person) RETURN n.name ORDER BY n.name"
     )
     assert restored_result.result_set == [["Alice"], ["Bob"]], restored_result.result_set
+
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
+
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
 
     restored_ft = restored_graph.query(
         "CALL db.idx.fulltext.queryNodes('Person','Alice') "

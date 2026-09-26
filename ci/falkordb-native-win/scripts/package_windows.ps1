@@ -206,6 +206,21 @@ if ($Deps -match "(?i)(VCRUNTIME|MSVCP)[^\s]*\.dll") {
     throw "server.exe depends on an external MSVC runtime"
 }
 
+$Manifest = Join-Path $Root "SHA256SUMS.txt"
+if (Test-Path $Manifest) {
+    foreach ($Line in Get-Content $Manifest) {
+        if ([string]::IsNullOrWhiteSpace($Line)) { continue }
+        $Parts = $Line -split "\s{2}", 2
+        if ($Parts.Count -ne 2) { throw "Malformed SHA256SUMS entry: $Line" }
+        $File = Join-Path $Root $Parts[1]
+        if (-not (Test-Path $File)) { throw "Manifest file missing: $($Parts[1])" }
+        $Actual = (Get-FileHash -Algorithm SHA256 $File).Hash.ToLowerInvariant()
+        if ($Actual -ne $Parts[0].ToLowerInvariant()) {
+            throw "SHA256 mismatch for $($Parts[1])"
+        }
+    }
+}
+
 & "$Root\python\python.exe" -c "import redis, falkordb"
 if ($LASTEXITCODE -ne 0) {
     throw "Bundled migration Python runtime is not self-contained"
@@ -330,9 +345,33 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "server.exe")).Hash.ToLowerInvariant()
-@"
-server.exe sha256 $Hash
-"@ | Set-Content -Encoding ASCII (Join-Path $Stage "SHA256SUMS.txt")
+
+$MutableRoots = @(
+    (Join-Path $Stage "data"),
+    (Join-Path $Stage "logs"),
+    (Join-Path $Stage "tmp"),
+    (Join-Path $Stage "pycache"),
+    (Join-Path $Stage "imports"),
+    (Join-Path $Stage "exports"),
+    (Join-Path $Stage "migration"),
+    (Join-Path $Stage "cache"),
+    (Join-Path $Stage "config"),
+    (Join-Path $Stage "profile"),
+    (Join-Path $Stage "tls")
+)
+$ManifestPath = Join-Path $Stage "SHA256SUMS.txt"
+$ManifestLines = Get-ChildItem -Path $Stage -File -Recurse |
+    Where-Object {
+        $_.FullName -ne $ManifestPath -and
+        -not ($MutableRoots | Where-Object { $_ -and $_.Length -gt 0 -and $_ -ne $Stage -and $PSItem.FullName.StartsWith($_ + [IO.Path]::DirectorySeparatorChar) })
+    } |
+    Sort-Object FullName |
+    ForEach-Object {
+        $Relative = [IO.Path]::GetRelativePath($Stage, $_.FullName)
+        $Digest = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+        "$Digest  $Relative"
+    }
+$ManifestLines | Set-Content -Encoding ASCII $ManifestPath
 
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Zip -CompressionLevel Optimal
 

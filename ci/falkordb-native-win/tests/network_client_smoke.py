@@ -102,6 +102,27 @@ def phase_write():
         "embedding:vecf32([1.0,1.0])}]->(b)"
     )
 
+    # Mirror upstream FalkorDB's persistence corpus so the migration path proves
+    # every currently persisted SIValue family rather than only scalars.
+    graph.query(
+        "CREATE (:Types {"
+        "strval:'str', numval:5.5, boolval:true, array:[1,2,3], "
+        "pointval:point({latitude:5.5, longitude:6}), "
+        "vector:vecf32([1,0,3]), "
+        "arr_of_vecs:[vecf32([1,8,3]),vecf32([1,-1,4]),vecf32([2,2,3])], "
+        "date:date({year:1984,month:10,day:21}), "
+        "time:localtime({hour:10,minute:30,second:10}), "
+        "datetime:localdatetime({year:1984,month:10,day:21,hour:5,minute:30,second:10}), "
+        "duration:duration({years:1,months:1,days:1,hours:1,minutes:1,seconds:1})"
+        "})"
+    )
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+
     # Explain/profile are parsed into the official client's ExecutionPlan type.
     explain = graph.explain("MATCH (n:Person) RETURN n.name")
     assert explain.plan and len(explain.plan) > 0, explain.plan
@@ -221,6 +242,9 @@ def phase_write():
     )
     assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
 
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
+
     # Schema migration must preserve UNIQUE constraint enforcement, not just
     # graph data and indexes.
     try:
@@ -302,6 +326,15 @@ def phase_read():
         "MATCH (n:Person) RETURN n.name ORDER BY n.name"
     )
     assert restored_result.result_set == [["Alice"], ["Bob"]], restored_result.result_set
+
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
 
     restored_ft = restored_graph.query(
         "CALL db.idx.fulltext.queryNodes('Person','Alice') "

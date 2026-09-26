@@ -86,12 +86,21 @@ def migrate_udfs(source_ep: Endpoint, destination_ep: Endpoint, replace: bool) -
     try:
         libraries = source.udf_list(with_code=True)
         for row in libraries:
-            # falkordb-py currently returns each library as:
-            # [status/type, library_name, function_names, source_code].
-            if len(row) < 4:
+            # Current FalkorDB returns alternating labeled fields:
+            # ["library_name", name, "functions", [...],
+            #  "library_code", source].
+            if len(row) < 4 or len(row) % 2 != 0:
                 raise RuntimeError(f"unexpected GRAPH.UDF LIST WITHCODE row: {row!r}")
-            name = text(row[1])
-            code = text(row[3])
+            fields = {
+                text(row[i]).lower(): row[i + 1]
+                for i in range(0, len(row), 2)
+            }
+            if "library_name" not in fields or "library_code" not in fields:
+                raise RuntimeError(
+                    f"GRAPH.UDF LIST WITHCODE omitted required fields: {row!r}"
+                )
+            name = text(fields["library_name"])
+            code = text(fields["library_code"])
             destination.udf_load(name, code, replace)
             moved += 1
     finally:

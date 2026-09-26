@@ -125,8 +125,8 @@ def graph_signature(db: FalkorDB, name: str) -> dict:
     indexes = canonical_rows(
         graph.ro_query(
             "CALL db.indexes() "
-            "YIELD label, properties, types, language, stopwords, entitytype, info "
-            "RETURN label, properties, types, language, stopwords, entitytype, info"
+            "YIELD label, properties, types, options, language, stopwords, entitytype "
+            "RETURN label, properties, types, options, language, stopwords, entitytype"
         ).result_set
     )
 

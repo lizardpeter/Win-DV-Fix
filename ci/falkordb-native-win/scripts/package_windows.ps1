@@ -229,6 +229,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Bundled migration Python runtime is not self-contained"
 }
 
+& "$Root\run-tool.ps1" import-rdb --help | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Portable run-tool wrapper failed to forward helper arguments"
+}
+
 $OutsideFile = Join-Path $env:WINDIR "win.ini"
 if (Test-Path $OutsideFile) {
     $ToolEscape = & "$Root\python\python.exe" "$Root\import_falkordb_rdb.py" inspect --rdb $OutsideFile 2>&1

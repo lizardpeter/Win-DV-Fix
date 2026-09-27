@@ -523,6 +523,12 @@ try {
         throw "Direct MCP OAuth restart phase failed with exit code $LASTEXITCODE"
     }
     $McpRestartText = (Get-Content (Join-Path $Logs "11_mcp_direct_oauth_restart.txt") -Raw)
+    if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_ACCESS_TOKEN_RESTART_PASS") {
+        throw "Direct MCP OAuth access token did not survive restart"
+    }
+    if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_REFRESH_TOKEN_RESTART_PASS") {
+        throw "Direct MCP OAuth refresh token could not mint a new access token after restart"
+    }
     if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_RESTART_PASS") {
         throw "Direct MCP OAuth token/data did not survive restart"
     }

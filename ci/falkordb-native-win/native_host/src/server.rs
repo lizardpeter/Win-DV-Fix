@@ -113,6 +113,7 @@ pub struct RdbFileImportReport {
     pub sha256: String,
     pub dry_run: bool,
     pub udf_count: usize,
+    pub ignored_aux_keys: Vec<String>,
     pub graphs: Vec<RdbFileGraphReport>,
 }
 
@@ -386,6 +387,7 @@ impl GraphCatalog {
                 sha256: parsed.sha256_hex,
                 dry_run: true,
                 udf_count: parsed.udfs.len(),
+                ignored_aux_keys: parsed.ignored_aux_keys.clone(),
                 graphs: graph_reports,
             });
         }
@@ -457,6 +459,7 @@ impl GraphCatalog {
             sha256: parsed.sha256_hex,
             dry_run: false,
             udf_count: parsed.udfs.len(),
+            ignored_aux_keys: parsed.ignored_aux_keys,
             graphs: graph_reports,
         })
     }

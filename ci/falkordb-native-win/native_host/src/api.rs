@@ -25,6 +25,7 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     pub read_write_token: Option<String>,
     pub read_only_token: Option<String>,
+    pub oauth_admin_secret: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -36,6 +37,7 @@ impl Default for ApiConfig {
             bind: "127.0.0.1:8443".parse().expect("valid default API socket"),
             read_write_token: None,
             read_only_token: None,
+            oauth_admin_secret: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,
@@ -173,10 +175,11 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-    content_type: &'static str,
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) content_type: &'static str,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
@@ -280,11 +283,35 @@ fn route_http(
         return json_response(200, openapi_document());
     }
 
+    if let Some(response) = crate::mcp::public_auth_route(
+        &request.method,
+        &request.target,
+        &request.headers,
+        &request.body,
+        config.tls.is_some(),
+        config.oauth_admin_secret.as_deref(),
+        config.read_write_token.as_deref(),
+    ) {
+        return response;
+    }
+
     let scope = auth_scope(&request.headers, config);
     if scope == AuthScope::None
         && (config.read_write_token.is_some() || config.read_only_token.is_some())
     {
+        if request.target.split_once('?').map(|(path, _)| path).unwrap_or(&request.target) == "/mcp" {
+            return crate::mcp::oauth_unauthorized(&request.headers, config.tls.is_some());
+        }
         return error_response(401, "unauthorized", "valid Bearer token required");
+    }
+
+    if request.target.split_once('?').map(|(path, _)| path).unwrap_or(&request.target) == "/mcp" {
+        return crate::mcp::handle_mcp(
+            &request.method,
+            &request.body,
+            catalog,
+            scope == AuthScope::ReadWrite,
+        );
     }
 
     match (request.method.as_str(), request.target.as_str()) {
@@ -442,7 +469,7 @@ fn run_query(
     }
 }
 
-fn query_output_json(graph: &str, output: QueryOutput) -> JsonValue {
+pub(crate) fn query_output_json(graph: &str, output: QueryOutput) -> JsonValue {
     let rows: Vec<Vec<JsonValue>> = output
         .wire_rows
         .iter()
@@ -563,6 +590,7 @@ fn json_response(status: u16, value: JsonValue) -> HttpResponse {
         status,
         body: serde_json::to_vec(&value).expect("JSON value must serialize"),
         content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
     }
 }
 
@@ -578,6 +606,9 @@ fn error_response(status: u16, code: &str, message: &str) -> HttpResponse {
 fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::io::Result<()> {
     let reason = match response.status {
         200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -585,18 +616,24 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
 
     write!(
         writer,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
         response.status,
         reason,
         response.content_type,
         response.body.len()
     )?;
+    for (name, value) in &response.headers {
+        write!(writer, "{}: {}\r\n", name, value)?;
+    }
+    write!(writer, "\r\n")?;
     writer.write_all(&response.body)
 }
 

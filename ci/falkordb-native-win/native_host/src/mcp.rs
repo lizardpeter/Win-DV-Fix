@@ -820,6 +820,33 @@ fn tools_list_result(modern: bool) -> JsonValue {
             true,
         ),
         tool_definition(
+            "import_falkordb_rdb_file",
+            "Import FalkorDB RDB file",
+            "Parse, verify, and restore a complete native FalkorDB Redis dump.rdb from the server import directory without sending the database through MCP. The import is non-destructive and refuses to overwrite an existing graph. Supply sha256 and expected_graph to bind the import to an exact authoritative database. Set dry_run=true to validate without restoring.",
+            object_schema(
+                json!({
+                    "file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Relative path below FALKORDB_IMPORT_DIR, or <data-dir>/imports when unset."
+                    },
+                    "expected_graph": {"type": "string", "minLength": 1},
+                    "sha256": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9A-Fa-f]{64}$"
+                    },
+                    "dry_run": {"type": "boolean", "default": false}
+                }),
+                &["file"],
+            ),
+            RequiredScope::Admin,
+            false,
+            false,
+            false,
+        ),
+        tool_definition(
             "restore_graph_dump",
             "Restore graph dump",
             "Restore a base64-encoded Redis/FalkorDB DUMP payload into a named graph. Set replace=true to replace an existing graph.",
@@ -919,7 +946,8 @@ fn call_tool(
         | "checkpoint_graph"
         | "checkpoint_all_graphs"
         | "flush_all_graphs"
-        | "restore_graph_dump" => RequiredScope::Admin,
+        | "restore_graph_dump"
+        | "import_falkordb_rdb_file" => RequiredScope::Admin,
         _ => return Err(format!("unknown tool {name:?}")),
     };
 
@@ -1018,6 +1046,44 @@ fn call_tool(
                     "dump_base64": URL_SAFE_NO_PAD.encode(dump)
                 })
             })
+        }
+        "import_falkordb_rdb_file" => {
+            let file = required_string(&args, "file")?;
+            let expected_graph = args
+                .get("expected_graph")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let sha256 = args
+                .get("sha256")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let dry_run = args
+                .get("dry_run")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+
+            catalog
+                .import_rdb_file(file, expected_graph, sha256, dry_run)
+                .map(|report| {
+                    json!({
+                        "import_root": report.import_root,
+                        "file": report.file,
+                        "redis_rdb_version": report.redis_rdb_version,
+                        "size_bytes": report.size_bytes,
+                        "sha256": report.sha256,
+                        "dry_run": report.dry_run,
+                        "udf_count": report.udf_count,
+                        "graphs": report.graphs.into_iter().map(|graph| {
+                            json!({
+                                "graph": graph.graph,
+                                "fragments": graph.fragments,
+                                "nodes": graph.nodes,
+                                "relationships": graph.relationships,
+                                "checkpoint_file": graph.checkpoint_file
+                            })
+                        }).collect::<Vec<_>>()
+                    })
+                })
         }
         "restore_graph_dump" => {
             let graph_name = required_string(&args, "graph")?;
@@ -1606,5 +1672,6 @@ mod tests {
         assert!(names.contains(&"flush_all_graphs"));
         assert!(names.contains(&"export_graph_dump"));
         assert!(names.contains(&"restore_graph_dump"));
+        assert!(names.contains(&"import_falkordb_rdb_file"));
     }
 }

@@ -22,6 +22,9 @@ const RDB_OPCODE_EOF: u8 = 255;
 
 const RDB_TYPE_MODULE_PRE_GA: u8 = 6;
 const RDB_TYPE_MODULE_2: u8 = 7;
+// Redis stream encodings used by FalkorDB's per-graph telemetry key.
+const RDB_TYPE_STREAM_LISTPACKS_4: u8 = 26;
+const RDB_TYPE_STREAM_LISTPACKS_5: u8 = 27;
 
 const RDB_MODULE_OPCODE_EOF: u64 = 0;
 const RDB_MODULE_OPCODE_SINT: u64 = 1;
@@ -62,6 +65,10 @@ pub struct ParsedRdb {
     pub sha256_hex: String,
     pub graphs: Vec<RdbGraph>,
     pub udfs: HashMap<String, String>,
+    /// FalkorDB-owned auxiliary Redis keys intentionally not imported into
+    /// the native graph catalog. At present this is restricted to the
+    /// telemetry{graph} stream emitted beside a graph.
+    pub ignored_aux_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +556,89 @@ fn trim_nul_utf8(bytes: &[u8], label: &str) -> Result<String, String> {
         .map_err(|_| format!("{label} is not valid UTF-8"))
 }
 
+
+fn read_plain_len(reader: &mut RdbReader<'_>, label: &str) -> Result<u64, String> {
+    let (value, encoded) = reader.read_len()?;
+    if encoded {
+        return Err(format!("encoded RDB length where {label} was expected"));
+    }
+    Ok(value)
+}
+
+/// Consume a Redis stream value without materializing it. FalkorDB writes
+/// one telemetry{graph} stream alongside graph module keys. We preserve
+/// fail-closed behavior by accepting stream encodings 26/27 only for that
+/// exact auxiliary key shape; arbitrary Redis streams remain rejected.
+fn skip_stream_value(reader: &mut RdbReader<'_>, record_type: u8) -> Result<(), String> {
+    let listpack_count = read_plain_len(reader, "stream listpack count")?;
+    for _ in 0..listpack_count {
+        reader.string()?; // radix-tree node key
+        reader.string()?; // serialized listpack
+    }
+
+    // Common stream metadata for current stream RDB encodings.
+    read_plain_len(reader, "stream length")?;
+    read_plain_len(reader, "stream last-id ms")?;
+    read_plain_len(reader, "stream last-id seq")?;
+    read_plain_len(reader, "stream first-id ms")?;
+    read_plain_len(reader, "stream first-id seq")?;
+    read_plain_len(reader, "stream max-deleted-id ms")?;
+    read_plain_len(reader, "stream max-deleted-id seq")?;
+    read_plain_len(reader, "stream entries-added")?;
+
+    let group_count = read_plain_len(reader, "stream consumer-group count")?;
+    for _ in 0..group_count {
+        reader.string()?; // group name
+        read_plain_len(reader, "consumer-group last-id ms")?;
+        read_plain_len(reader, "consumer-group last-id seq")?;
+        read_plain_len(reader, "consumer-group entries-read")?;
+
+        let pel_count = read_plain_len(reader, "consumer-group PEL count")?;
+        for _ in 0..pel_count {
+            reader.read(16)?; // stream ID
+            reader.read(8)?;  // delivery time (mstime_t)
+            read_plain_len(reader, "consumer-group delivery count")?;
+        }
+
+        let consumer_count = read_plain_len(reader, "stream consumer count")?;
+        for _ in 0..consumer_count {
+            reader.string()?; // consumer name
+            reader.read(8)?;  // seen time
+            reader.read(8)?;  // active time
+            let local_pel_count = read_plain_len(reader, "consumer PEL count")?;
+            for _ in 0..local_pel_count {
+                reader.read(16)?;
+            }
+        }
+
+        if record_type >= RDB_TYPE_STREAM_LISTPACKS_5 {
+            let nack_zone_count = read_plain_len(reader, "stream NACK zone count")?;
+            let bytes = usize::try_from(nack_zone_count)
+                .ok()
+                .and_then(|value| value.checked_mul(16))
+                .ok_or_else(|| "stream NACK zone byte count overflow".to_string())?;
+            reader.read(bytes)?;
+        }
+    }
+
+    // STREAM_LISTPACKS_4 added IDMP state.
+    read_plain_len(reader, "stream IDMP duration")?;
+    read_plain_len(reader, "stream IDMP max entries")?;
+    let producer_count = read_plain_len(reader, "stream IDMP producer count")?;
+    for _ in 0..producer_count {
+        reader.string()?; // producer id
+        let entry_count = read_plain_len(reader, "stream IDMP producer entry count")?;
+        for _ in 0..entry_count {
+            reader.string()?; // IID
+            read_plain_len(reader, "stream IDMP entry ms")?;
+            read_plain_len(reader, "stream IDMP entry seq")?;
+        }
+    }
+    read_plain_len(reader, "stream IDMP IIDs added")?;
+    read_plain_len(reader, "stream IDMP IIDs duplicates")?;
+    Ok(())
+}
+
 fn module_records_as_chunks(records: Vec<ModuleRecord>, key: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut chunks = Vec::with_capacity(records.len());
     for record in records {
@@ -666,6 +756,7 @@ pub fn parse_rdb_file(path: &Path) -> Result<ParsedRdb, String> {
     let mut graph_order: Vec<RdbGraph> = Vec::new();
     let mut graph_indices: HashMap<String, usize> = HashMap::new();
     let mut udfs = HashMap::new();
+    let mut ignored_aux_keys = Vec::<String>::new();
     let mut current_db = 0u64;
     let mut pending_expire = false;
 
@@ -763,6 +854,18 @@ pub fn parse_rdb_file(path: &Path) -> Result<ParsedRdb, String> {
                 "RDB contains key {key_text:?} in Redis DB {current_db}; native FalkorDB host raw import requires DB 0"
             ));
         }
+        if matches!(
+            record_type,
+            RDB_TYPE_STREAM_LISTPACKS_4 | RDB_TYPE_STREAM_LISTPACKS_5
+        ) && key_text.starts_with("telemetry{")
+            && key_text.ends_with('}')
+        {
+            skip_stream_value(&mut reader, record_type)?;
+            ignored_aux_keys.push(key_text);
+            pending_expire = false;
+            continue;
+        }
+
         if record_type == RDB_TYPE_MODULE_PRE_GA {
             return Err(format!(
                 "key {key_text:?} uses unsupported pre-GA Redis module format"
@@ -826,6 +929,18 @@ pub fn parse_rdb_file(path: &Path) -> Result<ParsedRdb, String> {
     if graph_order.is_empty() {
         return Err("RDB contains no current FalkorDB graphdata/graphmeta keys".to_string());
     }
+
+    for key in &ignored_aux_keys {
+        let graph_name = key
+            .strip_prefix("telemetry{")
+            .and_then(|value| value.strip_suffix('}'))
+            .ok_or_else(|| format!("invalid FalkorDB telemetry key {key:?}"))?;
+        if !graph_order.iter().any(|graph| graph.name == graph_name) {
+            return Err(format!(
+                "telemetry key {key:?} does not correspond to a graph in this RDB"
+            ));
+        }
+    }
     for graph in &graph_order {
         if graph.fragments.len() as u64 != graph.key_count {
             return Err(format!(
@@ -843,6 +958,7 @@ pub fn parse_rdb_file(path: &Path) -> Result<ParsedRdb, String> {
         sha256_hex,
         graphs: graph_order,
         udfs,
+        ignored_aux_keys,
     })
 }
 

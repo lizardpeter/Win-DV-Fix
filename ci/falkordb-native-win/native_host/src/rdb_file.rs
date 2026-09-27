@@ -981,6 +981,17 @@ mod tests {
     }
 
     #[test]
+    fn consumes_minimal_falkordb_telemetry_stream() {
+        // Empty STREAM_LISTPACKS_4 value: no listpacks, zero IDs/counters,
+        // no groups, and empty IDMP metadata.
+        let bytes = [0u8; 15];
+        let mut reader = RdbReader::new(&bytes);
+        skip_stream_value(&mut reader, RDB_TYPE_STREAM_LISTPACKS_4)
+            .expect("minimal telemetry stream should parse");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
     fn rejects_import_path_traversal_before_io() {
         let data_dir = Path::new(".");
         assert!(resolve_import_file(data_dir, "../secret.rdb").is_err());

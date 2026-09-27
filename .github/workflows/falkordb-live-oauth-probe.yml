@@ -82,6 +82,26 @@ jobs:
           }, indent=2))
           PY
 
+          echo "=== stable ChatGPT CIMD ==="
+          curl -sS --fail-with-body --max-time 15 \
+            "https://chatgpt.com/oauth/client.json" > /tmp/chatgpt-stable-client.json
+          cat /tmp/chatgpt-stable-client.json
+          echo
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/chatgpt-stable-client.json'))
+          print(json.dumps({
+            'client_id': d.get('client_id'),
+            'redirect_uris': d.get('redirect_uris'),
+            'token_endpoint_auth_method': d.get('token_endpoint_auth_method'),
+            'token_endpoint_auth_methods_supported': d.get('token_endpoint_auth_methods_supported'),
+            'grant_types': d.get('grant_types'),
+            'response_types': d.get('response_types'),
+            'token_endpoint_auth_signing_alg': d.get('token_endpoint_auth_signing_alg'),
+            'jwks_uri': d.get('jwks_uri'),
+          }, indent=2))
+          PY
+
           echo "=== live OAuth metadata consistency ==="
           curl -sS --fail-with-body --max-time 15 \
             "$base/.well-known/oauth-authorization-server" > /tmp/as.json

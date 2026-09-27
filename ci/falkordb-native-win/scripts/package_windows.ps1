@@ -26,6 +26,7 @@ Copy-Item -Force $ServerExe (Join-Path $Stage "server.exe")
 Copy-Item -Force (Join-Path $Root "scripts\migrate_current_falkordb.py") (Join-Path $Stage "migrate_current_falkordb.py")
 Copy-Item -Force (Join-Path $Root "scripts\falkordb_bundle.py") (Join-Path $Stage "falkordb_bundle.py")
 Copy-Item -Force (Join-Path $Root "scripts\import_falkordb_rdb.py") (Join-Path $Stage "import_falkordb_rdb.py")
+Copy-Item -Force (Join-Path $Root "scripts\start_openai_tunnel.ps1") (Join-Path $Stage "start-openai-tunnel.ps1")
 Copy-Item -Force (Join-Path $Root "requirements-migration.txt") (Join-Path $Stage "requirements-migration.txt")
 Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
@@ -181,6 +182,7 @@ $RequiredFiles = @(
     "portable-env.ps1",
     "start-local.ps1",
     "run-tool.ps1",
+    "start-openai-tunnel.ps1",
     "import_falkordb_rdb.py",
     "migrate_current_falkordb.py",
     "falkordb_bundle.py",

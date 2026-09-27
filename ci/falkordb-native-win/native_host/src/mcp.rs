@@ -1,3 +1,4 @@
+// Native Streamable HTTP MCP + OAuth 2.1 bridge for the standalone FalkorDB host.
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},

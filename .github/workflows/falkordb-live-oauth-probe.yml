@@ -89,7 +89,7 @@ jobs:
           import json
           d=json.load(open('/tmp/as.json'))
           print(json.dumps(d, indent=2))
-          assert d.get('authorization_response_iss_parameter_supported') is False
+          assert d.get('authorization_response_iss_parameter_supported') is True
           assert d.get('client_id_metadata_document_supported') is True
           assert 'S256' in d.get('code_challenge_methods_supported', [])
           assert 'none' in d.get('token_endpoint_auth_methods_supported', [])

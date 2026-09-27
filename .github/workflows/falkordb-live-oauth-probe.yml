@@ -1,0 +1,83 @@
+name: FalkorDB live OAuth probe
+
+on:
+  push:
+    branches:
+      - chatgpt/falkordb-live-oauth-probe
+    paths:
+      - .github/workflows/falkordb-live-oauth-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe public OAuth and MCP endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://db.houseofkublai.com"
+
+          echo "=== DNS/TLS/HEAD ==="
+          curl -sSvk --max-time 15 "$base/.well-known/oauth-protected-resource" -o /tmp/resource.json 2>/tmp/curl-v.txt || {
+            cat /tmp/curl-v.txt
+            exit 1
+          }
+          cat /tmp/curl-v.txt
+          echo
+          echo "=== protected resource metadata ==="
+          cat /tmp/resource.json
+          echo
+
+          echo "=== authorization server metadata ==="
+          curl -sS --fail-with-body --max-time 15 "$base/.well-known/oauth-authorization-server"
+          echo
+
+          echo "=== modern server/discover ==="
+          curl -sS --fail-with-body --max-time 15 \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","clientInfo":{"name":"github-live-probe","version":"1"},"clientCapabilities":{}}}}' \
+            "$base/mcp"
+          echo
+
+          echo "=== modern tools/list ==="
+          curl -sS --fail-with-body --max-time 15 \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","clientInfo":{"name":"github-live-probe","version":"1"},"clientCapabilities":{}}}}' \
+            "$base/mcp" > /tmp/tools.json
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/tools.json'))
+          r=d.get('result',{})
+          print(json.dumps({
+            'jsonrpc': d.get('jsonrpc'),
+            'has_error': 'error' in d,
+            'resultType': r.get('resultType'),
+            'ttlMs': r.get('ttlMs'),
+            'cacheScope': r.get('cacheScope'),
+            'tool_count': len(r.get('tools',[])),
+            'tool_names': [x.get('name') for x in r.get('tools',[])],
+          }, indent=2))
+          PY
+
+          echo "=== token endpoint reachability (intentionally invalid code) ==="
+          status=$(curl -sS -o /tmp/token.json -w '%{http_code}' --max-time 15 \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'grant_type=authorization_code' \
+            --data-urlencode 'code=definitely-invalid-probe-code' \
+            --data-urlencode 'client_id=https://chatgpt.com/oauth/client.json' \
+            --data-urlencode 'redirect_uri=https://chatgpt.com/connector_platform_oauth_redirect' \
+            --data-urlencode 'code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk' \
+            --data-urlencode 'resource=https://db.houseofkublai.com/mcp' \
+            "$base/oauth/token")
+          echo "HTTP $status"
+          cat /tmp/token.json
+          echo
+          test "$status" = "400"
+          grep -q 'invalid_grant' /tmp/token.json
+
+          echo "LIVE_OAUTH_PUBLIC_PROBE_PASS"

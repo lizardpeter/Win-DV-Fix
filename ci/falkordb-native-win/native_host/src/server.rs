@@ -1710,6 +1710,19 @@ fn require_arity(args: &[Vec<u8>], expected: usize) -> Result<(), String> {
     }
 }
 
+fn graph_query_count(graph: &NativeGraph, cypher: &str) -> Result<u64, String> {
+    let output = graph.query_read_only(cypher)?;
+    let value = output
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or_else(|| format!("count query returned no value: {cypher}"))?;
+    value
+        .parse::<u64>()
+        .map_err(|e| format!("count query returned non-integer {value:?}: {e}"))
+}
+
+
 fn utf8<'a>(value: &'a [u8], what: &str) -> Result<&'a str, String> {
     std::str::from_utf8(value).map_err(|_| format!("ERR {what} must be UTF-8"))
 }

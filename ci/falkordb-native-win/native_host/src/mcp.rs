@@ -18,7 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "oauth-callback-v3-20260927";
+pub const OAUTH_BUILD_ID: &str = "oauth-fingerprint-v4-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
@@ -214,6 +214,20 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
     )
 }
 
+fn pairing_code_fingerprint(code: &str) -> String {
+    let digest = digest::digest(&digest::SHA256, code.as_bytes());
+    digest
+        .as_ref()
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>()
+}
+
+fn compact_pairing_input(input: &str) -> String {
+    input.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     if config.oauth_owner_secret.is_none()
         && config.read_write_token.is_none()
@@ -238,6 +252,19 @@ fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpRespons
     };
 
     let scope_display = html_escape(&validated.scope);
+    let pairing_fingerprint = config
+        .oauth_pairing_code
+        .as_deref()
+        .map(pairing_code_fingerprint)
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "OAuth authorization page [{}]: pairing_fingerprint={}, client_id={}, redirect_uri={}, resource={}",
+        OAUTH_BUILD_ID,
+        pairing_fingerprint,
+        validated.client_id,
+        validated.redirect_uri,
+        validated.resource,
+    );
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -261,11 +288,11 @@ code{{word-break:break-word}}
 <p><code>{scope_display}</code></p>
 <p><strong>Recommended:</strong> enter the restart-scoped <strong>OAuth pairing code</strong> printed in the server console. This bypasses all password, environment-variable, and secrets-file parsing.</p>
 <p>You may also use the RESP server password or <strong>FALKORDB_API_TOKEN</strong>. Raw values, complete <code>NAME=value</code> lines, and the complete two-line <code>falkordb-secrets.txt</code> are accepted.</p>
-<p class="small">OAuth build: <code>{build_id}</code></p>
+<p class="small">OAuth build: <code>{build_id}</code><br>Pairing fingerprint: <code>{pairing_fingerprint}</code></p>
 <form method="post" action="/oauth/authorize">
 {hidden}
 <label for="owner_secret">OAuth pairing code or FalkorDB owner secret</label>
-<input id="owner_secret" name="owner_secret" type="password" autocomplete="current-password" required autofocus>
+<input id="owner_secret" name="owner_secret" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required autofocus>
 <button type="submit">Authorize ChatGPT</button>
 </form>
 <p class="small">The owner secret is sent only to this server over HTTPS and is never returned to ChatGPT.</p>
@@ -273,7 +300,8 @@ code{{word-break:break-word}}
 </body>
 </html>"#,
         hidden = validated.hidden_fields(),
-        build_id = OAUTH_BUILD_ID
+        build_id = OAUTH_BUILD_ID,
+        pairing_fingerprint = pairing_fingerprint
     );
 
     let mut response = raw_response(200, "text/html; charset=utf-8", html.into_bytes());
@@ -318,21 +346,33 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         .map_or("", String::as_str);
     let matched_source = owner_secret_match_source(config, supplied);
     if matched_source.is_none() {
+        let expected_pairing_fingerprint = config
+            .oauth_pairing_code
+            .as_deref()
+            .map(pairing_code_fingerprint)
+            .unwrap_or_else(|| "none".to_string());
+        let compact_submitted_len = compact_pairing_input(supplied).chars().count();
         eprintln!(
-            "OAuth approval rejected [{}]: pairing_code={}, runtime_password={}, runtime_api_token={}, secrets_file_candidates={}, submitted_candidates={}",
+            "OAuth approval rejected [{}]: pairing_fingerprint={}, pairing_code={}, runtime_password={}, runtime_api_token={}, secrets_file_candidates={}, submitted_candidates={}, submitted_chars={}, compact_submitted_chars={}",
             OAUTH_BUILD_ID,
+            expected_pairing_fingerprint,
             config.oauth_pairing_code.is_some(),
             config.oauth_owner_secret.is_some(),
             config.read_write_token.is_some(),
             config.oauth_owner_secret_fallbacks.len(),
             normalize_owner_secret_candidates(supplied).len(),
+            supplied.chars().count(),
+            compact_submitted_len,
         );
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
             format!(
-                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The submitted value did not match this process.</p><p><strong>Use the OAuth pairing code printed by the currently running server.</strong> It is independent of falkordb-secrets.txt and environment variables.</p><p>Build: <code>{}</code></p><p>Pairing code active: <strong>{}</strong>; runtime password loaded: <strong>{}</strong>; runtime API token loaded: <strong>{}</strong>; secrets-file fallback candidates: <strong>{}</strong>.</p>",
+                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The submitted value did not match this process.</p><p>Build: <code>{}</code></p><p>Expected pairing fingerprint: <code>{}</code></p><p>Submitted characters: <strong>{}</strong>; after whitespace normalization: <strong>{}</strong>.</p><p>Pairing code active: <strong>{}</strong>; runtime password loaded: <strong>{}</strong>; runtime API token loaded: <strong>{}</strong>; secrets-file fallback candidates: <strong>{}</strong>.</p>",
                 OAUTH_BUILD_ID,
+                expected_pairing_fingerprint,
+                supplied.chars().count(),
+                compact_submitted_len,
                 config.oauth_pairing_code.is_some(),
                 config.oauth_owner_secret.is_some(),
                 config.read_write_token.is_some(),
@@ -404,12 +444,14 @@ fn owner_secret_match_source(config: &ApiConfig, supplied: &str) -> Option<&'sta
             .any(|candidate| constant_time_eq(expected, candidate))
     };
 
-    if config
-        .oauth_pairing_code
-        .as_deref()
-        .is_some_and(matches_expected)
-    {
-        return Some("pairing-code");
+    if let Some(expected_pairing) = config.oauth_pairing_code.as_deref() {
+        if matches_expected(expected_pairing) {
+            return Some("pairing-code");
+        }
+        let compact = compact_pairing_input(supplied);
+        if !compact.is_empty() && constant_time_eq(expected_pairing, &compact) {
+            return Some("pairing-code-whitespace-normalized");
+        }
     }
     if config
         .oauth_owner_secret
@@ -1879,6 +1921,25 @@ mod tests {
             "restart-scoped-pairing-code"
         ));
         assert!(!owner_secret_matches(&config, "different-code"));
+    }
+
+    #[test]
+    fn pairing_code_accepts_copy_whitespace_and_has_stable_fingerprint() {
+        let config = ApiConfig {
+            oauth_pairing_code: Some("ABCD_efgh-1234-IJKL_mnop-5678".to_string()),
+            ..ApiConfig::default()
+        };
+        assert_eq!(
+            owner_secret_match_source(
+                &config,
+                "ABCD_efgh-1234-\nIJKL_mnop-5678"
+            ),
+            Some("pairing-code-whitespace-normalized")
+        );
+        assert_eq!(
+            pairing_code_fingerprint("ABCD_efgh-1234-IJKL_mnop-5678"),
+            pairing_code_fingerprint("ABCD_efgh-1234-IJKL_mnop-5678")
+        );
     }
 
     #[test]

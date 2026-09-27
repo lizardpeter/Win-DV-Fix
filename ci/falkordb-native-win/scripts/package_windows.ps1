@@ -41,6 +41,15 @@ if (($EmbeddedTunnelVersion -join "`n") -notmatch "0\.0\.15") {
 }
 $EmbeddedTunnelVersion | Set-Content -Encoding UTF8 (Join-Path $Stage "EMBEDDED_TUNNEL_RUNTIME.txt")
 
+$EmbeddedLicenses = & (Join-Path $Stage "server.exe") --third-party-licenses 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Embedded OpenAI tunnel license display failed with exit code $LASTEXITCODE"
+}
+$EmbeddedLicenseText = $EmbeddedLicenses -join "`n"
+if ($EmbeddedLicenseText -notmatch "Copyright 2026 OpenAI" -or $EmbeddedLicenseText -notmatch "Apache License") {
+    throw "server.exe did not expose the embedded OpenAI NOTICE/license"
+}
+
 # Bundle an official embeddable Python runtime plus all migration dependencies
 # so helper tools do not use a machine-wide Python installation.
 $PythonVersion = "3.12.10"

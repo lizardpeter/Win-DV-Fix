@@ -26,59 +26,20 @@ Copy-Item -Force $ServerExe (Join-Path $Stage "server.exe")
 Copy-Item -Force (Join-Path $Root "scripts\migrate_current_falkordb.py") (Join-Path $Stage "migrate_current_falkordb.py")
 Copy-Item -Force (Join-Path $Root "scripts\falkordb_bundle.py") (Join-Path $Stage "falkordb_bundle.py")
 Copy-Item -Force (Join-Path $Root "scripts\import_falkordb_rdb.py") (Join-Path $Stage "import_falkordb_rdb.py")
-Copy-Item -Force (Join-Path $Root "scripts\start_openai_tunnel.ps1") (Join-Path $Stage "start-openai-tunnel.ps1")
 Copy-Item -Force (Join-Path $Root "requirements-migration.txt") (Join-Path $Stage "requirements-migration.txt")
 Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
 Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
 
-# Bundle the pinned official OpenAI Secure MCP Tunnel client so the
-# Windows package is immediately usable without another tool download.
-$TunnelClientVersion = "0.0.15"
-$TunnelClientZip = Join-Path $Stage "tmp\tunnel-client-v$TunnelClientVersion-windows-amd64.zip"
-$TunnelClientExtract = Join-Path $Stage "tmp\tunnel-client"
-$TunnelClientUrl = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion/tunnel-client-v$TunnelClientVersion-windows-amd64.zip"
-$TunnelClientZipSha256 = "3b53133a1e24d43f63088d843860cb1701a4c3ed6390de2e19f69089e43bddc1"
-$TunnelClientLicenseUrl = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion/tunnel-client-v$TunnelClientVersion-windows-amd64-licenses.txt"
-$TunnelClientLicenseSha256 = "9b9132caf4971379fa24dae57ca75a9f2ec5571dc8b2a90e7fab71c791b42c17"
-
-New-Item -ItemType Directory -Force -Path (Split-Path $TunnelClientZip -Parent) | Out-Null
-Invoke-WebRequest -UseBasicParsing -Uri $TunnelClientUrl -OutFile $TunnelClientZip
-$TunnelClientActualHash = (Get-FileHash -Algorithm SHA256 $TunnelClientZip).Hash.ToLowerInvariant()
-if ($TunnelClientActualHash -ne $TunnelClientZipSha256) {
-    throw "OpenAI tunnel-client archive SHA256 mismatch"
-}
-Expand-Archive -Path $TunnelClientZip -DestinationPath $TunnelClientExtract -Force
-$TunnelClientExe = Get-ChildItem -Path $TunnelClientExtract -Filter "tunnel-client.exe" -File -Recurse | Select-Object -First 1
-if ($null -eq $TunnelClientExe) {
-    throw "Official OpenAI tunnel-client archive did not contain tunnel-client.exe"
-}
-Copy-Item -Force $TunnelClientExe.FullName (Join-Path $Stage "tunnel-client.exe")
-Invoke-WebRequest -UseBasicParsing -Uri $TunnelClientLicenseUrl -OutFile (Join-Path $Stage "TUNNEL_CLIENT_LICENSES.txt")
-$TunnelClientLicenseActualHash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "TUNNEL_CLIENT_LICENSES.txt")).Hash.ToLowerInvariant()
-if ($TunnelClientLicenseActualHash -ne $TunnelClientLicenseSha256) {
-    throw "OpenAI tunnel-client license SHA256 mismatch"
-}
-$TunnelHelp = & (Join-Path $Stage "tunnel-client.exe") run --help 2>&1
+# The official OpenAI tunnel runtime is embedded directly inside server.exe.
+$EmbeddedTunnelVersion = & (Join-Path $Stage "server.exe") --embedded-tunnel-runtime-version 2>&1
 if ($LASTEXITCODE -ne 0) {
-    throw "Bundled OpenAI tunnel-client run --help failed with exit code $LASTEXITCODE"
+    throw "Embedded OpenAI tunnel runtime version check failed with exit code $LASTEXITCODE"
 }
-$TunnelHelpText = $TunnelHelp -join "`n"
-foreach ($RequiredFlag in @(
-    "--control-plane.tunnel-id",
-    "--mcp.server-url",
-    "--mcp.extra-headers",
-    "--mcp.discovery-extra-headers",
-    "--health.listen-addr"
-)) {
-    if ($TunnelHelpText -notmatch [Regex]::Escape($RequiredFlag)) {
-        throw "Bundled OpenAI tunnel-client does not expose required flag: $RequiredFlag"
-    }
+if (($EmbeddedTunnelVersion -join "`n") -notmatch "0\.0\.15") {
+    throw "server.exe did not report the pinned embedded OpenAI tunnel runtime v0.0.15"
 }
-$TunnelHelp | Set-Content -Encoding UTF8 (Join-Path $Stage "TUNNEL_CLIENT_RUN_HELP.txt")
-
-Remove-Item -Recurse -Force $TunnelClientExtract -ErrorAction SilentlyContinue
-Remove-Item -Force $TunnelClientZip -ErrorAction SilentlyContinue
+$EmbeddedTunnelVersion | Set-Content -Encoding UTF8 (Join-Path $Stage "EMBEDDED_TUNNEL_RUNTIME.txt")
 
 # Bundle an official embeddable Python runtime plus all migration dependencies
 # so helper tools do not use a machine-wide Python installation.
@@ -227,13 +188,10 @@ Set-Location $Root
 
 $RequiredFiles = @(
     "server.exe",
-    "tunnel-client.exe",
-    "TUNNEL_CLIENT_LICENSES.txt",
-    "TUNNEL_CLIENT_RUN_HELP.txt",
+    "EMBEDDED_TUNNEL_RUNTIME.txt",
     "portable-env.ps1",
     "start-local.ps1",
     "run-tool.ps1",
-    "start-openai-tunnel.ps1",
     "import_falkordb_rdb.py",
     "migrate_current_falkordb.py",
     "falkordb_bundle.py",

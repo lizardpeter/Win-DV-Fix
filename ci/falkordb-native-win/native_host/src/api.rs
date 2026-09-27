@@ -29,6 +29,10 @@ pub struct ApiConfig {
     /// The read/write API token remains an accepted fallback so existing
     /// deployments keep working.
     pub oauth_owner_secret: Option<String>,
+    /// Additional accepted OAuth owner-approval secrets. This is used to
+    /// preserve the values loaded directly from falkordb-secrets.txt even
+    /// when the startup script supplies different CLI/environment values.
+    pub oauth_owner_secret_fallbacks: Vec<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -41,6 +45,7 @@ impl Default for ApiConfig {
             read_write_token: None,
             read_only_token: None,
             oauth_owner_secret: None,
+            oauth_owner_secret_fallbacks: Vec::new(),
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,

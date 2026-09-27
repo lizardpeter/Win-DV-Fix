@@ -582,6 +582,25 @@ fn main() -> Result<(), String> {
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(|| local_secrets.api_read_token.clone());
+    let mut openai_tunnel_id = env::var("CONTROL_PLANE_TUNNEL_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| env::var("OPENAI_TUNNEL_ID").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| local_secrets.openai_tunnel_id.clone());
+    let mut openai_tunnel_api_key = env::var("CONTROL_PLANE_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| env::var("OPENAI_TUNNEL_API_KEY").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| local_secrets.openai_tunnel_api_key.clone());
+    let embedded_tunnel_disabled = env::var("FALKORDB_DISABLE_OPENAI_TUNNEL")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+        });
     let mut api_allow_plaintext_remote = false;
     let mut api_allow_unauthenticated_remote = false;
 
@@ -750,8 +769,11 @@ CHATGPT HTTPS API OPTIONS:
                                    for OpenAI Secure MCP Tunnel.
                                    Default with FALKORDB_API_TOKEN: 127.0.0.1:18444
                                    Env: FALKORDB_TUNNEL_MCP_BIND
-                                   Requires FALKORDB_API_TOKEN; tunnel-client
-                                   injects it only on the local backend hop.
+                                   Requires FALKORDB_API_TOKEN. server.exe embeds
+                                   and starts the OpenAI tunnel runtime itself.
+                                   On first interactive run it asks once for the
+                                   tunnel ID and runtime API key, then saves them
+                                   to falkordb-secrets.txt.
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
@@ -768,6 +790,14 @@ including a ChatGPT custom integration.
             }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+
+    if !embedded_tunnel_disabled && tunnel_mcp_bind.is_some() && api_token.is_some() {
+        (openai_tunnel_id, openai_tunnel_api_key) = maybe_first_run_tunnel_setup(
+            &executable_dir,
+            openai_tunnel_id,
+            openai_tunnel_api_key,
+        )?;
     }
 
     let shared_tls = match (tls_cert, tls_key) {
@@ -823,7 +853,7 @@ including a ChatGPT custom integration.
 
         let tunnel_config = ApiConfig {
             bind,
-            read_write_token: Some(local_token),
+            read_write_token: Some(local_token.clone()),
             read_only_token: None,
             oauth_owner_secret: None,
             oauth_owner_secret_fallbacks: Vec::new(),
@@ -844,6 +874,24 @@ including a ChatGPT custom integration.
                 eprintln!("Secure MCP Tunnel backend stopped: {err}");
             }
         });
+
+        if !embedded_tunnel_disabled {
+            match (openai_tunnel_id.clone(), openai_tunnel_api_key.clone()) {
+                (Some(tunnel_id), Some(tunnel_api_key)) => {
+                    start_embedded_openai_tunnel(
+                        tunnel_id,
+                        tunnel_api_key,
+                        local_token,
+                        bind,
+                    )?;
+                }
+                _ => {
+                    eprintln!(
+                        "Embedded OpenAI tunnel is not configured yet; server.exe will prompt once when run interactively."
+                    );
+                }
+            }
+        }
     }
 
     if let Some(bind) = api_bind {

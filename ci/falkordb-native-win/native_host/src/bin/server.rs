@@ -353,6 +353,8 @@ CHATGPT HTTPS API OPTIONS:
   --api-bind HOST:PORT             Enable API listener, e.g. 0.0.0.0:8443
   --api-token TOKEN                Read/write Bearer token (or FALKORDB_API_TOKEN)
   --api-read-token TOKEN           Optional read-only Bearer token
+                                   OAuth owner approval accepts the RESP password
+                                   and, for compatibility, the read/write API token.
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
@@ -416,6 +418,7 @@ including a ChatGPT custom integration.
             bind,
             read_write_token: api_token,
             read_only_token: api_read_token,
+            oauth_owner_secret: config.password.clone(),
             allow_unauthenticated_remote: api_allow_unauthenticated_remote,
             allow_plaintext_remote: api_allow_plaintext_remote,
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {

@@ -72,6 +72,76 @@ fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<Path
     Ok(candidate)
 }
 
+
+#[derive(Default)]
+struct LocalSecrets {
+    password: Option<String>,
+    api_token: Option<String>,
+    api_read_token: Option<String>,
+}
+
+fn unquote_secret_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn parse_secret_assignment(line: &str) -> Option<(String, String)> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+        return None;
+    }
+
+    let (raw_name, raw_value) = line.split_once('=')?;
+    let mut name = raw_name.trim();
+    if let Some(rest) = name.strip_prefix("set ") {
+        name = rest.trim();
+    }
+    if let Some(rest) = name.strip_prefix("$env:") {
+        name = rest.trim();
+    }
+
+    match name {
+        "FALKORDB_PASSWORD" | "FALKORDB_API_TOKEN" | "FALKORDB_API_READ_TOKEN" => {
+            Some((name.to_string(), unquote_secret_value(raw_value)))
+        }
+        _ => None,
+    }
+}
+
+fn load_local_secrets(root: &Path) -> Result<LocalSecrets, String> {
+    let path = root.join("falkordb-secrets.txt");
+    if !path.exists() {
+        return Ok(LocalSecrets::default());
+    }
+
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("read local secrets file {}: {e}", path.display()))?;
+    let mut secrets = LocalSecrets::default();
+    for line in text.lines() {
+        let Some((name, value)) = parse_secret_assignment(line) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "FALKORDB_PASSWORD" => secrets.password = Some(value),
+            "FALKORDB_API_TOKEN" => secrets.api_token = Some(value),
+            "FALKORDB_API_READ_TOKEN" => secrets.api_read_token = Some(value),
+            _ => {}
+        }
+    }
+    Ok(secrets)
+}
+
 fn portable_enabled_from_env() -> bool {
     env::var("FALKORDB_PORTABLE")
         .ok()
@@ -155,6 +225,9 @@ fn main() -> Result<(), String> {
         configure_portable_process(root)?;
     }
 
+    let executable_dir = executable_root()?;
+    let local_secrets = load_local_secrets(&executable_dir)?;
+
     let _engine = Engine::init()?;
 
     let mut config = ServerConfig::default();
@@ -174,6 +247,9 @@ fn main() -> Result<(), String> {
         if !password.is_empty() {
             config.password = Some(password);
         }
+    }
+    if config.password.is_none() {
+        config.password = local_secrets.password.clone();
     }
     if let Ok(username) = env::var("FALKORDB_USERNAME") {
         if !username.is_empty() {
@@ -208,10 +284,12 @@ fn main() -> Result<(), String> {
         .transpose()?;
     let mut api_token = env::var("FALKORDB_API_TOKEN")
         .ok()
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .or_else(|| local_secrets.api_token.clone());
     let mut api_read_token = env::var("FALKORDB_API_READ_TOKEN")
         .ok()
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .or_else(|| local_secrets.api_read_token.clone());
     let mut api_allow_plaintext_remote = false;
     let mut api_allow_unauthenticated_remote = false;
 
@@ -343,6 +421,7 @@ RESP/FalkorDB OPTIONS:
                                    Env: FALKORDB_DATA_DIR
   --username USER                  RESP AUTH username (default: default)
   --password PASSWORD              RESP AUTH password (or FALKORDB_PASSWORD)
+                                   Falls back to falkordb-secrets.txt beside server.exe
   --tls-cert PATH                  PEM server certificate/chain (or FALKORDB_TLS_CERT)
   --tls-key PATH                   PEM private key (or FALKORDB_TLS_KEY)
   --tls-client-ca PATH             Require RESP mTLS clients signed by this PEM CA
@@ -352,6 +431,7 @@ RESP/FalkorDB OPTIONS:
 CHATGPT HTTPS API OPTIONS:
   --api-bind HOST:PORT             Enable API listener, e.g. 0.0.0.0:8443
   --api-token TOKEN                Read/write Bearer token (or FALKORDB_API_TOKEN)
+                                   Falls back to falkordb-secrets.txt beside server.exe
   --api-read-token TOKEN           Optional read-only Bearer token
                                    OAuth owner approval accepts the RESP password
                                    and, for compatibility, the read/write API token.

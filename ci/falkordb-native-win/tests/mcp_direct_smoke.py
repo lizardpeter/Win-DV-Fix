@@ -96,10 +96,8 @@ def oauth_link(ctx):
     params = urllib.parse.parse_qs(redirect.query)
     code = params["code"][0]
     assert params["state"][0] == "native-ci-state"
-    # Callback-specific OAuth mode deliberately omits RFC 9207 `iss` from
-    # the authorization response. ChatGPT selects the callback-specific URL
-    # because authorization_response_iss_parameter_supported is false.
-    assert "iss" not in params
+    # Stable ChatGPT callback mode requires RFC 9207 issuer identification.
+    assert params["iss"][0] == f"https://{HOST}:{PORT}"
 
     token_form = urllib.parse.urlencode(
         {

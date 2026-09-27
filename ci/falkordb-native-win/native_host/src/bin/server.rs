@@ -494,11 +494,29 @@ including a ChatGPT custom integration.
     }
 
     if let Some(bind) = api_bind {
+        let mut oauth_owner_secret_fallbacks = Vec::new();
+        for candidate in [
+            local_secrets.password.as_ref(),
+            local_secrets.api_token.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !candidate.is_empty()
+                && config.password.as_deref() != Some(candidate.as_str())
+                && api_token.as_deref() != Some(candidate.as_str())
+                && !oauth_owner_secret_fallbacks.iter().any(|existing| existing == candidate)
+            {
+                oauth_owner_secret_fallbacks.push(candidate.clone());
+            }
+        }
+
         let api_config = ApiConfig {
             bind,
             read_write_token: api_token,
             read_only_token: api_read_token,
             oauth_owner_secret: config.password.clone(),
+            oauth_owner_secret_fallbacks,
             allow_unauthenticated_remote: api_allow_unauthenticated_remote,
             allow_plaintext_remote: api_allow_plaintext_remote,
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {

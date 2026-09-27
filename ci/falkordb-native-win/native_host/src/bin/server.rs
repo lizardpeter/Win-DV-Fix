@@ -495,6 +495,9 @@ fn configure_portable_process(root: &Path) -> Result<(), String> {
         if env::var_os("FALKORDB_DATA_DIR").is_none() {
             env::set_var("FALKORDB_DATA_DIR", "data");
         }
+        if env::var_os("FALKORDB_IMPORT_DIR").is_none() {
+            env::set_var("FALKORDB_IMPORT_DIR", root.join("imports"));
+        }
         env::set_var("TEMP", &tmp);
         env::set_var("TMP", &tmp);
         env::set_var("HOME", &profile);

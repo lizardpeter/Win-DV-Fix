@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, native_config, redis_dump, snapshot, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, native_config, rdb_file, redis_dump, snapshot, udf_store, wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -93,6 +93,28 @@ pub struct GraphCatalog {
     data_dir: PathBuf,
     graph_dir: PathBuf,
     graphs: RwLock<HashMap<String, Arc<NativeGraph>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RdbFileGraphReport {
+    pub graph: String,
+    pub fragments: usize,
+    pub nodes: u64,
+    pub relationships: u64,
+    pub checkpoint_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RdbFileImportReport {
+    pub import_root: String,
+    pub file: String,
+    pub redis_rdb_version: u32,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub dry_run: bool,
+    pub udf_count: usize,
+    pub ignored_aux_keys: Vec<String>,
+    pub graphs: Vec<RdbFileGraphReport>,
 }
 
 impl GraphCatalog {
@@ -281,6 +303,165 @@ impl GraphCatalog {
         let payload = snapshot::save_falkordb_v19_payload(&graph, &name);
         self.restore_payload(&name, &payload)?;
         Ok(name)
+    }
+
+    /// Parse and optionally restore a complete Redis dump.rdb containing native
+    /// FalkorDB v19 graphdata/graphmeta module keys. Files are resolved below
+    /// FALKORDB_IMPORT_DIR, or <data-dir>/imports when that variable is unset.
+    /// This path never overwrites existing graphs.
+    pub fn import_rdb_file(
+        &self,
+        file: &str,
+        expected_graph: Option<&str>,
+        expected_sha256: Option<&str>,
+        dry_run: bool,
+    ) -> Result<RdbFileImportReport, String> {
+        let (import_root, path) = rdb_file::resolve_import_file(&self.data_dir, file)?;
+        let parsed = rdb_file::parse_rdb_file(&path)?;
+
+        if let Some(expected) = expected_sha256 {
+            let expected = expected.trim().to_ascii_lowercase();
+            if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("sha256 must be exactly 64 hexadecimal characters".to_string());
+            }
+            if parsed.sha256_hex != expected {
+                return Err(format!(
+                    "RDB SHA-256 mismatch for {file:?}: expected {expected}, computed {}",
+                    parsed.sha256_hex
+                ));
+            }
+        }
+
+        if !parsed.udfs.is_empty() {
+            return Err(format!(
+                "RDB contains {} FalkorDB UDF library/libraries; native MCP RDB import refuses to discard them",
+                parsed.udfs.len()
+            ));
+        }
+
+        if let Some(expected) = expected_graph {
+            if parsed.graphs.len() != 1 {
+                return Err(format!(
+                    "expected exactly one graph named {expected:?}, but RDB contains {} graphs",
+                    parsed.graphs.len()
+                ));
+            }
+            if parsed.graphs[0].name != expected {
+                return Err(format!(
+                    "RDB graph name mismatch: expected {expected:?}, found {:?}",
+                    parsed.graphs[0].name
+                ));
+            }
+        }
+
+        for graph in &parsed.graphs {
+            if self.contains(&graph.name)
+                || self.wal_path(&graph.name).exists()
+                || snapshot::load_latest(&self.wal_path(&graph.name), &graph.name)?.is_some()
+            {
+                return Err(format!(
+                    "destination graph {:?} already exists; raw RDB import is intentionally non-destructive",
+                    graph.name
+                ));
+            }
+        }
+
+        let mut graph_reports = parsed
+            .graphs
+            .iter()
+            .map(|graph| RdbFileGraphReport {
+                graph: graph.name.clone(),
+                fragments: graph.fragments.len(),
+                nodes: graph.node_count,
+                relationships: graph.edge_count,
+                checkpoint_file: None,
+            })
+            .collect::<Vec<_>>();
+
+        if dry_run {
+            return Ok(RdbFileImportReport {
+                import_root: import_root.display().to_string(),
+                file: file.to_string(),
+                redis_rdb_version: parsed.version,
+                size_bytes: parsed.size_bytes,
+                sha256: parsed.sha256_hex,
+                dry_run: true,
+                udf_count: parsed.udfs.len(),
+                ignored_aux_keys: parsed.ignored_aux_keys.clone(),
+                graphs: graph_reports,
+            });
+        }
+
+        let mut imported = Vec::<String>::new();
+        let import_result = (|| -> Result<(), String> {
+            for (source, report) in parsed.graphs.iter().zip(graph_reports.iter_mut()) {
+                let restored = self.restore_rdb_fragments(&source.fragments)?;
+                if restored != source.name {
+                    return Err(format!(
+                        "GRAPH.RESTORE.RDB restored {restored:?}, expected {:?}",
+                        source.name
+                    ));
+                }
+                imported.push(restored.clone());
+
+                let graph = self
+                    .get(&restored)
+                    .ok_or_else(|| format!("restored graph {restored:?} disappeared"))?;
+                let nodes = graph_query_count(&graph, "MATCH (n) RETURN count(n)")?;
+                let relationships =
+                    graph_query_count(&graph, "MATCH ()-[r]->() RETURN count(r)")?;
+                if nodes != source.node_count || relationships != source.edge_count {
+                    return Err(format!(
+                        "count verification failed for {:?}: nodes {}/{}, relationships {}/{}",
+                        source.name,
+                        nodes,
+                        source.node_count,
+                        relationships,
+                        source.edge_count
+                    ));
+                }
+
+                let checkpoint = graph.checkpoint()?;
+                report.nodes = nodes;
+                report.relationships = relationships;
+                report.checkpoint_file = Some(
+                    checkpoint
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = import_result {
+            let mut rollback_errors = Vec::new();
+            for name in imported.iter().rev() {
+                if let Err(rollback_err) = self.delete(name) {
+                    rollback_errors.push(format!("{name:?}: {rollback_err}"));
+                }
+            }
+            if rollback_errors.is_empty() {
+                return Err(format!("{err}; imported graphs were rolled back"));
+            }
+            return Err(format!(
+                "{err}; rollback also failed for {}",
+                rollback_errors.join(", ")
+            ));
+        }
+
+        Ok(RdbFileImportReport {
+            import_root: import_root.display().to_string(),
+            file: file.to_string(),
+            redis_rdb_version: parsed.version,
+            size_bytes: parsed.size_bytes,
+            sha256: parsed.sha256_hex,
+            dry_run: false,
+            udf_count: parsed.udfs.len(),
+            ignored_aux_keys: parsed.ignored_aux_keys,
+            graphs: graph_reports,
+        })
     }
 
     /// Export one graph in FalkorDB's upstream v19 GRAPH.RESTORE payload

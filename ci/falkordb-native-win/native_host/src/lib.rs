@@ -4,6 +4,7 @@ pub mod api;
 pub mod mcp;
 pub mod property_index;
 pub mod range_index;
+pub mod rdb_file;
 pub mod redis_dump;
 pub mod server;
 pub mod native_config;

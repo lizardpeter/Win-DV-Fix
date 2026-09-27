@@ -39,6 +39,38 @@ $Src = Join-Path $WorkDir "src"
 $Prefix = Join-Path $WorkDir "native-prefix"
 New-Item -ItemType Directory -Force -Path $Src, $Prefix | Out-Null
 
+# Pin and stage the official OpenAI Secure MCP Tunnel runtime before Rust
+# compilation. server.exe embeds these verified bytes, so deployment requires
+# only the single server.exe binary.
+$TunnelClientVersion = "0.0.15"
+$TunnelRuntimeZip = Join-Path $WorkDir "tunnel-client-runtime-v$TunnelClientVersion-windows-amd64.zip"
+$TunnelRuntimeExtract = Join-Path $WorkDir "tunnel-client-runtime-extract"
+$TunnelRuntimeExe = Join-Path $WorkDir "tunnel-client-runtime.exe"
+$TunnelRuntimeUrl = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion/tunnel-client-runtime-v$TunnelClientVersion-windows-amd64.zip"
+$TunnelRuntimeZipSha256 = "aa5ddb14dddd602fa59f3e6f4401aa8a79a218e341466226b7434127dff65dbc"
+
+$NeedTunnelRuntime = -not (Test-Path $TunnelRuntimeExe)
+if ($NeedTunnelRuntime) {
+    Invoke-WebRequest -UseBasicParsing -Uri $TunnelRuntimeUrl -OutFile $TunnelRuntimeZip
+    $Actual = (Get-FileHash -Algorithm SHA256 $TunnelRuntimeZip).Hash.ToLowerInvariant()
+    if ($Actual -ne $TunnelRuntimeZipSha256) {
+        throw "OpenAI tunnel runtime archive SHA256 mismatch: $Actual"
+    }
+    Remove-Item -Recurse -Force $TunnelRuntimeExtract -ErrorAction SilentlyContinue
+    Expand-Archive -Path $TunnelRuntimeZip -DestinationPath $TunnelRuntimeExtract -Force
+    $Runtime = Get-ChildItem -Path $TunnelRuntimeExtract -Filter "tunnel-client-runtime.exe" -File -Recurse | Select-Object -First 1
+    if ($null -eq $Runtime) {
+        throw "Official OpenAI tunnel runtime archive did not contain tunnel-client-runtime.exe"
+    }
+    Copy-Item -Force $Runtime.FullName $TunnelRuntimeExe
+    Remove-Item -Recurse -Force $TunnelRuntimeExtract -ErrorAction SilentlyContinue
+    Remove-Item -Force $TunnelRuntimeZip -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path $TunnelRuntimeExe)) {
+    throw "Embedded OpenAI tunnel runtime staging failed: $TunnelRuntimeExe"
+}
+Write-Host "Embedded OpenAI tunnel runtime: $TunnelRuntimeExe"
+
 $Falkor = Join-Path $Src "FalkorDB"
 if (-not (Test-Path $Falkor)) {
     git clone https://github.com/FalkorDB/FalkorDB.git $Falkor

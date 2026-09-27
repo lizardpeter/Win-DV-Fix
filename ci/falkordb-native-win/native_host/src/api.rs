@@ -166,17 +166,18 @@ fn handle_http_connection<S: Read + Write>(
         .map_err(|e| format!("flush ChatGPT API response: {e}"))
 }
 
-struct HttpRequest {
-    method: String,
-    target: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-    content_type: &'static str,
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) content_type: &'static str,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
@@ -263,6 +264,10 @@ fn route_http(
     catalog: &GraphCatalog,
     config: &ApiConfig,
 ) -> HttpResponse {
+    if let Some(response) = crate::mcp::route_http(&request, catalog, config) {
+        return response;
+    }
+
     if request.method == "GET" && request.target == "/healthz" {
         return json_response(200, json!({
             "ok": true,
@@ -385,7 +390,7 @@ fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScop
     AuthScope::None
 }
 
-fn constant_time_eq(expected: &str, candidate: &str) -> bool {
+pub(crate) fn constant_time_eq(expected: &str, candidate: &str) -> bool {
     if expected.len() != candidate.len() {
         return false;
     }
@@ -442,7 +447,7 @@ fn run_query(
     }
 }
 
-fn query_output_json(graph: &str, output: QueryOutput) -> JsonValue {
+pub(crate) fn query_output_json(graph: &str, output: QueryOutput) -> JsonValue {
     let rows: Vec<Vec<JsonValue>> = output
         .wire_rows
         .iter()
@@ -558,11 +563,25 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HttpRespon
         .map_err(|err| error_response(400, "invalid_json", &err.to_string()))
 }
 
-fn json_response(status: u16, value: JsonValue) -> HttpResponse {
+pub(crate) fn json_response(status: u16, value: JsonValue) -> HttpResponse {
     HttpResponse {
         status,
         body: serde_json::to_vec(&value).expect("JSON value must serialize"),
         content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
+    }
+}
+
+pub(crate) fn raw_response(
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> HttpResponse {
+    HttpResponse {
+        status,
+        body,
+        content_type,
+        headers: Vec::new(),
     }
 }
 
@@ -578,6 +597,8 @@ fn error_response(status: u16, code: &str, message: &str) -> HttpResponse {
 fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::io::Result<()> {
     let reason = match response.status {
         200 => "OK",
+        202 => "Accepted",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -586,17 +607,22 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
         409 => "Conflict",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
 
     write!(
         writer,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
         response.status,
         reason,
         response.content_type,
         response.body.len()
     )?;
+    for (name, value) in &response.headers {
+        write!(writer, "{}: {}\r\n", name, value)?;
+    }
+    write!(writer, "\r\n")?;
     writer.write_all(&response.body)
 }
 

@@ -1,16 +1,32 @@
 use std::{
     env,
     fs,
+    io::{self, IsTerminal, Write},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
-use std::time::Duration;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::{digest, rand::{SecureRandom, SystemRandom}};
+
+#[cfg(windows)]
+use windows_sys::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    },
+};
 
 use falkordb_native_host::{
     Engine,
@@ -18,6 +34,14 @@ use falkordb_native_host::{
     mcp::OAUTH_BUILD_ID,
     server::{GraphCatalog, ServerConfig, TlsConfig, serve_with_catalog},
 };
+
+const OPENAI_TUNNEL_RUNTIME_VERSION: &str = "0.0.15";
+
+#[cfg(windows)]
+static OPENAI_TUNNEL_RUNTIME: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build/tunnel-client-runtime.exe"
+));
 
 fn executable_root() -> Result<PathBuf, String> {
     let exe = env::current_exe()
@@ -90,6 +114,8 @@ struct LocalSecrets {
     password: Option<String>,
     api_token: Option<String>,
     api_read_token: Option<String>,
+    openai_tunnel_id: Option<String>,
+    openai_tunnel_api_key: Option<String>,
 }
 
 fn unquote_secret_value(value: &str) -> String {
@@ -121,7 +147,11 @@ fn parse_secret_assignment(line: &str) -> Option<(String, String)> {
     }
 
     match name {
-        "FALKORDB_PASSWORD" | "FALKORDB_API_TOKEN" | "FALKORDB_API_READ_TOKEN" => {
+        "FALKORDB_PASSWORD"
+        | "FALKORDB_API_TOKEN"
+        | "FALKORDB_API_READ_TOKEN"
+        | "OPENAI_TUNNEL_ID"
+        | "OPENAI_TUNNEL_API_KEY" => {
             Some((name.to_string(), unquote_secret_value(raw_value)))
         }
         _ => None,
@@ -148,10 +178,253 @@ fn load_local_secrets(root: &Path) -> Result<LocalSecrets, String> {
             "FALKORDB_PASSWORD" => secrets.password = Some(value),
             "FALKORDB_API_TOKEN" => secrets.api_token = Some(value),
             "FALKORDB_API_READ_TOKEN" => secrets.api_read_token = Some(value),
+            "OPENAI_TUNNEL_ID" => secrets.openai_tunnel_id = Some(value),
+            "OPENAI_TUNNEL_API_KEY" => secrets.openai_tunnel_api_key = Some(value),
             _ => {}
         }
     }
     Ok(secrets)
+}
+
+
+fn persist_openai_tunnel_credentials(
+    root: &Path,
+    tunnel_id: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    let path = root.join("falkordb-secrets.txt");
+    let existing = if path.exists() {
+        fs::read_to_string(&path)
+            .map_err(|e| format!("read local secrets file {}: {e}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut lines = Vec::new();
+    for line in existing.lines() {
+        let skip = parse_secret_assignment(line).is_some_and(|(name, _)| {
+            matches!(name.as_str(), "OPENAI_TUNNEL_ID" | "OPENAI_TUNNEL_API_KEY")
+        });
+        if !skip {
+            lines.push(line.to_string());
+        }
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(format!("OPENAI_TUNNEL_ID={tunnel_id}"));
+    lines.push(format!("OPENAI_TUNNEL_API_KEY={api_key}"));
+    lines.push(String::new());
+
+    fs::write(&path, lines.join("\r\n"))
+        .map_err(|e| format!("write OpenAI tunnel credentials to {}: {e}", path.display()))
+}
+
+fn maybe_first_run_tunnel_setup(
+    root: &Path,
+    current_id: Option<String>,
+    current_key: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    if current_id.is_some() && current_key.is_some() {
+        return Ok((current_id, current_key));
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok((current_id, current_key));
+    }
+
+    println!();
+    println!("OpenAI Secure MCP Tunnel first-time setup.");
+    println!("Paste the tunnel ID and runtime API key once; server.exe will save them");
+    println!("beside itself and start the embedded tunnel automatically on future runs.");
+    println!("Press Enter at the tunnel ID prompt to skip setup for now.");
+    println!();
+
+    let tunnel_id = if let Some(value) = current_id {
+        value
+    } else {
+        print!("OpenAI tunnel ID (tunnel_...): ");
+        io::stdout().flush().map_err(|e| format!("flush tunnel prompt: {e}"))?;
+        let mut value = String::new();
+        io::stdin()
+            .read_line(&mut value)
+            .map_err(|e| format!("read tunnel ID: {e}"))?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Ok((None, current_key));
+        }
+        value
+    };
+
+    let api_key = if let Some(value) = current_key {
+        value
+    } else {
+        let value = rpassword::prompt_password("OpenAI runtime API key: ")
+            .map_err(|e| format!("read OpenAI runtime API key: {e}"))?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Ok((Some(tunnel_id), None));
+        }
+        value
+    };
+
+    persist_openai_tunnel_credentials(root, &tunnel_id, &api_key)?;
+    println!("Saved OpenAI tunnel configuration to falkordb-secrets.txt.");
+    Ok((Some(tunnel_id), Some(api_key)))
+}
+
+#[cfg(windows)]
+fn materialize_embedded_tunnel_runtime() -> Result<PathBuf, String> {
+    let path = env::temp_dir().join(format!(
+        "falkordb-openai-tunnel-runtime-v{OPENAI_TUNNEL_RUNTIME_VERSION}.exe"
+    ));
+    let expected = digest::digest(&digest::SHA256, OPENAI_TUNNEL_RUNTIME);
+    let valid_existing = fs::read(&path)
+        .ok()
+        .map(|bytes| digest::digest(&digest::SHA256, &bytes))
+        .is_some_and(|actual| actual.as_ref() == expected.as_ref());
+
+    if !valid_existing {
+        let temp = path.with_extension(format!("exe.new-{}", std::process::id()));
+        fs::write(&temp, OPENAI_TUNNEL_RUNTIME)
+            .map_err(|e| format!("write embedded OpenAI tunnel runtime {}: {e}", temp.display()))?;
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        fs::rename(&temp, &path).map_err(|e| {
+            format!(
+                "install embedded OpenAI tunnel runtime {} -> {}: {e}",
+                temp.display(),
+                path.display()
+            )
+        })?;
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn attach_child_kill_job(child: &Child) -> Result<HANDLE, String> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(format!("SetInformationJobObject failed: {err}"));
+        }
+
+        let process = child.as_raw_handle() as HANDLE;
+        if AssignProcessToJobObject(job, process) == 0 {
+            let err = io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(format!("AssignProcessToJobObject failed: {err}"));
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+fn start_embedded_openai_tunnel(
+    tunnel_id: String,
+    api_key: String,
+    local_token: String,
+    bind: SocketAddr,
+) -> Result<(), String> {
+    let runtime = materialize_embedded_tunnel_runtime()?;
+    let mcp_url = format!("http://{bind}/mcp");
+    eprintln!(
+        "Embedded OpenAI Secure MCP Tunnel runtime v{OPENAI_TUNNEL_RUNTIME_VERSION} enabled for {mcp_url}"
+    );
+
+    thread::spawn(move || loop {
+        let local_auth = format!("Bearer {local_token}");
+        let mut command = Command::new(&runtime);
+        command
+            .arg("run")
+            .arg("--health.listen-addr")
+            .arg("127.0.0.1:18445")
+            .arg("--log.level")
+            .arg("info")
+            .arg("--log.format")
+            .arg("struct-text")
+            .env("CONTROL_PLANE_TUNNEL_ID", &tunnel_id)
+            .env("CONTROL_PLANE_API_KEY", &api_key)
+            .env("MCP_SERVER_URL", &mcp_url)
+            .env("MCP_STARTUP_WAIT_TIMEOUT", "30s")
+            .env("FALKORDB_TUNNEL_LOCAL_AUTH", &local_auth)
+            .env(
+                "MCP_EXTRA_HEADERS",
+                "Authorization: env:FALKORDB_TUNNEL_LOCAL_AUTH",
+            )
+            .env(
+                "MCP_DISCOVERY_EXTRA_HEADERS",
+                "Authorization: env:FALKORDB_TUNNEL_LOCAL_AUTH",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        match command.spawn() {
+            Ok(mut child) => {
+                let job = match attach_child_kill_job(&child) {
+                    Ok(job) => Some(job),
+                    Err(err) => {
+                        eprintln!("OpenAI tunnel child containment failed: {err}");
+                        let _ = child.kill();
+                        None
+                    }
+                };
+                if job.is_some() {
+                    match child.wait() {
+                        Ok(status) => eprintln!(
+                            "Embedded OpenAI tunnel exited with {status}; restarting in 5 seconds"
+                        ),
+                        Err(err) => eprintln!(
+                            "Embedded OpenAI tunnel wait failed: {err}; restarting in 5 seconds"
+                        ),
+                    }
+                }
+                if let Some(job) = job {
+                    unsafe {
+                        CloseHandle(job);
+                    }
+                }
+            }
+            Err(err) => eprintln!(
+                "Could not start embedded OpenAI tunnel runtime {}: {err}",
+                runtime.display()
+            ),
+        }
+        thread::sleep(Duration::from_secs(5));
+    });
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn start_embedded_openai_tunnel(
+    _tunnel_id: String,
+    _api_key: String,
+    _local_token: String,
+    _bind: SocketAddr,
+) -> Result<(), String> {
+    Err("embedded OpenAI tunnel runtime is available only on Windows".to_string())
 }
 
 fn portable_enabled_from_env() -> bool {

@@ -866,9 +866,12 @@ fn tool_definition(
         "securitySchemes": [
             {
                 "type": "oauth2",
-                "scopes": [scope.as_str()]
+                "scopes": [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
             }
-        ]
+        ],
+        "_meta": {
+            "requiredScope": scope.as_str()
+        }
     })
 }
 
@@ -901,7 +904,7 @@ fn call_tool(
     let name = params
         .get("name")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| (-32602, "tools/call requires params.name".to_string()))?;
+        .ok_or_else(|| "tools/call requires params.name".to_string())?;
     let args = params
         .get("arguments")
         .and_then(JsonValue::as_object)

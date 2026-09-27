@@ -25,6 +25,10 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     pub read_write_token: Option<String>,
     pub read_only_token: Option<String>,
+    /// Separate owner-approval secret for the interactive OAuth consent page.
+    /// The read/write API token remains an accepted fallback so existing
+    /// deployments keep working.
+    pub oauth_owner_secret: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -36,6 +40,7 @@ impl Default for ApiConfig {
             bind: "127.0.0.1:8443".parse().expect("valid default API socket"),
             read_write_token: None,
             read_only_token: None,
+            oauth_owner_secret: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,

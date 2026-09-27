@@ -127,6 +127,9 @@ Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
+$McpSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_direct_smoke.py"))
+$McpTokenFile = Join-Path $WorkDir "mcp-oauth-token.txt"
+Remove-Item -Force $McpTokenFile -ErrorAction SilentlyContinue
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
@@ -325,6 +328,16 @@ try {
         throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
     }
 
+    python $McpSmoke write --ca (Join-Path $TlsDir "ca.pem") --token-file $McpTokenFile 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_mcp_direct_oauth_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Direct MCP OAuth write phase failed with exit code $LASTEXITCODE"
+    }
+    $McpWriteText = (Get-Content (Join-Path $Logs "10_mcp_direct_oauth_write.txt") -Raw)
+    if ($McpWriteText -notmatch "MCP_DIRECT_OAUTH_WRITE_PASS") {
+        throw "Direct MCP OAuth write phase did not emit success marker"
+    }
+
     python $ParitySmoke 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "10_official_client_parity.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -503,6 +516,16 @@ try {
     if ($ApiRestartText -notmatch "CHATGPT_HTTPS_API_RESTART_PASS") {
         throw "ChatGPT HTTPS API did not prove restart/WAL recovery"
     }
+
+    python $McpSmoke read --ca (Join-Path $TlsDir "ca.pem") --token-file $McpTokenFile 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_mcp_direct_oauth_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Direct MCP OAuth restart phase failed with exit code $LASTEXITCODE"
+    }
+    $McpRestartText = (Get-Content (Join-Path $Logs "11_mcp_direct_oauth_restart.txt") -Raw)
+    if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_RESTART_PASS") {
+        throw "Direct MCP OAuth token/data did not survive restart"
+    }
 } finally {
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
@@ -514,6 +537,7 @@ Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+Write-Host "NATIVE_WINDOWS_CHATGPT_MCP_OAUTH_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"

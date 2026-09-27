@@ -80,4 +80,10 @@ jobs:
           test "$status" = "400"
           grep -q 'invalid_grant' /tmp/token.json
 
+          echo "=== direct public 18443 metadata ==="
+          curl -sS --fail-with-body --max-time 15 "https://db.houseofkublai.com:18443/.well-known/oauth-protected-resource"
+          echo
+          curl -sS --fail-with-body --max-time 15 "https://db.houseofkublai.com:18443/.well-known/oauth-authorization-server"
+          echo
+
           echo "LIVE_OAUTH_PUBLIC_PROBE_PASS"

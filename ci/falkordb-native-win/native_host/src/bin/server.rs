@@ -321,10 +321,19 @@ fn main() -> Result<(), String> {
         .transpose()?
         .unwrap_or(256);
 
-    // A configured API credential implies a localhost API even when no bind
-    // was specified, making the ChatGPT surface easy to enable safely.
+    // A configured API credential implies local management surfaces even when
+    // no bind was specified. The Secure MCP Tunnel backend is loopback-only and
+    // remains protected by the read/write API token, so enabling it by default
+    // does not create a new network ingress path.
     if api_bind.is_none() && (api_token.is_some() || api_read_token.is_some()) {
         api_bind = Some("127.0.0.1:8443".parse().expect("valid default API bind"));
+    }
+    if tunnel_mcp_bind.is_none() && api_token.is_some() {
+        tunnel_mcp_bind = Some(
+            "127.0.0.1:18444"
+                .parse()
+                .expect("valid default Secure MCP Tunnel bind"),
+        );
     }
 
     let mut args = cli_args.into_iter();
@@ -464,9 +473,9 @@ CHATGPT HTTPS API OPTIONS:
   --api-read-token TOKEN           Optional read-only Bearer token
                                    OAuth owner approval accepts the RESP password
                                    and, for compatibility, the read/write API token.
-  --tunnel-mcp-bind HOST:PORT      Enable a loopback-only, MCP-only plaintext
-                                   backend for OpenAI Secure MCP Tunnel.
-                                   Example: 127.0.0.1:18444
+  --tunnel-mcp-bind HOST:PORT      Override the loopback-only, MCP-only backend
+                                   for OpenAI Secure MCP Tunnel.
+                                   Default with FALKORDB_API_TOKEN: 127.0.0.1:18444
                                    Env: FALKORDB_TUNNEL_MCP_BIND
                                    Requires FALKORDB_API_TOKEN; tunnel-client
                                    injects it only on the local backend hop.

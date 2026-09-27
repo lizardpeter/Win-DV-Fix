@@ -43,6 +43,18 @@ static OPENAI_TUNNEL_RUNTIME: &[u8] = include_bytes!(concat!(
     "/../build/tunnel-client-runtime.exe"
 ));
 
+#[cfg(windows)]
+static OPENAI_TUNNEL_LICENSE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build/openai-tunnel-LICENSE.txt"
+));
+
+#[cfg(windows)]
+static OPENAI_TUNNEL_NOTICE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build/openai-tunnel-NOTICE.txt"
+));
+
 fn executable_root() -> Result<PathBuf, String> {
     let exe = env::current_exe()
         .map_err(|e| format!("resolve executable path: {e}"))?;
@@ -728,6 +740,21 @@ fn main() -> Result<(), String> {
                 }
                 tunnel_mcp_bind = Some(bind);
             }
+            "--third-party-licenses" => {
+                #[cfg(windows)]
+                {
+                    println!("OpenAI Secure MCP Tunnel runtime v{OPENAI_TUNNEL_RUNTIME_VERSION}");
+                    println!();
+                    print!("{OPENAI_TUNNEL_NOTICE}");
+                    println!();
+                    print!("{OPENAI_TUNNEL_LICENSE}");
+                    return Ok(());
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err("embedded tunnel runtime is available only on Windows".to_string());
+                }
+            }
             "--api-token" => {
                 api_token = Some(
                     args.next()
@@ -765,6 +792,7 @@ PORTABLE OPTIONS:
   --embedded-tunnel-runtime-version
                                    Print the version of the OpenAI tunnel runtime
                                    embedded inside this server.exe and exit.
+  --third-party-licenses            Print embedded OpenAI tunnel NOTICE/license.
                                    Relative data/TLS paths are rooted there and
                                    external/parent paths are rejected.
                                    Env: FALKORDB_PORTABLE=1

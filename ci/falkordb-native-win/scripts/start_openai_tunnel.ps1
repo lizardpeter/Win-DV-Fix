@@ -70,7 +70,7 @@ try {
     throw "The local Secure MCP Tunnel backend is not reachable on 127.0.0.1:18444. Start server.exe with --tunnel-mcp-bind 127.0.0.1:18444 (or set FALKORDB_TUNNEL_MCP_BIND). $($_.Exception.Message)"
 }
 
-$env:FALKORDB_TUNNEL_LOCAL_TOKEN = $LocalToken
+$env:FALKORDB_TUNNEL_LOCAL_AUTH = "Bearer $LocalToken"
 try {
     Write-Host "Starting OpenAI Secure MCP Tunnel..."
     Write-Host "Tunnel ID: $($env:CONTROL_PLANE_TUNNEL_ID)"
@@ -80,8 +80,8 @@ try {
         "--control-plane.tunnel-id", $env:CONTROL_PLANE_TUNNEL_ID,
         "--control-plane.api-key", "env:CONTROL_PLANE_API_KEY",
         "--mcp.server-url", $McpUrl,
-        "--mcp.extra-headers", "Authorization: Bearer env:FALKORDB_TUNNEL_LOCAL_TOKEN",
-        "--mcp.discovery-extra-headers", "Authorization: Bearer env:FALKORDB_TUNNEL_LOCAL_TOKEN",
+        "--mcp.extra-headers", "Authorization: env:FALKORDB_TUNNEL_LOCAL_AUTH",
+        "--mcp.discovery-extra-headers", "Authorization: env:FALKORDB_TUNNEL_LOCAL_AUTH",
         "--health.listen-addr", $HealthListen,
         "--log.level", "info",
         "--log.format", "struct-text"
@@ -89,5 +89,5 @@ try {
     & $TunnelClient @Args
     exit $LASTEXITCODE
 } finally {
-    Remove-Item Env:FALKORDB_TUNNEL_LOCAL_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item Env:FALKORDB_TUNNEL_LOCAL_AUTH -ErrorAction SilentlyContinue
 }

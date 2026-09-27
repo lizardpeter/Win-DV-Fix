@@ -11,6 +11,9 @@ state stays inside the folder containing `server.exe`.** The launcher creates:
 ```text
 falkordb-native-windows-x64\
   server.exe
+  tunnel-client.exe
+  start-openai-tunnel.ps1
+  TUNNEL_CLIENT_LICENSES.txt
   start-local.ps1
   portable-env.ps1
   run-tool.ps1
@@ -204,6 +207,44 @@ whose WAL reaches the configured threshold (256 MiB by default):
 
 Set `FALKORDB_CHECKPOINT_WAL_MB` or pass `--checkpoint-wal-mb` to change the
 threshold.
+
+## OpenAI Secure MCP Tunnel
+
+For ChatGPT developer-mode access without exposing the MCP server publicly,
+enable the dedicated loopback backend and run the bundled OpenAI tunnel client.
+
+Start the database with the private MCP backend enabled:
+
+```powershell
+$env:FALKORDB_TUNNEL_MCP_BIND = "127.0.0.1:18444"
+# Keep using the same FALKORDB_API_TOKEN already present in
+# falkordb-secrets.txt or the process environment.
+.\server.exe <your normal server arguments>
+```
+
+The listener is deliberately restricted to loopback, exposes only `/mcp` and
+`/healthz`, suppresses OAuth discovery, and requires the existing read/write
+API Bearer token on the local hop. Its tool descriptors advertise `noauth` to
+ChatGPT because `tunnel-client` injects that private backend token locally.
+
+Create an MCP tunnel in OpenAI Platform tunnel settings, then set the two
+runtime values supplied/selected there:
+
+```powershell
+$env:CONTROL_PLANE_TUNNEL_ID = "tunnel_..."
+$env:CONTROL_PLANE_API_KEY = "sk-..."
+.\start-openai-tunnel.ps1
+```
+
+The launcher reads `FALKORDB_API_TOKEN` from the environment or
+`falkordb-secrets.txt`, keeps it out of the OpenAI control-plane connection,
+and injects it only on the `tunnel-client -> 127.0.0.1:18444` hop. The bundled
+`tunnel-client.exe` is the pinned official OpenAI Windows x64 release verified
+by SHA-256 during packaging.
+
+In ChatGPT developer mode, create the app using **Connection -> Tunnel** and
+select the same tunnel (or paste its `tunnel_id`). No browser OAuth link to the
+FalkorDB server is required for this tunnel-backed app.
 
 ## ChatGPT HTTPS API
 

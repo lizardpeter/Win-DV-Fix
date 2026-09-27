@@ -18,7 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "oauth-fingerprint-v4-20260927";
+pub const OAUTH_BUILD_ID: &str = "oauth-callback-fix-v5-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
@@ -29,7 +29,9 @@ const MAX_MCP_BATCH_QUERIES: usize = 100;
 const SCOPE_READ: &str = "graph:read";
 const SCOPE_WRITE: &str = "graph:write";
 const SCOPE_ADMIN: &str = "graph:admin";
-const ALL_SCOPES: &str = "graph:read graph:write graph:admin";
+const SCOPE_OFFLINE: &str = "offline_access";
+const ALL_SCOPES: &str = "graph:read graph:write graph:admin offline_access";
+const AUTHORIZATION_RESPONSE_ISS_SUPPORTED: bool = false;
 
 #[derive(Debug, Clone)]
 struct OAuthCode {
@@ -201,7 +203,7 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
         200,
         json!({
             "issuer": base,
-            "authorization_response_iss_parameter_supported": false,
+            "authorization_response_iss_parameter_supported": AUTHORIZATION_RESPONSE_ISS_SUPPORTED,
             "authorization_endpoint": format!("{base}/oauth/authorize"),
             "token_endpoint": format!("{base}/oauth/token"),
             "client_id_metadata_document_supported": true,
@@ -416,16 +418,26 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
 
     let separator = if validated.redirect_uri.contains('?') { '&' } else { '?' };
     let mut location = format!(
-        "{}{}code={}&iss={}",
+        "{}{}code={}",
         validated.redirect_uri,
         separator,
-        percent_encode(&code),
-        percent_encode(&base)
+        percent_encode(&code)
     );
+    if AUTHORIZATION_RESPONSE_ISS_SUPPORTED {
+        location.push_str("&iss=");
+        location.push_str(&percent_encode(&base));
+    }
     if !validated.state.is_empty() {
         location.push_str("&state=");
         location.push_str(&percent_encode(&validated.state));
     }
+    eprintln!(
+        "OAuth redirect [{}]: callback_mode={}, redirect_uri={}, iss_included={}",
+        OAUTH_BUILD_ID,
+        if AUTHORIZATION_RESPONSE_ISS_SUPPORTED { "stable" } else { "callback-specific" },
+        validated.redirect_uri,
+        AUTHORIZATION_RESPONSE_ISS_SUPPORTED,
+    );
 
     let mut response = raw_response(302, "text/plain; charset=utf-8", Vec::new());
     response.headers.push(("Location".to_string(), location));
@@ -784,7 +796,7 @@ fn allowed_chatgpt_redirect(uri: &str) -> bool {
 
 fn validate_requested_scopes(scope: &str) -> Result<(), String> {
     for item in scope.split_whitespace() {
-        if !matches!(item, SCOPE_READ | SCOPE_WRITE | SCOPE_ADMIN) {
+        if !matches!(item, SCOPE_READ | SCOPE_WRITE | SCOPE_ADMIN | SCOPE_OFFLINE) {
             return Err(format!("unsupported scope {item:?}"));
         }
     }
@@ -803,7 +815,7 @@ fn validate_scope_subset(requested: &str, granted: &str) -> Result<(), String> {
 }
 
 fn canonical_scope(scope: &str) -> String {
-    [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
+    [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN, SCOPE_OFFLINE]
         .into_iter()
         .filter(|candidate| scope.split_whitespace().any(|item| item == *candidate))
         .collect::<Vec<_>>()
@@ -1921,6 +1933,20 @@ mod tests {
             "restart-scoped-pairing-code"
         ));
         assert!(!owner_secret_matches(&config, "different-code"));
+    }
+
+    #[test]
+    fn callback_specific_mode_does_not_claim_issuer_response_support() {
+        assert!(!AUTHORIZATION_RESPONSE_ISS_SUPPORTED);
+    }
+
+    #[test]
+    fn offline_access_is_a_supported_oauth_scope() {
+        assert!(validate_requested_scopes("graph:read offline_access").is_ok());
+        assert_eq!(
+            canonical_scope("offline_access graph:admin graph:read"),
+            "graph:read graph:admin offline_access"
+        );
     }
 
     #[test]

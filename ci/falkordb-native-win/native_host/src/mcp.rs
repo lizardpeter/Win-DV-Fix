@@ -601,8 +601,8 @@ fn mcp_post(request: &HttpRequest, catalog: &GraphCatalog, config: &ApiConfig) -
             let resource = format!("{base}/mcp");
             match call_tool(&params, request, catalog, config, &base, &resource, modern) {
                 Ok(result) => result,
-                Err((code, message)) => {
-                    return json_response(200, rpc_error(id, code, &message));
+                Err(message) => {
+                    return json_response(200, rpc_error(id, -32602, &message));
                 }
             }
         }
@@ -897,7 +897,7 @@ fn call_tool(
     issuer: &str,
     resource: &str,
     modern: bool,
-) -> Result<JsonValue, (i64, String)> {
+) -> Result<JsonValue, String> {
     let name = params
         .get("name")
         .and_then(JsonValue::as_str)
@@ -917,7 +917,7 @@ fn call_tool(
         | "checkpoint_all_graphs"
         | "flush_all_graphs"
         | "restore_graph_dump" => RequiredScope::Admin,
-        _ => return Err((-32601, format!("unknown tool {name:?}"))),
+        _ => return Err(format!("unknown tool {name:?}")),
     };
 
     let granted = mcp_granted_scopes(request, config, issuer, resource);

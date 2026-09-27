@@ -133,14 +133,48 @@ pub(crate) fn route_http(
         _ => return None,
     }
 
-    Some(match request.method.as_str() {
+    let response = match request.method.as_str() {
         "POST" => mcp_post(request, catalog, config),
-        // This implementation is intentionally JSON-response Streamable HTTP.
-        // It has no server-initiated notification stream, so GET/DELETE are not
-        // needed and the MCP transport permits 405 for them.
-        "GET" | "DELETE" => method_not_allowed("POST"),
-        _ => method_not_allowed("POST"),
-    })
+        "OPTIONS" => {
+            let mut response = raw_response(204, "text/plain; charset=utf-8", Vec::new());
+            response.headers.push(("Allow".to_string(), "POST, OPTIONS".to_string()));
+            response
+        }
+        // The 2026-07-28 stateless Streamable HTTP transport uses POST only.
+        // Legacy clients that probe GET/DELETE receive an explicit 405.
+        "GET" | "DELETE" => method_not_allowed("POST, OPTIONS"),
+        _ => method_not_allowed("POST, OPTIONS"),
+    };
+
+    Some(with_mcp_cors(response))
+}
+
+fn with_mcp_cors(mut response: HttpResponse) -> HttpResponse {
+    // ChatGPT's developer-mode connection UI may perform a browser preflight
+    // before its backend begins MCP discovery. Authorization is carried in the
+    // Bearer token, not cookies, so wildcard origin is safe for CORS while the
+    // server still enforces OAuth on every privileged tool call.
+    response.headers.push((
+        "Access-Control-Allow-Origin".to_string(),
+        "*".to_string(),
+    ));
+    response.headers.push((
+        "Access-Control-Allow-Methods".to_string(),
+        "POST, OPTIONS".to_string(),
+    ));
+    response.headers.push((
+        "Access-Control-Allow-Headers".to_string(),
+        "accept, authorization, content-type, mcp-protocol-version, mcp-method, mcp-name".to_string(),
+    ));
+    response.headers.push((
+        "Access-Control-Expose-Headers".to_string(),
+        "WWW-Authenticate".to_string(),
+    ));
+    response.headers.push((
+        "Vary".to_string(),
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers".to_string(),
+    ));
+    response
 }
 
 fn protected_resource_metadata(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {

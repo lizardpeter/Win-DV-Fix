@@ -18,7 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v2-20260927";
+pub const OAUTH_BUILD_ID: &str = "oauth-callback-v3-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
@@ -201,7 +201,7 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
         200,
         json!({
             "issuer": base,
-            "authorization_response_iss_parameter_supported": true,
+            "authorization_response_iss_parameter_supported": false,
             "authorization_endpoint": format!("{base}/oauth/authorize"),
             "token_endpoint": format!("{base}/oauth/token"),
             "client_id_metadata_document_supported": true,
@@ -347,9 +347,13 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     }
 
     eprintln!(
-        "OAuth approval accepted [{}] using {}",
+        "OAuth approval accepted [{}] using {}; client_id={}; redirect_uri={}; resource={}; issuer={}",
         OAUTH_BUILD_ID,
-        matched_source.unwrap_or("unknown")
+        matched_source.unwrap_or("unknown"),
+        validated.client_id,
+        validated.redirect_uri,
+        validated.resource,
+        base,
     );
 
     cleanup_expired_codes();
@@ -494,6 +498,7 @@ fn unquote_owner_secret(value: &str) -> String {
 
 fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     let Some(secret) = config.read_write_token.as_deref() else {
+        eprintln!("OAuth token rejected [{}]: no API signing token configured", OAUTH_BUILD_ID);
         return oauth_error(
             503,
             "temporarily_unavailable",
@@ -502,14 +507,42 @@ fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     };
     let body = match std::str::from_utf8(&request.body) {
         Ok(body) => body,
-        Err(_) => return oauth_error(400, "invalid_request", "form body is not UTF-8"),
+        Err(_) => {
+            eprintln!("OAuth token rejected [{}]: request body is not UTF-8", OAUTH_BUILD_ID);
+            return oauth_error(400, "invalid_request", "form body is not UTF-8");
+        }
     };
     let params = parse_urlencoded(body);
-    match params.get("grant_type").map(String::as_str) {
-        Some("authorization_code") => exchange_authorization_code(&params, secret),
-        Some("refresh_token") => exchange_refresh_token(&params, secret),
+    let grant_type = params.get("grant_type").map(String::as_str).unwrap_or("<missing>");
+    eprintln!(
+        "OAuth token request [{}]: grant_type={}, client_id_present={}, redirect_uri_present={}, resource_present={}, verifier_present={}, user_agent={}",
+        OAUTH_BUILD_ID,
+        grant_type,
+        params.contains_key("client_id"),
+        params.contains_key("redirect_uri"),
+        params.contains_key("resource"),
+        params.contains_key("code_verifier"),
+        request.headers.get("user-agent").map(String::as_str).unwrap_or("<none>"),
+    );
+
+    let mut response = match grant_type {
+        "authorization_code" => exchange_authorization_code(&params, secret),
+        "refresh_token" => exchange_refresh_token(&params, secret),
         _ => oauth_error(400, "unsupported_grant_type", "unsupported grant_type"),
-    }
+    };
+    response.headers.push(("Pragma".to_string(), "no-cache".to_string()));
+    let outcome = serde_json::from_slice::<JsonValue>(&response.body)
+        .ok()
+        .and_then(|value| {
+            value.get("error").and_then(JsonValue::as_str).map(str::to_string)
+                .or_else(|| value.get("access_token").map(|_| "token_issued".to_string()))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    eprintln!(
+        "OAuth token response [{}]: status={} outcome={}",
+        OAUTH_BUILD_ID, response.status, outcome
+    );
+    response
 }
 
 fn exchange_authorization_code(params: &HashMap<String, String>, secret: &str) -> HttpResponse {
@@ -758,6 +791,17 @@ fn mcp_post(request: &HttpRequest, catalog: &GraphCatalog, config: &ApiConfig) -
     };
     let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
     let modern = is_modern_request(request, &params) || method == "server/discover";
+
+    if matches!(method, "server/discover" | "initialize" | "tools/list") {
+        eprintln!(
+            "MCP control request [{}]: method={}, modern={}, bearer_present={}, host={}",
+            OAUTH_BUILD_ID,
+            method,
+            modern,
+            request.headers.contains_key("authorization"),
+            request.headers.get("host").map(String::as_str).unwrap_or("<missing>"),
+        );
+    }
 
     // JSON-RPC notifications do not receive a JSON-RPC response.
     if object.get("id").is_none() {

@@ -39,6 +39,11 @@ pub struct ApiConfig {
     pub oauth_pairing_code: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
+    /// Dedicated backend for OpenAI Secure MCP Tunnel. When enabled this
+    /// listener exposes only /mcp and /healthz, suppresses OAuth discovery,
+    /// and advertises MCP tools as noauth to the product because the local
+    /// tunnel-client injects a private backend Bearer token on the loopback hop.
+    pub tunnel_mode: bool,
     pub tls: Option<TlsConfig>,
 }
 
@@ -53,6 +58,7 @@ impl Default for ApiConfig {
             oauth_pairing_code: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
+            tunnel_mode: false,
             tls: None,
         }
     }
@@ -289,6 +295,14 @@ fn route_http(
             "service": "falkordb-native-chatgpt-api",
             "version": 1
         }));
+    }
+
+    if config.tunnel_mode {
+        // The Secure MCP Tunnel backend is deliberately MCP-only. In
+        // particular, do not expose OAuth discovery on this listener: ChatGPT
+        // sees noauth tools while tunnel-client authenticates the private
+        // loopback hop with a static backend Bearer header.
+        return error_response(404, "not_found", "tunnel backend exposes only /mcp and /healthz");
     }
 
     if request.method == "GET"

@@ -41,6 +41,8 @@ RDB_OPCODE_EOF = 255
 
 RDB_TYPE_MODULE_PRE_GA = 6
 RDB_TYPE_MODULE_2 = 7
+RDB_TYPE_STREAM_LISTPACKS_4 = 26
+RDB_TYPE_STREAM_LISTPACKS_5 = 27
 
 RDB_MODULE_OPCODE_EOF = 0
 RDB_MODULE_OPCODE_SINT = 1
@@ -79,6 +81,7 @@ class ParsedRdb:
     graphs: "OrderedDict[str, list[bytes]]"
     headers: dict[str, GraphHeader]
     udfs: dict[str, str]
+    ignored_aux_keys: list[str]
 
 
 class RdbReader:
@@ -184,22 +187,20 @@ def lzf_decompress(data: bytes, expected_len: int) -> bytes:
 
 
 def redis_crc64(data: bytes) -> int:
-    poly = 0xAD93_D235_94C9_35A9
+    # Redis CRC64-Jones, reflected form. Table-driven verification is
+    # important for 100+ MiB graph snapshots.
+    poly = 0x95AC_9329_AC4B_C9B5
+    table = []
+    for value in range(256):
+        crc = value
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+        table.append(crc)
+
     crc = 0
     for byte in data:
-        for mask in (1, 2, 4, 8, 16, 32, 64, 128):
-            high = bool(crc & 0x8000_0000_0000_0000)
-            bit = bool(byte & mask)
-            crc = (crc << 1) & 0xFFFF_FFFF_FFFF_FFFF
-            if high ^ bit:
-                crc ^= poly
-    # reverse 64 bits, matching Redis crc64.c
-    value = crc
-    reversed_value = 0
-    for _ in range(64):
-        reversed_value = (reversed_value << 1) | (value & 1)
-        value >>= 1
-    return reversed_value
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc
 
 
 def module_name(module_id: int) -> str:
@@ -396,6 +397,71 @@ def parse_falkordb_aux(
         udfs[name] = script
 
 
+
+def read_plain_len(reader: RdbReader, label: str) -> int:
+    value, encoded = reader.read_len()
+    if encoded:
+        raise ValueError(f"encoded RDB length where {label} was expected")
+    return value
+
+
+def skip_stream_value(reader: RdbReader, record_type: int) -> None:
+    """Consume FalkorDB's telemetry Redis Stream without materializing it."""
+    listpack_count = read_plain_len(reader, "stream listpack count")
+    for _ in range(listpack_count):
+        reader.string()  # radix-tree node key
+        reader.string()  # serialized listpack
+
+    read_plain_len(reader, "stream length")
+    read_plain_len(reader, "stream last-id ms")
+    read_plain_len(reader, "stream last-id seq")
+    read_plain_len(reader, "stream first-id ms")
+    read_plain_len(reader, "stream first-id seq")
+    read_plain_len(reader, "stream max-deleted-id ms")
+    read_plain_len(reader, "stream max-deleted-id seq")
+    read_plain_len(reader, "stream entries-added")
+
+    group_count = read_plain_len(reader, "stream consumer-group count")
+    for _ in range(group_count):
+        reader.string()
+        read_plain_len(reader, "consumer-group last-id ms")
+        read_plain_len(reader, "consumer-group last-id seq")
+        read_plain_len(reader, "consumer-group entries-read")
+
+        pel_count = read_plain_len(reader, "consumer-group PEL count")
+        for _ in range(pel_count):
+            reader.read(16)
+            reader.read(8)
+            read_plain_len(reader, "consumer-group delivery count")
+
+        consumer_count = read_plain_len(reader, "stream consumer count")
+        for _ in range(consumer_count):
+            reader.string()
+            reader.read(8)  # seen time
+            reader.read(8)  # active time
+            local_pel_count = read_plain_len(reader, "consumer PEL count")
+            for _ in range(local_pel_count):
+                reader.read(16)
+
+        if record_type >= RDB_TYPE_STREAM_LISTPACKS_5:
+            nack_zone_count = read_plain_len(reader, "stream NACK zone count")
+            reader.read(nack_zone_count * 16)
+
+    # STREAM_LISTPACKS_4 added IDMP state.
+    read_plain_len(reader, "stream IDMP duration")
+    read_plain_len(reader, "stream IDMP max entries")
+    producer_count = read_plain_len(reader, "stream IDMP producer count")
+    for _ in range(producer_count):
+        reader.string()
+        entry_count = read_plain_len(reader, "stream IDMP producer entry count")
+        for _ in range(entry_count):
+            reader.string()
+            read_plain_len(reader, "stream IDMP entry ms")
+            read_plain_len(reader, "stream IDMP entry seq")
+    read_plain_len(reader, "stream IDMP IIDs added")
+    read_plain_len(reader, "stream IDMP IIDs duplicates")
+
+
 def parse_rdb(path: Path) -> ParsedRdb:
     data = path.read_bytes()
     if len(data) < 17 or not data.startswith(b"REDIS"):
@@ -424,6 +490,7 @@ def parse_rdb(path: Path) -> ParsedRdb:
     graphs: "OrderedDict[str, list[bytes]]" = OrderedDict()
     headers: dict[str, GraphHeader] = {}
     udfs: dict[str, str] = {}
+    ignored_aux_keys: list[str] = []
     current_db = 0
     pending_expire = False
 
@@ -508,6 +575,17 @@ def parse_rdb(path: Path) -> ParsedRdb:
                 "currently requires DB 0"
             )
 
+        if (
+            record_type
+            in (RDB_TYPE_STREAM_LISTPACKS_4, RDB_TYPE_STREAM_LISTPACKS_5)
+            and key_text.startswith("telemetry{")
+            and key_text.endswith("}")
+        ):
+            skip_stream_value(reader, record_type)
+            ignored_aux_keys.append(key_text)
+            pending_expire = False
+            continue
+
         if record_type == RDB_TYPE_MODULE_PRE_GA:
             raise ValueError(
                 f"key {key_text!r} uses unsupported pre-GA Redis module format"
@@ -575,7 +653,14 @@ def parse_rdb(path: Path) -> ParsedRdb:
     if not graphs:
         raise ValueError("RDB contains no current FalkorDB graphdata/graphmeta keys")
 
-    return ParsedRdb(version, graphs, headers, udfs)
+    for key in ignored_aux_keys:
+        graph_name = key.removeprefix("telemetry{").removesuffix("}")
+        if graph_name not in graphs:
+            raise ValueError(
+                f"telemetry key {key!r} does not correspond to a graph in this RDB"
+            )
+
+    return ParsedRdb(version, graphs, headers, udfs, ignored_aux_keys)
 
 
 def endpoint_kwargs(args) -> dict:
@@ -627,7 +712,8 @@ def import_rdb(args) -> None:
     parsed = parse_rdb(rdb_path)
     print(
         f"parsed Redis RDB v{parsed.version}: "
-        f"{len(parsed.graphs)} graph(s), {len(parsed.udfs)} UDF library/libraries"
+        f"{len(parsed.graphs)} graph(s), {len(parsed.udfs)} UDF library/libraries, "
+        f"{len(parsed.ignored_aux_keys)} ignored auxiliary telemetry key(s)"
     )
 
     raw = Redis(**endpoint_kwargs(args))
@@ -741,6 +827,8 @@ def inspect_rdb(args) -> None:
         )
     for name in sorted(parsed.udfs):
         print(f"UDF {name!r}")
+    for key in parsed.ignored_aux_keys:
+        print(f"ignored FalkorDB auxiliary telemetry key {key!r}")
 
 
 def main() -> None:

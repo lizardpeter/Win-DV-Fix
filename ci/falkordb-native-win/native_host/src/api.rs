@@ -598,6 +598,7 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
+        204 => "No Content",
         302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",

@@ -64,6 +64,37 @@ jobs:
           }, indent=2))
           PY
 
+          echo "=== current ChatGPT callback-specific CIMD ==="
+          curl -sS --fail-with-body --max-time 15 \
+            "https://chatgpt.com/oauth/ZLvagrWsX-4W/client.json" > /tmp/chatgpt-client.json
+          cat /tmp/chatgpt-client.json
+          echo
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/chatgpt-client.json'))
+          print(json.dumps({
+            'client_id': d.get('client_id'),
+            'redirect_uris': d.get('redirect_uris'),
+            'token_endpoint_auth_method': d.get('token_endpoint_auth_method'),
+            'token_endpoint_auth_methods_supported': d.get('token_endpoint_auth_methods_supported'),
+            'grant_types': d.get('grant_types'),
+            'response_types': d.get('response_types'),
+          }, indent=2))
+          PY
+
+          echo "=== live OAuth metadata consistency ==="
+          curl -sS --fail-with-body --max-time 15 \
+            "$base/.well-known/oauth-authorization-server" > /tmp/as.json
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/as.json'))
+          print(json.dumps(d, indent=2))
+          assert d.get('authorization_response_iss_parameter_supported') is False
+          assert d.get('client_id_metadata_document_supported') is True
+          assert 'S256' in d.get('code_challenge_methods_supported', [])
+          assert 'none' in d.get('token_endpoint_auth_methods_supported', [])
+          PY
+
           echo "=== token endpoint reachability (intentionally invalid code) ==="
           status=$(curl -sS -o /tmp/token.json -w '%{http_code}' --max-time 15 \
             -H 'Content-Type: application/x-www-form-urlencoded' \

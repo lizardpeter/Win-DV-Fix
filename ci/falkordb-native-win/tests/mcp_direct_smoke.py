@@ -139,7 +139,12 @@ def oauth_link(ctx):
     if status != 200:
         raise AssertionError((status, data.decode(errors="replace")))
     refreshed = json.loads(data)
-    return refreshed["access_token"]
+    return {
+        "access_token": refreshed["access_token"],
+        "refresh_token": refreshed["refresh_token"],
+        "scope": refreshed["scope"],
+        "resource": resource,
+    }
 
 
 def write_phase(ctx, token_file: Path):
@@ -193,7 +198,8 @@ def write_phase(ctx, token_file: Path):
     assert unauth["isError"] is True
     assert "mcp/www_authenticate" in unauth["_meta"]
 
-    token = oauth_link(ctx)
+    token_state = oauth_link(ctx)
+    token = token_state["access_token"]
 
     created = rpc(
         ctx,
@@ -243,12 +249,15 @@ def write_phase(ctx, token_file: Path):
     )
     assert checkpoint["isError"] is False
 
-    token_file.write_text(token, encoding="utf-8")
+    token_file.write_text(json.dumps(token_state), encoding="utf-8")
     print("MCP_DIRECT_OAUTH_WRITE_PASS")
 
 
 def read_phase(ctx, token_file: Path):
-    token = token_file.read_text(encoding="utf-8").strip()
+    state = json.loads(token_file.read_text(encoding="utf-8"))
+    token = state["access_token"]
+
+    # First prove the already-issued access token survives a hard server restart.
     read = rpc(
         ctx,
         "tools/call",
@@ -263,6 +272,47 @@ def read_phase(ctx, token_file: Path):
         request_id=8,
     )
     assert read["structuredContent"]["rows"] == [[42]]
+    print("MCP_DIRECT_OAUTH_ACCESS_TOKEN_RESTART_PASS")
+
+    # Then prove the long-lived refresh token also survives the restart and can
+    # mint a fresh access token without another browser authorization.
+    refresh_form = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": state["refresh_token"],
+            "resource": state["resource"],
+            "scope": state["scope"],
+        }
+    )
+    status, _, data = request(
+        ctx,
+        "POST",
+        "/oauth/token",
+        body=refresh_form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if status != 200:
+        raise AssertionError((status, data.decode(errors="replace")))
+    refreshed = json.loads(data)
+    assert refreshed["token_type"] == "Bearer"
+    assert refreshed["scope"] == state["scope"]
+    assert refreshed["refresh_token"]
+
+    read_after_refresh = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "query_graph_read",
+            "arguments": {
+                "graph": "mcp-ci",
+                "cypher": "MATCH (n:McpProbe {name:'direct-oauth'}) RETURN n.value",
+            },
+        },
+        token=refreshed["access_token"],
+        request_id=9,
+    )
+    assert read_after_refresh["structuredContent"]["rows"] == [[42]]
+    print("MCP_DIRECT_OAUTH_REFRESH_TOKEN_RESTART_PASS")
     print("MCP_DIRECT_OAUTH_RESTART_PASS")
 
 

@@ -110,6 +110,10 @@ pub(crate) fn route_http(
         .split_once('?')
         .map_or(request.target.as_str(), |(path, _)| path);
 
+    if config.tunnel_mode && path != "/mcp" {
+        return None;
+    }
+
     match path {
         "/.well-known/oauth-protected-resource"
         | "/.well-known/oauth-protected-resource/mcp" => {
@@ -878,7 +882,7 @@ fn mcp_post(request: &HttpRequest, catalog: &GraphCatalog, config: &ApiConfig) -
         "server/discover" => server_discover_result(),
         "initialize" => initialize_result(&params),
         "ping" => json!({}),
-        "tools/list" => tools_list_result(modern),
+        "tools/list" => tools_list_result(modern, config.tunnel_mode),
         "tools/call" => {
             let Some(base) = request_base(request, config) else {
                 return json_response(
@@ -946,8 +950,8 @@ fn initialize_result(params: &JsonValue) -> JsonValue {
     })
 }
 
-fn tools_list_result(modern: bool) -> JsonValue {
-    let tools = vec![
+fn tools_list_result(modern: bool, tunnel_mode: bool) -> JsonValue {
+    let mut tools = vec![
         tool_definition(
             "list_graphs",
             "List graphs",
@@ -1126,6 +1130,18 @@ fn tools_list_result(modern: bool) -> JsonValue {
         ),
     ];
 
+    if tunnel_mode {
+        for tool in &mut tools {
+            let noauth = json!([{"type": "noauth"}]);
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("securitySchemes".to_string(), noauth.clone());
+                if let Some(meta) = object.get_mut("_meta").and_then(JsonValue::as_object_mut) {
+                    meta.insert("securitySchemes".to_string(), noauth);
+                }
+            }
+        }
+    }
+
     modernize_list(json!({"tools": tools}), modern)
 }
 
@@ -1158,7 +1174,13 @@ fn tool_definition(
             }
         ],
         "_meta": {
-            "requiredScope": scope.as_str()
+            "requiredScope": scope.as_str(),
+            "securitySchemes": [
+                {
+                    "type": "oauth2",
+                    "scopes": [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
+                }
+            ]
         }
     })
 }
@@ -1213,6 +1235,12 @@ fn call_tool(
 
     let granted = mcp_granted_scopes(request, config, issuer, resource);
     if !granted.is_some_and(|scope| scope.allows(required_scope)) {
+        if config.tunnel_mode {
+            return Ok(tool_failure(
+                "Secure MCP Tunnel backend authentication header is missing or invalid",
+                modern,
+            ));
+        }
         return Ok(auth_required_result(
             issuer,
             resource,
@@ -2023,7 +2051,7 @@ mod tests {
 
     #[test]
     fn tool_list_exposes_full_read_write_admin_surface() {
-        let value = tools_list_result(false);
+        let value = tools_list_result(false, false);
         let names: Vec<&str> = value["tools"]
             .as_array()
             .unwrap()

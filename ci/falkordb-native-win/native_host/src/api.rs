@@ -33,6 +33,10 @@ pub struct ApiConfig {
     /// preserve the values loaded directly from falkordb-secrets.txt even
     /// when the startup script supplies different CLI/environment values.
     pub oauth_owner_secret_fallbacks: Vec<String>,
+    /// High-entropy restart-scoped code printed only to the server console.
+    /// This gives the machine owner an independent OAuth approval path that
+    /// does not depend on environment variables or secrets-file parsing.
+    pub oauth_pairing_code: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -46,6 +50,7 @@ impl Default for ApiConfig {
             read_only_token: None,
             oauth_owner_secret: None,
             oauth_owner_secret_fallbacks: Vec::new(),
+            oauth_pairing_code: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,

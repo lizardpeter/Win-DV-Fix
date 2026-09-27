@@ -9,9 +9,13 @@ use std::{
 
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ring::rand::{SecureRandom, SystemRandom};
+
 use falkordb_native_host::{
     Engine,
     api::{ApiConfig, serve_api},
+    mcp::OAUTH_BUILD_ID,
     server::{GraphCatalog, ServerConfig, TlsConfig, serve_with_catalog},
 };
 
@@ -24,6 +28,14 @@ fn executable_root() -> Result<PathBuf, String> {
     parent
         .canonicalize()
         .map_err(|e| format!("canonicalize executable directory {}: {e}", parent.display()))
+}
+
+fn generate_oauth_pairing_code() -> Result<String, String> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 24];
+    rng.fill(&mut bytes)
+        .map_err(|_| "generate OAuth pairing code: secure random generator failed".to_string())?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<PathBuf, String> {
@@ -511,12 +523,26 @@ including a ChatGPT custom integration.
             }
         }
 
+        let oauth_pairing_code = generate_oauth_pairing_code()?;
+        eprintln!("FalkorDB OAuth build: {OAUTH_BUILD_ID}");
+        eprintln!("OAuth pairing code (valid until this server restarts): {oauth_pairing_code}");
+        eprintln!(
+            "OAuth credential diagnostics: secrets_file={} found={}, file_password={}, file_api_token={}, runtime_password={}, runtime_api_token={}",
+            executable_dir.join("falkordb-secrets.txt").display(),
+            executable_dir.join("falkordb-secrets.txt").exists(),
+            local_secrets.password.is_some(),
+            local_secrets.api_token.is_some(),
+            config.password.is_some(),
+            api_token.is_some(),
+        );
+
         let api_config = ApiConfig {
             bind,
             read_write_token: api_token,
             read_only_token: api_read_token,
             oauth_owner_secret: config.password.clone(),
             oauth_owner_secret_fallbacks,
+            oauth_pairing_code: Some(oauth_pairing_code),
             allow_unauthenticated_remote: api_allow_unauthenticated_remote,
             allow_plaintext_remote: api_allow_plaintext_remote,
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {

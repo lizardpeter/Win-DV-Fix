@@ -18,6 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
+pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v1-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
@@ -217,6 +218,7 @@ fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpRespons
     if config.oauth_owner_secret.is_none()
         && config.read_write_token.is_none()
         && config.oauth_owner_secret_fallbacks.is_empty()
+        && config.oauth_pairing_code.is_none()
     {
         return oauth_error(
             503,
@@ -257,10 +259,12 @@ code{{word-break:break-word}}
 <h1>Authorize ChatGPT</h1>
 <p>Grant ChatGPT direct access to this FalkorDB server with these scopes:</p>
 <p><code>{scope_display}</code></p>
-<p>Enter your FalkorDB <strong>owner secret</strong>. You may use the RESP server password or the existing <strong>FALKORDB_API_TOKEN</strong>. You may paste either the raw value or the full <code>NAME=value</code> line from <code>falkordb-secrets.txt</code>.</p>
+<p><strong>Recommended:</strong> enter the restart-scoped <strong>OAuth pairing code</strong> printed in the server console. This bypasses all password, environment-variable, and secrets-file parsing.</p>
+<p>You may also use the RESP server password or <strong>FALKORDB_API_TOKEN</strong>. Raw values, complete <code>NAME=value</code> lines, and the complete two-line <code>falkordb-secrets.txt</code> are accepted.</p>
+<p class="small">OAuth build: <code>{build_id}</code></p>
 <form method="post" action="/oauth/authorize">
 {hidden}
-<label for="owner_secret">FalkorDB owner secret</label>
+<label for="owner_secret">OAuth pairing code or FalkorDB owner secret</label>
 <input id="owner_secret" name="owner_secret" type="password" autocomplete="current-password" required autofocus>
 <button type="submit">Authorize ChatGPT</button>
 </form>
@@ -268,7 +272,8 @@ code{{word-break:break-word}}
 </div>
 </body>
 </html>"#,
-        hidden = validated.hidden_fields()
+        hidden = validated.hidden_fields(),
+        build_id = OAUTH_BUILD_ID
     );
 
     let mut response = raw_response(200, "text/html; charset=utf-8", html.into_bytes());
@@ -283,6 +288,7 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     if config.oauth_owner_secret.is_none()
         && config.read_write_token.is_none()
         && config.oauth_owner_secret_fallbacks.is_empty()
+        && config.oauth_pairing_code.is_none()
     {
         return oauth_error(
             503,
@@ -310,15 +316,27 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         .get("owner_secret")
         .or_else(|| params.get("api_token"))
         .map_or("", String::as_str);
-    if !owner_secret_matches(config, supplied) {
+    let matched_source = owner_secret_match_source(config, supplied);
+    if matched_source.is_none() {
+        eprintln!(
+            "OAuth approval rejected [{}]: pairing_code={}, runtime_password={}, runtime_api_token={}, secrets_file_candidates={}, submitted_candidates={}",
+            OAUTH_BUILD_ID,
+            config.oauth_pairing_code.is_some(),
+            config.oauth_owner_secret.is_some(),
+            config.read_write_token.is_some(),
+            config.oauth_owner_secret_fallbacks.len(),
+            normalize_owner_secret_candidates(supplied).len(),
+        );
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
             format!(
-                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted.</p><p>This server currently has <strong>{}</strong> distinct owner credential source(s) available for OAuth. You may paste the raw password/token, a complete FALKORDB_PASSWORD=... or FALKORDB_API_TOKEN=... line, or the complete falkordb-secrets.txt contents.</p>",
-                usize::from(config.oauth_owner_secret.is_some())
-                    + usize::from(config.read_write_token.is_some())
-                    + config.oauth_owner_secret_fallbacks.len()
+                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The submitted value did not match this process.</p><p><strong>Use the OAuth pairing code printed by the currently running server.</strong> It is independent of falkordb-secrets.txt and environment variables.</p><p>Build: <code>{}</code></p><p>Pairing code active: <strong>{}</strong>; runtime password loaded: <strong>{}</strong>; runtime API token loaded: <strong>{}</strong>; secrets-file fallback candidates: <strong>{}</strong>.</p>",
+                OAUTH_BUILD_ID,
+                config.oauth_pairing_code.is_some(),
+                config.oauth_owner_secret.is_some(),
+                config.read_write_token.is_some(),
+                config.oauth_owner_secret_fallbacks.len(),
             ).into_bytes(),
         );
         response.headers.push((
@@ -327,6 +345,12 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         ));
         return response;
     }
+
+    eprintln!(
+        "OAuth approval accepted [{}] using {}",
+        OAUTH_BUILD_ID,
+        matched_source.unwrap_or("unknown")
+    );
 
     cleanup_expired_codes();
     let code = match random_token("ac_", 32) {
@@ -364,10 +388,10 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     response
 }
 
-fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
+fn owner_secret_match_source(config: &ApiConfig, supplied: &str) -> Option<&'static str> {
     let candidates = normalize_owner_secret_candidates(supplied);
     if candidates.is_empty() {
-        return false;
+        return None;
     }
 
     let matches_expected = |expected: &str| {
@@ -376,18 +400,39 @@ fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
             .any(|candidate| constant_time_eq(expected, candidate))
     };
 
-    config
+    if config
+        .oauth_pairing_code
+        .as_deref()
+        .is_some_and(matches_expected)
+    {
+        return Some("pairing-code");
+    }
+    if config
         .oauth_owner_secret
         .as_deref()
         .is_some_and(matches_expected)
-        || config
-            .read_write_token
-            .as_deref()
-            .is_some_and(matches_expected)
-        || config
-            .oauth_owner_secret_fallbacks
-            .iter()
-            .any(|expected| matches_expected(expected))
+    {
+        return Some("runtime-password");
+    }
+    if config
+        .read_write_token
+        .as_deref()
+        .is_some_and(matches_expected)
+    {
+        return Some("runtime-api-token");
+    }
+    if config
+        .oauth_owner_secret_fallbacks
+        .iter()
+        .any(|expected| matches_expected(expected))
+    {
+        return Some("secrets-file");
+    }
+    None
+}
+
+fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
+    owner_secret_match_source(config, supplied).is_some()
 }
 
 fn normalize_owner_secret_candidates(input: &str) -> Vec<String> {
@@ -1769,6 +1814,27 @@ mod tests {
             "FALKORDB_PASSWORD=file-password\nFALKORDB_API_TOKEN=file-api-token\n"
         ));
         assert!(!owner_secret_matches(&config, "not-in-any-source"));
+    }
+
+    #[test]
+    fn oauth_pairing_code_is_an_independent_owner_approval_path() {
+        let config = ApiConfig {
+            oauth_owner_secret: Some("wrong-runtime-password".to_string()),
+            read_write_token: Some("wrong-runtime-api-token".to_string()),
+            oauth_owner_secret_fallbacks: vec!["wrong-file-value".to_string()],
+            oauth_pairing_code: Some("restart-scoped-pairing-code".to_string()),
+            ..ApiConfig::default()
+        };
+
+        assert_eq!(
+            owner_secret_match_source(&config, "restart-scoped-pairing-code"),
+            Some("pairing-code")
+        );
+        assert!(owner_secret_matches(
+            &config,
+            "restart-scoped-pairing-code"
+        ));
+        assert!(!owner_secret_matches(&config, "different-code"));
     }
 
     #[test]

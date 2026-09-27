@@ -187,22 +187,20 @@ def lzf_decompress(data: bytes, expected_len: int) -> bytes:
 
 
 def redis_crc64(data: bytes) -> int:
-    poly = 0xAD93_D235_94C9_35A9
+    # Redis CRC64-Jones, reflected form. Table-driven verification is
+    # important for 100+ MiB graph snapshots.
+    poly = 0x95AC_9329_AC4B_C9B5
+    table = []
+    for value in range(256):
+        crc = value
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+        table.append(crc)
+
     crc = 0
     for byte in data:
-        for mask in (1, 2, 4, 8, 16, 32, 64, 128):
-            high = bool(crc & 0x8000_0000_0000_0000)
-            bit = bool(byte & mask)
-            crc = (crc << 1) & 0xFFFF_FFFF_FFFF_FFFF
-            if high ^ bit:
-                crc ^= poly
-    # reverse 64 bits, matching Redis crc64.c
-    value = crc
-    reversed_value = 0
-    for _ in range(64):
-        reversed_value = (reversed_value << 1) | (value & 1)
-        value >>= 1
-    return reversed_value
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc
 
 
 def module_name(module_id: int) -> str:

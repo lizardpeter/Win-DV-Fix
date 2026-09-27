@@ -18,7 +18,8 @@ use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc, time::{Duration, Insta
 use graph::{
     effects::{
         EffectsBuffer, EffectsPayload,
-        announce::{AnnouncedConstraint, SchemaBaseline},    },
+        announce::{AnnouncedConstraint, SchemaBaseline},
+    },
     entity_type::EntityType,
     graph::{
         constraint::{ConstraintStatus, ConstraintType},

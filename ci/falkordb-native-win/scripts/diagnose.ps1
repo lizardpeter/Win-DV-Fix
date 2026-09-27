@@ -127,6 +127,7 @@ Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
+$McpSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_smoke.py"))
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
 $UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
 $UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
@@ -325,6 +326,17 @@ try {
         throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
     }
 
+    python $McpSmoke 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_mcp_oauth_full_control.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "MCP OAuth full-control smoke failed with exit code $LASTEXITCODE"
+    }
+    $McpText = (Get-Content (Join-Path $Logs "10_mcp_oauth_full_control.txt") -Raw)
+    if ($McpText -notmatch "MCP_OAUTH_FULL_CONTROL_PASS") {
+        throw "MCP OAuth smoke did not prove full-control tool connectivity"
+    }
+    Write-Host "NATIVE_WINDOWS_MCP_OAUTH_FULL_CONTROL_PASS"
+
     python $ParitySmoke 2>&1 |
         Tee-Object -FilePath (Join-Path $Logs "10_official_client_parity.txt")
     if ($LASTEXITCODE -ne 0) {
@@ -514,6 +526,7 @@ Write-Host ""
 Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+Write-Host "NATIVE_WINDOWS_MCP_OAUTH_FULL_CONTROL_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"

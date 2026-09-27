@@ -216,9 +216,9 @@ enable the dedicated loopback backend and run the bundled OpenAI tunnel client.
 Start the database with the private MCP backend enabled:
 
 ```powershell
-$env:FALKORDB_TUNNEL_MCP_BIND = "127.0.0.1:18444"
-# Keep using the same FALKORDB_API_TOKEN already present in
-# falkordb-secrets.txt or the process environment.
+# With FALKORDB_API_TOKEN configured, server.exe enables the protected
+# loopback backend automatically on 127.0.0.1:18444.
+# FALKORDB_TUNNEL_MCP_BIND can override that loopback address if needed.
 .\server.exe <your normal server arguments>
 ```
 

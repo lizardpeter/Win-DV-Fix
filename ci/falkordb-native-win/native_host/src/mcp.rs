@@ -18,7 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "oauth-callback-fix-v5-20260927";
+pub const OAUTH_BUILD_ID: &str = "oauth-stable-rfc9207-v6-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
@@ -31,7 +31,7 @@ const SCOPE_WRITE: &str = "graph:write";
 const SCOPE_ADMIN: &str = "graph:admin";
 const SCOPE_OFFLINE: &str = "offline_access";
 const ALL_SCOPES: &str = "graph:read graph:write graph:admin offline_access";
-const AUTHORIZATION_RESPONSE_ISS_SUPPORTED: bool = false;
+const AUTHORIZATION_RESPONSE_ISS_SUPPORTED: bool = true;
 
 #[derive(Debug, Clone)]
 struct OAuthCode {
@@ -250,7 +250,9 @@ fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpRespons
 
     let validated = match validate_authorize_params(&params, &base) {
         Ok(v) => v,
-        Err(message) => return oauth_error(400, "invalid_request", &message),
+        Err(message) => {
+            return authorization_error_response(&params, &base, "invalid_request", &message)
+        }
     };
 
     let scope_display = html_escape(&validated.scope);
@@ -337,7 +339,9 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     let params = parse_urlencoded(body);
     let validated = match validate_authorize_params(&params, &base) {
         Ok(v) => v,
-        Err(message) => return oauth_error(400, "invalid_request", &message),
+        Err(message) => {
+            return authorization_error_response(&params, &base, "invalid_request", &message)
+        }
     };
 
     // Accept the new owner_secret field and the old api_token field so a
@@ -385,7 +389,15 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
             "Content-Security-Policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string(),
         ));
-        return response;
+        // For a valid OAuth request, RFC 9207 requires issuer identification
+        // on authorization error responses as well. Redirect the OAuth client
+        // instead of stranding it on a server-local HTML error page.
+        return authorization_error_response(
+            &params,
+            &base,
+            "access_denied",
+            "owner approval was not accepted",
+        );
     }
 
     eprintln!(
@@ -1787,6 +1799,47 @@ fn method_not_allowed(allow: &str) -> HttpResponse {
     response
 }
 
+fn authorization_error_response(
+    params: &HashMap<String, String>,
+    base: &str,
+    code: &str,
+    description: &str,
+) -> HttpResponse {
+    let client_ok = params
+        .get("client_id")
+        .is_some_and(|client_id| allowed_chatgpt_client_id(client_id));
+    let redirect = params
+        .get("redirect_uri")
+        .filter(|uri| allowed_chatgpt_redirect(uri));
+
+    if client_ok {
+        if let Some(redirect_uri) = redirect {
+            let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+            let mut location = format!(
+                "{}{}error={}&error_description={}",
+                redirect_uri,
+                separator,
+                percent_encode(code),
+                percent_encode(description),
+            );
+            if AUTHORIZATION_RESPONSE_ISS_SUPPORTED {
+                location.push_str("&iss=");
+                location.push_str(&percent_encode(base));
+            }
+            if let Some(state) = params.get("state").filter(|state| !state.is_empty()) {
+                location.push_str("&state=");
+                location.push_str(&percent_encode(state));
+            }
+            let mut response = raw_response(302, "text/plain; charset=utf-8", Vec::new());
+            response.headers.push(("Location".to_string(), location));
+            response.headers.push(("Cache-Control".to_string(), "no-store".to_string()));
+            return response;
+        }
+    }
+
+    oauth_error(400, code, description)
+}
+
 fn oauth_error(status: u16, code: &str, description: &str) -> HttpResponse {
     json_response(
         status,
@@ -1936,8 +1989,8 @@ mod tests {
     }
 
     #[test]
-    fn callback_specific_mode_does_not_claim_issuer_response_support() {
-        assert!(!AUTHORIZATION_RESPONSE_ISS_SUPPORTED);
+    fn stable_callback_mode_claims_rfc9207_issuer_response_support() {
+        assert!(AUTHORIZATION_RESPONSE_ISS_SUPPORTED);
     }
 
     #[test]

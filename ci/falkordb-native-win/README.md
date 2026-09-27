@@ -16,6 +16,7 @@ Current verified Windows CI evidence:
 - Final network marker: `NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS`
 - mTLS marker: `NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS`
 - ChatGPT HTTPS API marker: `NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS`
+- OpenAI Secure MCP Tunnel marker: `NATIVE_WINDOWS_OPENAI_SECURE_MCP_TUNNEL_PASS`
 
 The successful run compiled the FalkorDB `graph` crate and the native host with
 `FALKORDB_SKIP_REDISEARCH=1`, passed the standalone Cypher/index/WAL suite,
@@ -193,6 +194,28 @@ performance work, including:
 - benchmarking against the original FalkorDB/RediSearch deployment
 - stress/crash/fuzz testing
 
+
+## OpenAI Secure MCP Tunnel
+
+The native server includes a dedicated private backend for OpenAI Secure MCP
+Tunnel. Enable it with:
+
+```powershell
+$env:FALKORDB_TUNNEL_MCP_BIND = "127.0.0.1:18444"
+```
+
+or `--tunnel-mcp-bind 127.0.0.1:18444`.
+
+This backend is loopback-only, plaintext only on the local machine, MCP-only,
+and locally Bearer-protected with `FALKORDB_API_TOKEN`. It does not publish
+OAuth metadata. ChatGPT sees `noauth` tool descriptors while the bundled
+official `tunnel-client.exe` injects the backend token only on the local hop.
+
+The portable package includes `start-openai-tunnel.ps1`; after creating a
+Tunnel in OpenAI Platform, set `CONTROL_PLANE_TUNNEL_ID` and
+`CONTROL_PLANE_API_KEY`, then run that script. The Windows CI verifies tool
+discovery, no-OAuth descriptors, rejection without the private local token,
+authenticated graph write/read, and a hard database-server restart.
 
 ## ChatGPT HTTPS API
 

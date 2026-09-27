@@ -32,6 +32,36 @@ Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
 Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
 
+# Bundle the pinned official OpenAI Secure MCP Tunnel client so the
+# Windows package is immediately usable without another tool download.
+$TunnelClientVersion = "0.0.15"
+$TunnelClientZip = Join-Path $Stage "tmp\tunnel-client-v$TunnelClientVersion-windows-amd64.zip"
+$TunnelClientExtract = Join-Path $Stage "tmp\tunnel-client"
+$TunnelClientUrl = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion/tunnel-client-v$TunnelClientVersion-windows-amd64.zip"
+$TunnelClientZipSha256 = "3b53133a1e24d43f63088d843860cb1701a4c3ed6390de2e19f69089e43bddc1"
+$TunnelClientLicenseUrl = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion/tunnel-client-v$TunnelClientVersion-windows-amd64-licenses.txt"
+$TunnelClientLicenseSha256 = "9b9132caf4971379fa24dae57ca75a9f2ec5571dc8b2a90e7fab71c791b42c17"
+
+New-Item -ItemType Directory -Force -Path (Split-Path $TunnelClientZip -Parent) | Out-Null
+Invoke-WebRequest -UseBasicParsing -Uri $TunnelClientUrl -OutFile $TunnelClientZip
+$TunnelClientActualHash = (Get-FileHash -Algorithm SHA256 $TunnelClientZip).Hash.ToLowerInvariant()
+if ($TunnelClientActualHash -ne $TunnelClientZipSha256) {
+    throw "OpenAI tunnel-client archive SHA256 mismatch"
+}
+Expand-Archive -Path $TunnelClientZip -DestinationPath $TunnelClientExtract -Force
+$TunnelClientExe = Get-ChildItem -Path $TunnelClientExtract -Filter "tunnel-client.exe" -File -Recurse | Select-Object -First 1
+if ($null -eq $TunnelClientExe) {
+    throw "Official OpenAI tunnel-client archive did not contain tunnel-client.exe"
+}
+Copy-Item -Force $TunnelClientExe.FullName (Join-Path $Stage "tunnel-client.exe")
+Invoke-WebRequest -UseBasicParsing -Uri $TunnelClientLicenseUrl -OutFile (Join-Path $Stage "TUNNEL_CLIENT_LICENSES.txt")
+$TunnelClientLicenseActualHash = (Get-FileHash -Algorithm SHA256 (Join-Path $Stage "TUNNEL_CLIENT_LICENSES.txt")).Hash.ToLowerInvariant()
+if ($TunnelClientLicenseActualHash -ne $TunnelClientLicenseSha256) {
+    throw "OpenAI tunnel-client license SHA256 mismatch"
+}
+Remove-Item -Recurse -Force $TunnelClientExtract -ErrorAction SilentlyContinue
+Remove-Item -Force $TunnelClientZip -ErrorAction SilentlyContinue
+
 # Bundle an official embeddable Python runtime plus all migration dependencies
 # so helper tools do not use a machine-wide Python installation.
 $PythonVersion = "3.12.10"
@@ -179,6 +209,8 @@ Set-Location $Root
 
 $RequiredFiles = @(
     "server.exe",
+    "tunnel-client.exe",
+    "TUNNEL_CLIENT_LICENSES.txt",
     "portable-env.ps1",
     "start-local.ps1",
     "run-tool.ps1",

@@ -18,7 +18,7 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v1-20260927";
+pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v2-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;

@@ -59,6 +59,24 @@ $TunnelClientLicenseActualHash = (Get-FileHash -Algorithm SHA256 (Join-Path $Sta
 if ($TunnelClientLicenseActualHash -ne $TunnelClientLicenseSha256) {
     throw "OpenAI tunnel-client license SHA256 mismatch"
 }
+$TunnelHelp = & (Join-Path $Stage "tunnel-client.exe") run --help 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Bundled OpenAI tunnel-client run --help failed with exit code $LASTEXITCODE"
+}
+$TunnelHelpText = $TunnelHelp -join "`n"
+foreach ($RequiredFlag in @(
+    "--control-plane.tunnel-id",
+    "--mcp.server-url",
+    "--mcp.extra-headers",
+    "--mcp.discovery-extra-headers",
+    "--health.listen-addr"
+)) {
+    if ($TunnelHelpText -notmatch [Regex]::Escape($RequiredFlag)) {
+        throw "Bundled OpenAI tunnel-client does not expose required flag: $RequiredFlag"
+    }
+}
+$TunnelHelp | Set-Content -Encoding UTF8 (Join-Path $Stage "TUNNEL_CLIENT_RUN_HELP.txt")
+
 Remove-Item -Recurse -Force $TunnelClientExtract -ErrorAction SilentlyContinue
 Remove-Item -Force $TunnelClientZip -ErrorAction SilentlyContinue
 
@@ -211,6 +229,7 @@ $RequiredFiles = @(
     "server.exe",
     "tunnel-client.exe",
     "TUNNEL_CLIENT_LICENSES.txt",
+    "TUNNEL_CLIENT_RUN_HELP.txt",
     "portable-env.ps1",
     "start-local.ps1",
     "run-tool.ps1",

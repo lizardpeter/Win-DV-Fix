@@ -1748,6 +1748,30 @@ mod tests {
     }
 
     #[test]
+    fn owner_secret_accepts_secrets_file_values_even_when_runtime_values_differ() {
+        let config = ApiConfig {
+            oauth_owner_secret: Some("runtime-password".to_string()),
+            read_write_token: Some("runtime-api-token".to_string()),
+            oauth_owner_secret_fallbacks: vec![
+                "file-password".to_string(),
+                "file-api-token".to_string(),
+            ],
+            ..ApiConfig::default()
+        };
+
+        assert!(owner_secret_matches(&config, "file-password"));
+        assert!(owner_secret_matches(
+            &config,
+            "FALKORDB_API_TOKEN=file-api-token"
+        ));
+        assert!(owner_secret_matches(
+            &config,
+            "FALKORDB_PASSWORD=file-password\nFALKORDB_API_TOKEN=file-api-token\n"
+        ));
+        assert!(!owner_secret_matches(&config, "not-in-any-source"));
+    }
+
+    #[test]
     fn tool_list_exposes_full_read_write_admin_surface() {
         let value = tools_list_result(false);
         let names: Vec<&str> = value["tools"]

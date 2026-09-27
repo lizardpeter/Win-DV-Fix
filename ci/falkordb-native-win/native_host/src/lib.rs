@@ -1,6 +1,7 @@
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
 pub mod api;
+pub mod mcp;
 pub mod property_index;
 pub mod range_index;
 pub mod redis_dump;
@@ -17,8 +18,7 @@ use std::{cell::Cell, ffi::c_void, path::Path, sync::Arc, time::{Duration, Insta
 use graph::{
     effects::{
         EffectsBuffer, EffectsPayload,
-        announce::{AnnouncedConstraint, SchemaBaseline},
-    },
+        announce::{AnnouncedConstraint, SchemaBaseline},    },
     entity_type::EntityType,
     graph::{
         constraint::{ConstraintStatus, ConstraintType},

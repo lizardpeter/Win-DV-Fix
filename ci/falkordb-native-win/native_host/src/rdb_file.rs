@@ -260,19 +260,27 @@ fn lzf_decompress(data: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
 }
 
 fn redis_crc64(data: &[u8]) -> u64 {
-    const POLY: u64 = 0xAD93_D235_94C9_35A9;
+    // Redis' CRC64-Jones polynomial in reflected form. A 256-entry table
+    // avoids the old eight branch-heavy bit steps per input byte.
+    const REFLECTED_POLY: u64 = 0x95AC_9329_AC4B_C9B5;
+    let mut table = [0u64; 256];
+    for (index, slot) in table.iter_mut().enumerate() {
+        let mut crc = index as u64;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ REFLECTED_POLY
+            } else {
+                crc >> 1
+            };
+        }
+        *slot = crc;
+    }
+
     let mut crc = 0u64;
     for &byte in data {
-        for mask in [1u8, 2, 4, 8, 16, 32, 64, 128] {
-            let high = (crc & 0x8000_0000_0000_0000) != 0;
-            let bit = (byte & mask) != 0;
-            crc <<= 1;
-            if high ^ bit {
-                crc ^= POLY;
-            }
-        }
+        crc = table[((crc as u8) ^ byte) as usize] ^ (crc >> 8);
     }
-    crc.reverse_bits()
+    crc
 }
 
 fn module_name(module_id: u64) -> String {

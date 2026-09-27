@@ -198,13 +198,9 @@ performance work, including:
 ## OpenAI Secure MCP Tunnel
 
 The native server includes a dedicated private backend for OpenAI Secure MCP
-Tunnel. Enable it with:
-
-```powershell
-$env:FALKORDB_TUNNEL_MCP_BIND = "127.0.0.1:18444"
-```
-
-or `--tunnel-mcp-bind 127.0.0.1:18444`.
+Tunnel. When `FALKORDB_API_TOKEN` is configured, it is enabled automatically at
+`127.0.0.1:18444`. Use `FALKORDB_TUNNEL_MCP_BIND` or
+`--tunnel-mcp-bind` only to override the loopback address.
 
 This backend is loopback-only, plaintext only on the local machine, MCP-only,
 and locally Bearer-protected with `FALKORDB_API_TOKEN`. It does not publish

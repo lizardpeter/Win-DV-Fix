@@ -143,6 +143,21 @@ def oauth_link(ctx):
 
 
 def write_phase(ctx, token_file: Path):
+    status, headers, data = request(
+        ctx,
+        "OPTIONS",
+        "/mcp",
+        headers={
+            "Origin": "https://chatgpt.com",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,mcp-protocol-version,mcp-method,mcp-name",
+        },
+    )
+    assert status == 204, (status, data)
+    assert headers.get("Access-Control-Allow-Origin") == "*", headers
+    assert "POST" in headers.get("Access-Control-Allow-Methods", ""), headers
+    assert "authorization" in headers.get("Access-Control-Allow-Headers", "").lower(), headers
+
     status, _, data = request(ctx, "GET", "/.well-known/oauth-protected-resource")
     assert status == 200, (status, data)
     metadata = json.loads(data)

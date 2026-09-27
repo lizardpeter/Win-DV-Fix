@@ -128,6 +128,7 @@ New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
 $ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
 $ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
 $McpSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_direct_smoke.py"))
+$TunnelSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_tunnel_smoke.py"))
 $McpTokenFile = Join-Path $WorkDir "mcp-oauth-token.txt"
 Remove-Item -Force $McpTokenFile -ErrorAction SilentlyContinue
 $ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
@@ -174,11 +175,13 @@ function Start-NativeServer([string]$Suffix) {
         "--tls-key", (Join-Path $TlsDir "server-key.pem"),
         "--tls-client-ca", (Join-Path $TlsDir "ca.pem"),
         "--api-bind", "127.0.0.1:8443",
+        "--tunnel-mcp-bind", "127.0.0.1:18444",
         "--api-token", "native-api-write-secret",
         "--api-read-token", "native-api-read-secret"
     ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     Wait-NativeServer 6391
     Wait-NativeServer 8443
+    Wait-NativeServer 18444
     return $proc
 }
 
@@ -336,6 +339,16 @@ try {
     $McpWriteText = (Get-Content (Join-Path $Logs "10_mcp_direct_oauth_write.txt") -Raw)
     if ($McpWriteText -notmatch "MCP_DIRECT_OAUTH_WRITE_PASS") {
         throw "Direct MCP OAuth write phase did not emit success marker"
+    }
+
+    python $TunnelSmoke 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_mcp_secure_tunnel_backend.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Secure MCP Tunnel backend smoke failed with exit code $LASTEXITCODE"
+    }
+    $TunnelText = (Get-Content (Join-Path $Logs "10_mcp_secure_tunnel_backend.txt") -Raw)
+    if ($TunnelText -notmatch "MCP_SECURE_TUNNEL_BACKEND_PASS") {
+        throw "Secure MCP Tunnel backend did not emit success marker"
     }
 
     python $ParitySmoke 2>&1 |
@@ -532,6 +545,16 @@ try {
     if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_RESTART_PASS") {
         throw "Direct MCP OAuth token/data did not survive restart"
     }
+
+    python $TunnelSmoke 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_mcp_secure_tunnel_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Secure MCP Tunnel backend restart phase failed with exit code $LASTEXITCODE"
+    }
+    $TunnelRestartText = (Get-Content (Join-Path $Logs "11_mcp_secure_tunnel_restart.txt") -Raw)
+    if ($TunnelRestartText -notmatch "MCP_SECURE_TUNNEL_BACKEND_PASS") {
+        throw "Secure MCP Tunnel backend did not survive restart"
+    }
 } finally {
     if ($null -ne $Server -and -not $Server.HasExited) {
         Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
@@ -544,6 +567,7 @@ Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
 Write-Host "NATIVE_WINDOWS_CHATGPT_MCP_OAUTH_PASS"
+Write-Host "NATIVE_WINDOWS_OPENAI_SECURE_MCP_TUNNEL_PASS"
 Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
 Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
 Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"

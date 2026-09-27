@@ -71,6 +71,18 @@ if (-not (Test-Path $TunnelRuntimeExe)) {
 }
 Write-Host "Embedded OpenAI tunnel runtime: $TunnelRuntimeExe"
 
+$TunnelLicense = Join-Path $WorkDir "openai-tunnel-LICENSE.txt"
+$TunnelNotice = Join-Path $WorkDir "openai-tunnel-NOTICE.txt"
+if (-not (Test-Path $TunnelLicense)) {
+    Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/openai/tunnel-client/v$TunnelClientVersion/LICENSE" -OutFile $TunnelLicense
+}
+if (-not (Test-Path $TunnelNotice)) {
+    Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/openai/tunnel-client/v$TunnelClientVersion/NOTICE" -OutFile $TunnelNotice
+}
+if (-not (Test-Path $TunnelLicense) -or -not (Test-Path $TunnelNotice)) {
+    throw "OpenAI tunnel license/notice staging failed"
+}
+
 $Falkor = Join-Path $Src "FalkorDB"
 if (-not (Test-Path $Falkor)) {
     git clone https://github.com/FalkorDB/FalkorDB.git $Falkor

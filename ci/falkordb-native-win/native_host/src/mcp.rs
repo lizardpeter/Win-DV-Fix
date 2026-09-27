@@ -214,11 +214,11 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
 }
 
 fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
-    if config.read_write_token.is_none() {
+    if config.oauth_owner_secret.is_none() && config.read_write_token.is_none() {
         return oauth_error(
             503,
             "temporarily_unavailable",
-            "OAuth linking requires a configured read/write API token",
+            "OAuth linking requires a configured owner secret",
         );
     }
 
@@ -254,14 +254,14 @@ code{{word-break:break-word}}
 <h1>Authorize ChatGPT</h1>
 <p>Grant ChatGPT direct access to this FalkorDB server with these scopes:</p>
 <p><code>{scope_display}</code></p>
-<p>Enter the existing <strong>FALKORDB_API_TOKEN</strong> from your local <code>falkordb-secrets.txt</code>. It is sent only to this server over HTTPS and is not returned to ChatGPT.</p>
+<p>Enter your FalkorDB <strong>owner secret</strong>. You may use the RESP server password or the existing <strong>FALKORDB_API_TOKEN</strong>. You may paste either the raw value or the full <code>NAME=value</code> line from <code>falkordb-secrets.txt</code>.</p>
 <form method="post" action="/oauth/authorize">
 {hidden}
-<label for="api_token">FalkorDB API token</label>
-<input id="api_token" name="api_token" type="password" autocomplete="current-password" required autofocus>
+<label for="owner_secret">FalkorDB owner secret</label>
+<input id="owner_secret" name="owner_secret" type="password" autocomplete="current-password" required autofocus>
 <button type="submit">Authorize ChatGPT</button>
 </form>
-<p class="small">The issued ChatGPT token is revocable by rotating FALKORDB_API_TOKEN.</p>
+<p class="small">The owner secret is sent only to this server over HTTPS and is never returned to ChatGPT.</p>
 </div>
 </body>
 </html>"#,
@@ -277,13 +277,13 @@ code{{word-break:break-word}}
 }
 
 fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
-    let Some(expected_api_token) = config.read_write_token.as_deref() else {
+    if config.oauth_owner_secret.is_none() && config.read_write_token.is_none() {
         return oauth_error(
             503,
             "temporarily_unavailable",
-            "OAuth linking requires a configured read/write API token",
+            "OAuth linking requires a configured owner secret",
         );
-    };
+    }
     let Some(base) = request_base(request, config) else {
         return oauth_error(400, "invalid_request", "missing or invalid Host header");
     };
@@ -298,12 +298,17 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         Err(message) => return oauth_error(400, "invalid_request", &message),
     };
 
-    let supplied = params.get("api_token").map_or("", String::as_str);
-    if !constant_time_eq(expected_api_token, supplied) {
+    // Accept the new owner_secret field and the old api_token field so a
+    // browser page opened by a previous build can still complete after restart.
+    let supplied = params
+        .get("owner_secret")
+        .or_else(|| params.get("api_token"))
+        .map_or("", String::as_str);
+    if !owner_secret_matches(config, supplied) {
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
-            b"<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB API token was not accepted. Close this page and try linking again.</p>".to_vec(),
+            b"<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted. Use the RESP server password or FALKORDB_API_TOKEN from falkordb-secrets.txt.</p>".to_vec(),
         );
         response.headers.push((
             "Content-Security-Policy".to_string(),
@@ -346,6 +351,53 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     let mut response = raw_response(302, "text/plain; charset=utf-8", Vec::new());
     response.headers.push(("Location".to_string(), location));
     response
+}
+
+fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
+    let supplied = normalize_owner_secret(supplied);
+    if supplied.is_empty() {
+        return false;
+    }
+
+    config
+        .oauth_owner_secret
+        .as_deref()
+        .is_some_and(|expected| constant_time_eq(expected, &supplied))
+        || config
+            .read_write_token
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(expected, &supplied))
+}
+
+fn normalize_owner_secret(input: &str) -> String {
+    let trimmed = input.trim();
+    let candidate = if let Some((name, value)) = trimmed.split_once('=') {
+        let mut key = name.trim();
+        if let Some(rest) = key.strip_prefix("set ") {
+            key = rest.trim();
+        }
+        if let Some(rest) = key.strip_prefix("$env:") {
+            key = rest.trim();
+        }
+        if matches!(key, "FALKORDB_PASSWORD" | "FALKORDB_API_TOKEN") {
+            value.trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    if candidate.len() >= 2 {
+        let bytes = candidate.as_bytes();
+        if (bytes[0] == b'"' && bytes[candidate.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[candidate.len() - 1] == b'\'')
+        {
+            return candidate[1..candidate.len() - 1].to_string();
+        }
+    }
+
+    candidate.to_string()
 }
 
 fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
@@ -1621,6 +1673,31 @@ mod tests {
             "https://chatgpt.com/connector/oauth/callback123"
         ));
         assert!(!allowed_chatgpt_redirect("https://evil.example/callback"));
+    }
+
+    #[test]
+    fn owner_secret_accepts_password_token_and_secret_file_lines() {
+        let config = ApiConfig {
+            oauth_owner_secret: Some("server-password".to_string()),
+            read_write_token: Some("api-token-value".to_string()),
+            ..ApiConfig::default()
+        };
+
+        assert!(owner_secret_matches(&config, "server-password"));
+        assert!(owner_secret_matches(&config, "api-token-value"));
+        assert!(owner_secret_matches(
+            &config,
+            "FALKORDB_API_TOKEN=api-token-value"
+        ));
+        assert!(owner_secret_matches(
+            &config,
+            "FALKORDB_PASSWORD=\"server-password\""
+        ));
+        assert!(owner_secret_matches(
+            &config,
+            "$env:FALKORDB_API_TOKEN='api-token-value'"
+        ));
+        assert!(!owner_secret_matches(&config, "wrong-secret"));
     }
 
     #[test]

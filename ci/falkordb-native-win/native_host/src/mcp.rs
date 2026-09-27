@@ -1073,6 +1073,7 @@ fn call_tool(
                         "sha256": report.sha256,
                         "dry_run": report.dry_run,
                         "udf_count": report.udf_count,
+                        "ignored_aux_keys": report.ignored_aux_keys,
                         "graphs": report.graphs.into_iter().map(|graph| {
                             json!({
                                 "graph": graph.graph,

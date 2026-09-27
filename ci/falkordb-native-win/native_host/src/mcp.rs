@@ -214,7 +214,10 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
 }
 
 fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
-    if config.oauth_owner_secret.is_none() && config.read_write_token.is_none() {
+    if config.oauth_owner_secret.is_none()
+        && config.read_write_token.is_none()
+        && config.oauth_owner_secret_fallbacks.is_empty()
+    {
         return oauth_error(
             503,
             "temporarily_unavailable",
@@ -277,7 +280,10 @@ code{{word-break:break-word}}
 }
 
 fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
-    if config.oauth_owner_secret.is_none() && config.read_write_token.is_none() {
+    if config.oauth_owner_secret.is_none()
+        && config.read_write_token.is_none()
+        && config.oauth_owner_secret_fallbacks.is_empty()
+    {
         return oauth_error(
             503,
             "temporarily_unavailable",
@@ -308,7 +314,12 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
-            b"<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted. Use the RESP server password or FALKORDB_API_TOKEN from falkordb-secrets.txt.</p>".to_vec(),
+            format!(
+                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted.</p><p>This server currently has <strong>{}</strong> distinct owner credential source(s) available for OAuth. You may paste the raw password/token, a complete FALKORDB_PASSWORD=... or FALKORDB_API_TOKEN=... line, or the complete falkordb-secrets.txt contents.</p>",
+                usize::from(config.oauth_owner_secret.is_some())
+                    + usize::from(config.read_write_token.is_some())
+                    + config.oauth_owner_secret_fallbacks.len()
+            ).into_bytes(),
         );
         response.headers.push((
             "Content-Security-Policy".to_string(),
@@ -354,50 +365,86 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
 }
 
 fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
-    let supplied = normalize_owner_secret(supplied);
-    if supplied.is_empty() {
+    let candidates = normalize_owner_secret_candidates(supplied);
+    if candidates.is_empty() {
         return false;
     }
+
+    let matches_expected = |expected: &str| {
+        candidates
+            .iter()
+            .any(|candidate| constant_time_eq(expected, candidate))
+    };
 
     config
         .oauth_owner_secret
         .as_deref()
-        .is_some_and(|expected| constant_time_eq(expected, &supplied))
+        .is_some_and(matches_expected)
         || config
             .read_write_token
             .as_deref()
-            .is_some_and(|expected| constant_time_eq(expected, &supplied))
+            .is_some_and(matches_expected)
+        || config
+            .oauth_owner_secret_fallbacks
+            .iter()
+            .any(|expected| matches_expected(expected))
 }
 
-fn normalize_owner_secret(input: &str) -> String {
-    let trimmed = input.trim();
-    let candidate = if let Some((name, value)) = trimmed.split_once('=') {
-        let mut key = name.trim();
-        if let Some(rest) = key.strip_prefix("set ") {
-            key = rest.trim();
+fn normalize_owner_secret_candidates(input: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    let mut push_candidate = |value: &str| {
+        let value = unquote_owner_secret(value.trim());
+        if !value.is_empty() && !candidates.iter().any(|existing| existing == &value) {
+            candidates.push(value);
         }
-        if let Some(rest) = key.strip_prefix("$env:") {
-            key = rest.trim();
-        }
-        if matches!(key, "FALKORDB_PASSWORD" | "FALKORDB_API_TOKEN") {
-            value.trim()
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
     };
 
-    if candidate.len() >= 2 {
-        let bytes = candidate.as_bytes();
-        if (bytes[0] == b'"' && bytes[candidate.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[candidate.len() - 1] == b'\'')
-        {
-            return candidate[1..candidate.len() - 1].to_string();
-        }
+    // Accept a raw secret, a full NAME=value assignment, or even the complete
+    // two-line falkordb-secrets.txt contents pasted into the form.
+    let trimmed = input.trim();
+    if !trimmed.contains('\n') && !trimmed.contains('\r') {
+        push_candidate(trimmed);
     }
 
-    candidate.to_string()
+    for line in input.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if let Some((name, value)) = line.split_once('=') {
+            let mut key = name.trim();
+            if let Some(rest) = key.strip_prefix("set ") {
+                key = rest.trim();
+            }
+            if let Some(rest) = key.strip_prefix("$env:") {
+                key = rest.trim();
+            }
+            if key.eq_ignore_ascii_case("FALKORDB_PASSWORD")
+                || key.eq_ignore_ascii_case("FALKORDB_API_TOKEN")
+            {
+                push_candidate(value);
+                continue;
+            }
+        }
+
+        push_candidate(line);
+    }
+
+    candidates
+}
+
+fn unquote_owner_secret(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {

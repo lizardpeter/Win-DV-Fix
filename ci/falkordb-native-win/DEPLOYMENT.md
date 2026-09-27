@@ -208,43 +208,32 @@ whose WAL reaches the configured threshold (256 MiB by default):
 Set `FALKORDB_CHECKPOINT_WAL_MB` or pass `--checkpoint-wal-mb` to change the
 threshold.
 
-## OpenAI Secure MCP Tunnel
+## OpenAI Secure MCP Tunnel — one executable
 
-For ChatGPT developer-mode access without exposing the MCP server publicly,
-enable the dedicated loopback backend and run the bundled OpenAI tunnel client.
+The Windows `server.exe` now contains the official OpenAI
+`tunnel-client-runtime` bytes inside the executable. There is no second
+runtime EXE or PowerShell launcher to manage.
 
-Start the database with the private MCP backend enabled:
+When `FALKORDB_API_TOKEN` is configured, `server.exe` automatically starts
+the protected loopback MCP backend at `127.0.0.1:18444`. If OpenAI tunnel
+credentials are not already present and the process is attached to a console,
+the first interactive launch asks once for:
 
-```powershell
-# With FALKORDB_API_TOKEN configured, server.exe enables the protected
-# loopback backend automatically on 127.0.0.1:18444.
-# FALKORDB_TUNNEL_MCP_BIND can override that loopback address if needed.
-.\server.exe <your normal server arguments>
-```
+- the OpenAI tunnel ID
+- the OpenAI runtime API key
 
-The listener is deliberately restricted to loopback, exposes only `/mcp` and
-`/healthz`, suppresses OAuth discovery, and requires the existing read/write
-API Bearer token on the local hop. Its tool descriptors advertise `noauth` to
-ChatGPT because `tunnel-client` injects that private backend token locally.
+Those values are added to the existing `falkordb-secrets.txt` beside
+`server.exe` as `OPENAI_TUNNEL_ID` and `OPENAI_TUNNEL_API_KEY`. On every
+later launch, the same `server.exe` starts both FalkorDB and the embedded
+OpenAI tunnel runtime automatically.
 
-Create an MCP tunnel in OpenAI Platform tunnel settings, then set the two
-runtime values supplied/selected there:
+The embedded runtime receives the OpenAI runtime API key only through its
+process environment. The existing FalkorDB API token is injected only on the
+local `tunnel-client -> 127.0.0.1:18444` hop. Port 18444 remains loopback-only
+and must never be forwarded through the router.
 
-```powershell
-$env:CONTROL_PLANE_TUNNEL_ID = "tunnel_..."
-$env:CONTROL_PLANE_API_KEY = "sk-..."
-.\start-openai-tunnel.ps1
-```
-
-The launcher reads `FALKORDB_API_TOKEN` from the environment or
-`falkordb-secrets.txt`, keeps it out of the OpenAI control-plane connection,
-and injects it only on the `tunnel-client -> 127.0.0.1:18444` hop. The bundled
-`tunnel-client.exe` is the pinned official OpenAI Windows x64 release verified
-by SHA-256 during packaging.
-
-In ChatGPT developer mode, create the app using **Connection -> Tunnel** and
-select the same tunnel (or paste its `tunnel_id`). No browser OAuth link to the
-FalkorDB server is required for this tunnel-backed app.
+To disable automatic tunnel startup for maintenance, set
+`FALKORDB_DISABLE_OPENAI_TUNNEL=1`.
 
 ## ChatGPT HTTPS API
 

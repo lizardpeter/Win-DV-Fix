@@ -643,6 +643,29 @@ fn main() -> Result<(), String> {
                 config.bind.set_port(port);
             }
             "--portable" => {}
+            "--embedded-tunnel-runtime-version" => {
+                #[cfg(windows)]
+                {
+                    let runtime = materialize_embedded_tunnel_runtime()?;
+                    let output = Command::new(&runtime)
+                        .arg("--version")
+                        .output()
+                        .map_err(|e| format!("run embedded OpenAI tunnel runtime --version: {e}"))?;
+                    if !output.status.success() {
+                        return Err(format!(
+                            "embedded OpenAI tunnel runtime --version failed with {}",
+                            output.status
+                        ));
+                    }
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    return Ok(());
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err("embedded tunnel runtime is available only on Windows".to_string());
+                }
+            }
             "--data-dir" => {
                 let value = args.next().ok_or_else(|| "--data-dir requires a path".to_string())?;
                 config.data_dir = if let Some(root) = &portable_root {
@@ -739,6 +762,9 @@ USAGE:
 
 PORTABLE OPTIONS:
   --portable                       Keep runtime state under the server.exe folder.
+  --embedded-tunnel-runtime-version
+                                   Print the version of the OpenAI tunnel runtime
+                                   embedded inside this server.exe and exit.
                                    Relative data/TLS paths are rooted there and
                                    external/parent paths are rejected.
                                    Env: FALKORDB_PORTABLE=1

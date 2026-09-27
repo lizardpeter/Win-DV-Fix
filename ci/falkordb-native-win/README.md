@@ -197,21 +197,21 @@ performance work, including:
 
 ## OpenAI Secure MCP Tunnel
 
-The native server includes a dedicated private backend for OpenAI Secure MCP
-Tunnel. When `FALKORDB_API_TOKEN` is configured, it is enabled automatically at
-`127.0.0.1:18444`. Use `FALKORDB_TUNNEL_MCP_BIND` or
-`--tunnel-mcp-bind` only to override the loopback address.
+The Windows release is a **single-executable ChatGPT tunnel deployment**.
+`server.exe` embeds the pinned official OpenAI tunnel runtime and supervises it
+as a child process. The child is placed in a Windows Job Object with
+kill-on-close semantics so closing the database process also tears down the
+embedded tunnel process tree.
 
-This backend is loopback-only, plaintext only on the local machine, MCP-only,
-and locally Bearer-protected with `FALKORDB_API_TOKEN`. It does not publish
-OAuth metadata. ChatGPT sees `noauth` tool descriptors while the bundled
-official `tunnel-client.exe` injects the backend token only on the local hop.
+With `FALKORDB_API_TOKEN` configured, the private MCP backend is enabled
+automatically on `127.0.0.1:18444`. The first interactive run prompts once for
+the OpenAI tunnel ID and runtime API key if they are missing, saves them in the
+existing local secrets file, and then launches the tunnel automatically.
+Subsequent operation is just launching `server.exe`.
 
-The portable package includes `start-openai-tunnel.ps1`; after creating a
-Tunnel in OpenAI Platform, set `CONTROL_PLANE_TUNNEL_ID` and
-`CONTROL_PLANE_API_KEY`, then run that script. The Windows CI verifies tool
-discovery, no-OAuth descriptors, rejection without the private local token,
-authenticated graph write/read, and a hard database-server restart.
+CI verifies the private MCP backend, authenticated graph write/read, restart
+behavior, the presence/version of the embedded OpenAI runtime, and the final
+single-file Windows artifact.
 
 ## ChatGPT HTTPS API
 

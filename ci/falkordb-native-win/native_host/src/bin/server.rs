@@ -294,6 +294,13 @@ fn main() -> Result<(), String> {
                 .map_err(|e| format!("invalid FALKORDB_API_BIND {v:?}: {e}"))
         })
         .transpose()?;
+    let mut tunnel_mcp_bind: Option<SocketAddr> = env::var("FALKORDB_TUNNEL_MCP_BIND")
+        .ok()
+        .map(|v| {
+            v.parse::<SocketAddr>()
+                .map_err(|e| format!("invalid FALKORDB_TUNNEL_MCP_BIND {v:?}: {e}"))
+        })
+        .transpose()?;
     let mut api_token = env::var("FALKORDB_API_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
@@ -387,6 +394,16 @@ fn main() -> Result<(), String> {
                         .map_err(|e| format!("invalid --api-bind {value:?}: {e}"))?,
                 );
             }
+            "--tunnel-mcp-bind" => {
+                let value = args.next().ok_or_else(|| "--tunnel-mcp-bind requires HOST:PORT".to_string())?;
+                let bind = value
+                    .parse::<SocketAddr>()
+                    .map_err(|e| format!("invalid --tunnel-mcp-bind {value:?}: {e}"))?;
+                if !bind.ip().is_loopback() {
+                    return Err("--tunnel-mcp-bind must use a loopback address".to_string());
+                }
+                tunnel_mcp_bind = Some(bind);
+            }
             "--api-token" => {
                 api_token = Some(
                     args.next()
@@ -447,6 +464,12 @@ CHATGPT HTTPS API OPTIONS:
   --api-read-token TOKEN           Optional read-only Bearer token
                                    OAuth owner approval accepts the RESP password
                                    and, for compatibility, the read/write API token.
+  --tunnel-mcp-bind HOST:PORT      Enable a loopback-only, MCP-only plaintext
+                                   backend for OpenAI Secure MCP Tunnel.
+                                   Example: 127.0.0.1:18444
+                                   Env: FALKORDB_TUNNEL_MCP_BIND
+                                   Requires FALKORDB_API_TOKEN; tunnel-client
+                                   injects it only on the local backend hop.
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
                                    Permit non-loopback API without Bearer auth
@@ -505,6 +528,42 @@ including a ChatGPT custom integration.
         });
     }
 
+    if let Some(bind) = tunnel_mcp_bind {
+        if !bind.ip().is_loopback() {
+            return Err("Secure MCP Tunnel backend must bind to loopback only".to_string());
+        }
+        let Some(local_token) = api_token.clone() else {
+            return Err(
+                "Secure MCP Tunnel backend requires FALKORDB_API_TOKEN/--api-token for the local tunnel-client hop"
+                    .to_string(),
+            );
+        };
+
+        let tunnel_config = ApiConfig {
+            bind,
+            read_write_token: Some(local_token),
+            read_only_token: None,
+            oauth_owner_secret: None,
+            oauth_owner_secret_fallbacks: Vec::new(),
+            oauth_pairing_code: None,
+            allow_unauthenticated_remote: false,
+            allow_plaintext_remote: false,
+            tunnel_mode: true,
+            tls: None,
+        };
+        tunnel_config.validate()?;
+
+        eprintln!(
+            "FalkorDB Secure MCP Tunnel backend listening on http://{bind}/mcp (loopback-only, local Bearer protected)"
+        );
+        let tunnel_catalog = Arc::clone(&catalog);
+        thread::spawn(move || {
+            if let Err(err) = serve_api(tunnel_config, tunnel_catalog) {
+                eprintln!("Secure MCP Tunnel backend stopped: {err}");
+            }
+        });
+    }
+
     if let Some(bind) = api_bind {
         let mut oauth_owner_secret_fallbacks = Vec::new();
         for candidate in [
@@ -538,13 +597,14 @@ including a ChatGPT custom integration.
 
         let api_config = ApiConfig {
             bind,
-            read_write_token: api_token,
-            read_only_token: api_read_token,
+            read_write_token: api_token.clone(),
+            read_only_token: api_read_token.clone(),
             oauth_owner_secret: config.password.clone(),
             oauth_owner_secret_fallbacks,
             oauth_pairing_code: Some(oauth_pairing_code),
             allow_unauthenticated_remote: api_allow_unauthenticated_remote,
             allow_plaintext_remote: api_allow_plaintext_remote,
+            tunnel_mode: false,
             tls: shared_tls.as_ref().map(|(cert_path, key_path)| TlsConfig {
                 cert_path: cert_path.clone(),
                 key_path: key_path.clone(),

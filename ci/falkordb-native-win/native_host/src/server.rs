@@ -1717,9 +1717,11 @@ fn graph_query_count(graph: &NativeGraph, cypher: &str) -> Result<u64, String> {
         .first()
         .and_then(|row| row.first())
         .ok_or_else(|| format!("count query returned no value: {cypher}"))?;
-    value
-        .parse::<u64>()
-        .map_err(|e| format!("count query returned non-integer {value:?}: {e}"))
+    match value {
+        WireValue::Int(v) if *v >= 0 => Ok(*v as u64),
+        WireValue::Int(v) => Err(format!("count query returned negative integer {v}: {cypher}")),
+        other => Err(format!("count query returned non-integer {other:?}: {cypher}")),
+    }
 }
 
 

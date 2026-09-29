@@ -172,8 +172,23 @@ def write_phase(ctx, token_file: Path):
 
     discover = rpc(ctx, "server/discover")
     assert "2026-07-28" in discover["supportedVersions"]
+    assert "urn:ure:ontology:universal-game-re:v1" in discover["instructions"]
+    assert "USES_ONTOLOGY" in discover["instructions"]
+    assert "HAS_INVARIANT" in discover["instructions"]
+    assert "Family -> Variant -> Occurrence" in discover["instructions"]
+    assert "R2 all.txt" in discover["instructions"]
 
-    tools = rpc(ctx, "tools/list", request_id=2)
+    initialized = rpc(
+        ctx,
+        "initialize",
+        {"protocolVersion": "2026-07-28", "clientInfo": {"name": "mcp-ci", "version": "1"}},
+        request_id=2,
+    )
+    assert initialized["protocolVersion"] == "2026-07-28"
+    assert "urn:ure:ontology:universal-game-re:v1" in initialized["instructions"]
+    assert "reconstructed per-function/per-unit source text" in initialized["instructions"]
+
+    tools = rpc(ctx, "tools/list", request_id=3)
     names = {tool["name"] for tool in tools["tools"]}
     for required in {
         "list_graphs",
@@ -194,7 +209,7 @@ def write_phase(ctx, token_file: Path):
         ctx,
         "tools/call",
         {"name": "list_graphs", "arguments": {}},
-        request_id=3,
+        request_id=4,
     )
     assert unauth["isError"] is True
     assert "mcp/www_authenticate" in unauth["_meta"]

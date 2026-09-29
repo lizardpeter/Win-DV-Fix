@@ -25,6 +25,7 @@ const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const AUTH_CODE_TTL_SECS: u64 = 10 * 60;
 const MAX_MCP_BATCH_QUERIES: usize = 100;
+const UREGRAPH_AGENT_INSTRUCTIONS: &str = "Direct access to the user's native FalkorDB graph server. For game reverse-engineering in the named graph uregraph, bootstrap before substantive work: start from the target Project, follow USES_ONTOLOGY to urn:ure:ontology:universal-game-re:v1, and read its HAS_INVARIANT, HAS_EXTENSION_POLICY, HAS_PARTITION_POLICY, HAS_SERVER_GRAPH_POLICY, HAS_ADAPTER_CONTRACT, and HAS_AUDIT nodes plus the target Build/current work/evidence. Treat that ontology as authoritative for schema and workflow. Preserve Family -> Variant -> Occurrence separation; scope addresses/offsets to exact builds and artifacts; never merge by name/address alone; keep evidence/representations distinct from accepted assertions; preserve rejected/superseded hypotheses; append immutable Representation revisions; reconstructed per-function/per-unit source text is stored literally on its Representation revision in uregraph, with Git/R2 only as mirrors/provenance. Use graph-native work/lease/fencing rules when instantiated so concurrent agents do not duplicate or overwrite work. Large original binaries/assets remain in R2/CAS; use the R2 all.txt inventory and established GitHub Actions/CDN retrieval bridge when bytes are not locally mounted. Local absence is not file inaccessibility. Other named graphs such as medgraph and neurosurgery are isolated domains and must not inherit UREGraph ontology unless explicitly bridged. Use read tools for inspection; use write/admin tools only for requested mutations, and write validated RE findings back to uregraph with provenance.";
 
 const SCOPE_READ: &str = "graph:read";
 const SCOPE_WRITE: &str = "graph:write";
@@ -920,7 +921,7 @@ fn server_discover_result() -> JsonValue {
         "capabilities": {
             "tools": {"listChanged": false}
         },
-        "instructions": "Direct access to the user's native FalkorDB graph server. Use read tools for inspection. Use write/admin tools when the user asks to create, update, import, checkpoint, copy, restore, or delete graph data.",
+        "instructions": UREGRAPH_AGENT_INSTRUCTIONS,
         "ttlMs": 60000,
         "cacheScope": "private",
         "resultType": "complete",
@@ -944,9 +945,9 @@ fn initialize_result(params: &JsonValue) -> JsonValue {
         },
         "serverInfo": {
             "name": "falkordb-native-windows",
-            "version": "0.4.0"
+            "version": "0.4.1"
         },
-        "instructions": "Direct read/write/admin access to the native FalkorDB graph server."
+        "instructions": UREGRAPH_AGENT_INSTRUCTIONS
     })
 }
 

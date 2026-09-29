@@ -1713,7 +1713,7 @@ fn require_arity(args: &[Vec<u8>], expected: usize) -> Result<(), String> {
 fn graph_query_count(graph: &NativeGraph, cypher: &str) -> Result<u64, String> {
     let output = graph.query_read_only(cypher)?;
     let value = output
-        .rows
+        .wire_rows
         .first()
         .and_then(|row| row.first())
         .ok_or_else(|| format!("count query returned no value: {cypher}"))?;

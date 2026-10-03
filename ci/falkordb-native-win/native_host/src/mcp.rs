@@ -2226,7 +2226,7 @@ mod tests {
 
     #[test]
     fn tool_list_exposes_full_read_write_admin_surface() {
-        let value = tools_list_result(false);
+        let value = tools_list_result(false, false);
         let names: Vec<&str> = value["tools"]
             .as_array()
             .unwrap()

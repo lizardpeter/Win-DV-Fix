@@ -33,7 +33,12 @@ jobs:
           curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/h2 -o /tmp/app "https://$HOST/dashboard/app.js?probe=$TS" || echo "curl app exit=$?"
           cat /tmp/h2 2>/dev/null || true
           grep -E 'X-FalkorDB-Dashboard-Authorization|Authorization|authMode|viewerPassword|tokenInput' /tmp/app 2>/dev/null | head -30 || true
-          echo "=== OVERVIEW NO AUTH ==="
-          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/h3 -o /tmp/overview "https://$HOST/v1/overview?probe=$TS" || echo "curl overview exit=$?"
-          cat /tmp/h3 2>/dev/null || true
-          cat /tmp/overview 2>/dev/null || true
+          echo "=== AUTH STATUS ==="
+          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/ha -o /tmp/authstatus "https://$HOST/dashboard/auth-status?probe=$TS" || echo "curl auth-status exit=$?"
+          cat /tmp/ha 2>/dev/null || true
+          cat /tmp/authstatus 2>/dev/null || true
+          echo
+          echo "=== DASHBOARD BODY-AUTH BAD CREDS (EXPECTED 401) ==="
+          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/hb -o /tmp/bodyauth -H 'Content-Type: application/json' --data '{"viewer_username":"viewer","viewer_password":"__definitely_wrong__","api_token":""}' "https://$HOST/dashboard/overview?probe=$TS" || echo "curl bodyauth exit=$?"
+          cat /tmp/hb 2>/dev/null || true
+          cat /tmp/bodyauth 2>/dev/null || true

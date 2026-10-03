@@ -19,7 +19,7 @@ use crate::{
 };
 
 const PROTOCOL_MODERN: &str = "2026-07-28";
-pub const OAUTH_BUILD_ID: &str = "oauth-tunnel-metadata-v5-20261003";
+pub const OAUTH_BUILD_ID: &str = "oauth-claude-csp-v6-20261003";
 const SERVER_VERSION: &str = "0.5.0";
 pub const TOOLSET_VERSION: &str = "2026-10-01.4";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
@@ -207,11 +207,6 @@ fn protected_resource_metadata(request: &HttpRequest, config: &ApiConfig) -> Htt
     };
 
     if config.tunnel_mode {
-        // The embedded Secure MCP Tunnel authenticates the loopback hop with
-        // an injected Bearer header. From the tunnel runtime's perspective the
-        // target does not expose an end-user OAuth authorization server, but it
-        // still performs RFC 9728 protected-resource discovery at startup and
-        // requires the mandatory "resource" field.
         return json_response(
             200,
             json!({
@@ -318,9 +313,13 @@ code{{word-break:break-word}}
     );
 
     let mut response = raw_response(200, "text/html; charset=utf-8", html.into_bytes());
+    let redirect_source = oauth_redirect_csp_source(&validated.redirect_uri)
+        .unwrap_or_else(|| "'self'".to_string());
     response.headers.push((
         "Content-Security-Policy".to_string(),
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'".to_string(),
+        format!(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {redirect_source}; base-uri 'none'; frame-ancestors 'none'"
+        ),
     ));
     response
 }
@@ -782,6 +781,25 @@ fn validate_authorize_params(
         resource: resource.to_string(),
         scope: canonical_scope(scope),
     })
+}
+
+fn oauth_redirect_csp_source(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    if !matches!(scheme, "https" | "http") {
+        return None;
+    }
+    let authority_end = rest
+        .find(|ch: char| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty()
+        || !authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+    {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn allowed_mcp_client_id(client_id: &str) -> bool {
@@ -2169,29 +2187,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tunnel_mode_exposes_valid_protected_resource_metadata() {
+    fn claude_web_consent_csp_allows_validated_callback_redirect() {
         let config = ApiConfig {
-            tunnel_mode: true,
-            read_write_token: Some("local-hop-secret".to_string()),
+            oauth_pairing_code: Some("PAIR-123".to_string()),
+            read_write_token: Some("api-token".to_string()),
             ..ApiConfig::default()
         };
+        let query = [
+            ("response_type", "code"),
+            ("client_id", CLAUDE_WEB_CLIENT_ID),
+            ("redirect_uri", CLAUDE_WEB_REDIRECT_URI),
+            ("state", "state-123"),
+            ("code_challenge", "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"),
+            ("code_challenge_method", "S256"),
+            ("resource", "https://db.example.test/mcp"),
+            ("scope", ALL_SCOPES),
+        ]
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
         let mut headers = HashMap::new();
-        headers.insert("host".to_string(), "127.0.0.1:18444".to_string());
+        headers.insert("host".to_string(), "db.example.test".to_string());
         let request = HttpRequest {
             method: "GET".to_string(),
-            target: "/.well-known/oauth-protected-resource/mcp".to_string(),
+            target: format!("/oauth/authorize?{query}"),
             headers,
             body: Vec::new(),
         };
 
-        let response = protected_resource_metadata(&request, &config);
+        let response = oauth_authorize_get(&request, &config);
         assert_eq!(response.status, 200);
-        let body: JsonValue = serde_json::from_slice(&response.body).expect("metadata JSON");
-        assert_eq!(
-            body["resource"],
-            JsonValue::String("http://127.0.0.1:18444/mcp".to_string())
+        let csp = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Content-Security-Policy")
+            .map(|(_, value)| value.as_str())
+            .expect("consent CSP");
+        assert!(
+            csp.contains("form-action 'self' https://claude.ai"),
+            "unexpected CSP: {csp}"
         );
-        assert!(body.get("authorization_servers").is_none());
+    }
+
+    #[test]
+    fn claude_web_authorization_redirects_to_hosted_callback() {
+        let config = ApiConfig {
+            oauth_pairing_code: Some("PAIR-123".to_string()),
+            read_write_token: Some("api-token".to_string()),
+            ..ApiConfig::default()
+        };
+        let params = [
+            ("response_type", "code"),
+            ("client_id", CLAUDE_WEB_CLIENT_ID),
+            ("redirect_uri", CLAUDE_WEB_REDIRECT_URI),
+            ("state", "state-123"),
+            ("code_challenge", "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"),
+            ("code_challenge_method", "S256"),
+            ("resource", "https://db.example.test/mcp"),
+            ("scope", ALL_SCOPES),
+            ("owner_secret", "PAIR-123"),
+        ]
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "db.example.test".to_string());
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/oauth/authorize".to_string(),
+            headers,
+            body: params.into_bytes(),
+        };
+
+        let response = oauth_authorize_post(&request, &config);
+        assert_eq!(response.status, 302);
+        let location = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Location")
+            .map(|(_, value)| value.as_str())
+            .expect("OAuth redirect Location");
+        assert!(
+            location.starts_with("https://claude.ai/api/mcp/auth_callback?code="),
+            "unexpected Location: {location}"
+        );
+        assert!(location.contains("&state=state-123"));
     }
 
     #[test]

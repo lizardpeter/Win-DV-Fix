@@ -13,8 +13,10 @@ PORT = 8443
 API_TOKEN = "native-api-write-secret"
 CLIENT_ID = "https://chatgpt.com/oauth/client.json"
 REDIRECT_URI = "https://chatgpt.com/connector_platform_oauth_redirect"
-CLAUDE_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
-CLAUDE_REDIRECT_URI = "http://localhost:43123/callback"
+CLAUDE_WEB_CLIENT_ID = "https://claude.ai/oauth/mcp-oauth-client-metadata"
+CLAUDE_WEB_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
+CLAUDE_CODE_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
+CLAUDE_CODE_REDIRECT_URI = "http://localhost:43123/callback"
 VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
 
@@ -151,6 +153,12 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert metadata["resource"] == f"https://{HOST}:{PORT}/mcp"
     assert "graph:admin" in metadata["scopes_supported"]
 
+    status, _, data = request(ctx, "GET", "/.well-known/oauth-authorization-server")
+    assert status == 200, (status, data)
+    oauth_metadata = json.loads(data)
+    assert oauth_metadata["client_id_metadata_document_supported"] is True
+    assert oauth_metadata["revocation_endpoint"] == f"https://{HOST}:{PORT}/oauth/revoke"
+
     discover = rpc(ctx, "server/discover")
     assert "2026-07-28" in discover["supportedVersions"]
 
@@ -183,10 +191,26 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert unauth["isError"] is True
     assert "mcp/www_authenticate" in unauth["_meta"]
 
+    claude_web_token = oauth_link(
+        ctx,
+        client_id=CLAUDE_WEB_CLIENT_ID,
+        redirect_uri=CLAUDE_WEB_REDIRECT_URI,
+        state="claude-web-ci-state",
+    )
+    claude_web_read = rpc(
+        ctx,
+        "tools/call",
+        {"name": "list_graphs", "arguments": {}},
+        token=claude_web_token,
+        request_id=29,
+    )
+    assert claude_web_read["isError"] is False, claude_web_read
+    print("CLAUDE_WEB_OAUTH_PASS")
+
     claude_token = oauth_link(
         ctx,
-        client_id=CLAUDE_CLIENT_ID,
-        redirect_uri=CLAUDE_REDIRECT_URI,
+        client_id=CLAUDE_CODE_CLIENT_ID,
+        redirect_uri=CLAUDE_CODE_REDIRECT_URI,
         state="claude-code-ci-state",
     )
     claude_read = rpc(

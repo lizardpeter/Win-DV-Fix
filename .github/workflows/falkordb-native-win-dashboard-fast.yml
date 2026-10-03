@@ -1,0 +1,87 @@
+name: FalkorDB Dashboard Fast Windows Build
+
+on:
+  push:
+    branches:
+      - chatgpt/falkordb-native-win-ci
+    paths:
+      - 'ci/falkordb-native-win/native_host/**'
+      - 'ci/falkordb-native-win/scripts/bootstrap_windows.ps1'
+      - 'ci/falkordb-native-win/scripts/package_windows.ps1'
+      - '.github/workflows/falkordb-native-win-dashboard-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: falkordb-dashboard-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-package:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore native dependency cache
+        id: native-deps
+        uses: actions/cache@v4
+        with:
+          path: ci/falkordb-native-win/build/native-prefix
+          key: falkordb-native-deps-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/scripts/bootstrap_windows.ps1') }}
+
+      - name: Bootstrap source with cached native dependencies
+        if: steps.native-deps.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1' -SkipNativeDeps
+
+      - name: Bootstrap native dependencies
+        if: steps.native-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\bootstrap_windows.ps1'
+
+      - name: Test and build release server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Root = [IO.Path]::GetFullPath('.\ci\falkordb-native-win')
+          $NativeLibDir = (Get-Content (Join-Path $Root 'build\native-lib-dir.txt') -Raw).Trim()
+          $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
+          $env:LAGRAPH_LIB_DIR = $NativeLibDir
+          $env:FALKORDB_NATIVE_NO_OPENMP = "1"
+          $env:FALKORDB_SKIP_REDISEARCH = "1"
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          $env:CARGO_TARGET_DIR = Join-Path $Root 'build\cargo-target'
+          $Manifest = Join-Path $Root 'native_host\Cargo.toml'
+
+          cargo test --manifest-path $Manifest --lib
+          if ($LASTEXITCODE -ne 0) { throw "Native host unit tests failed" }
+
+          cargo build --manifest-path $Manifest --bin server --release
+          if ($LASTEXITCODE -ne 0) { throw "Release server build failed" }
+
+      - name: Build deployable package
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\package_windows.ps1'
+
+      - name: Upload deployable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: falkordb-native-windows-dashboard-auth-fix
+          path: ci/falkordb-native-win/build/package/falkordb-native-windows-x64.zip
+          if-no-files-found: error

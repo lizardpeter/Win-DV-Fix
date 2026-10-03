@@ -24,7 +24,6 @@ const SERVER_VERSION: &str = "0.5.0";
 pub const TOOLSET_VERSION: &str = "2026-10-01.4";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
-const REFRESH_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const AUTH_CODE_TTL_SECS: u64 = 10 * 60;
 const MAX_MCP_BATCH_QUERIES: usize = 100;
 
@@ -32,6 +31,8 @@ const SCOPE_READ: &str = "graph:read";
 const SCOPE_WRITE: &str = "graph:write";
 const SCOPE_ADMIN: &str = "graph:admin";
 const ALL_SCOPES: &str = "graph:read graph:write graph:admin";
+const CLAUDE_WEB_CLIENT_ID: &str = "https://claude.ai/oauth/mcp-oauth-client-metadata";
+const CLAUDE_WEB_REDIRECT_URI: &str = "https://claude.ai/api/mcp/auth_callback";
 const CLAUDE_CODE_CLIENT_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
 
 #[derive(Debug, Clone)]
@@ -133,7 +134,13 @@ pub(crate) fn route_http(
         }
         "/oauth/token" => {
             return Some(match request.method.as_str() {
-                "POST" => oauth_token(request, config),
+                "POST" => oauth_token(request, config, catalog),
+                _ => method_not_allowed("POST"),
+            });
+        }
+        "/oauth/revoke" => {
+            return Some(match request.method.as_str() {
+                "POST" => oauth_revoke(request, catalog),
                 _ => method_not_allowed("POST"),
             });
         }
@@ -213,6 +220,7 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
             "authorization_response_iss_parameter_supported": true,
             "authorization_endpoint": format!("{base}/oauth/authorize"),
             "token_endpoint": format!("{base}/oauth/token"),
+            "revocation_endpoint": format!("{base}/oauth/revoke"),
             "client_id_metadata_document_supported": true,
             "token_endpoint_auth_methods_supported": ["none"],
             "response_types_supported": ["code"],
@@ -469,7 +477,11 @@ fn unquote_owner_secret(value: &str) -> String {
     value.to_string()
 }
 
-fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
+fn oauth_token(
+    request: &HttpRequest,
+    config: &ApiConfig,
+    catalog: &GraphCatalog,
+) -> HttpResponse {
     let Some(secret) = config.read_write_token.as_deref() else {
         return oauth_error(
             503,
@@ -483,13 +495,35 @@ fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     };
     let params = parse_urlencoded(body);
     match params.get("grant_type").map(String::as_str) {
-        Some("authorization_code") => exchange_authorization_code(&params, secret),
-        Some("refresh_token") => exchange_refresh_token(&params, secret),
+        Some("authorization_code") => {
+            exchange_authorization_code(&params, secret, catalog)
+        }
+        Some("refresh_token") => exchange_refresh_token(&params, secret, catalog),
         _ => oauth_error(400, "unsupported_grant_type", "unsupported grant_type"),
     }
 }
 
-fn exchange_authorization_code(params: &HashMap<String, String>, secret: &str) -> HttpResponse {
+fn oauth_revoke(request: &HttpRequest, catalog: &GraphCatalog) -> HttpResponse {
+    let body = match std::str::from_utf8(&request.body) {
+        Ok(body) => body,
+        Err(_) => return oauth_error(400, "invalid_request", "form body is not UTF-8"),
+    };
+    let params = parse_urlencoded(body);
+    let Some(token) = params.get("token") else {
+        return oauth_error(400, "invalid_request", "token is required");
+    };
+    // RFC 7009-style revocation is intentionally idempotent.
+    if let Err(err) = crate::oauth_grants::revoke(catalog.data_dir(), token) {
+        return oauth_error(500, "server_error", &err);
+    }
+    raw_response(200, "application/json; charset=utf-8", b"{}".to_vec())
+}
+
+fn exchange_authorization_code(
+    params: &HashMap<String, String>,
+    secret: &str,
+    catalog: &GraphCatalog,
+) -> HttpResponse {
     cleanup_expired_codes();
     let Some(code_value) = params.get("code") else {
         return oauth_error(400, "invalid_request", "code is required");
@@ -520,15 +554,21 @@ fn exchange_authorization_code(params: &HashMap<String, String>, secret: &str) -
     }
 
     oauth_codes().lock().remove(code_value);
-    issue_token_pair(
+    issue_new_token_pair(
         secret,
+        catalog,
+        &record.client_id,
         &record.issuer,
         &record.resource,
         &record.scope,
     )
 }
 
-fn exchange_refresh_token(params: &HashMap<String, String>, secret: &str) -> HttpResponse {
+fn exchange_refresh_token(
+    params: &HashMap<String, String>,
+    secret: &str,
+    catalog: &GraphCatalog,
+) -> HttpResponse {
     let Some(refresh) = params.get("refresh_token") else {
         return oauth_error(400, "invalid_request", "refresh_token is required");
     };
@@ -536,24 +576,84 @@ fn exchange_refresh_token(params: &HashMap<String, String>, secret: &str) -> Htt
         return oauth_error(400, "invalid_target", "resource is required");
     };
     let issuer = resource.strip_suffix("/mcp").unwrap_or(resource);
+    let client_id = params.get("client_id").map(String::as_str);
 
-    let token = match verify_signed_token(secret, refresh, issuer, resource, "refresh") {
-        Ok(token) => token,
-        Err(message) => return oauth_error(400, "invalid_grant", &message),
-    };
-
-    let scope = params
-        .get("scope")
-        .map(String::as_str)
-        .unwrap_or(&token.scope);
-    if let Err(message) = validate_scope_subset(scope, &token.scope) {
-        return oauth_error(400, "invalid_scope", &message);
+    match crate::oauth_grants::validate_and_touch(
+        catalog.data_dir(),
+        secret,
+        refresh,
+        client_id,
+        issuer,
+        resource,
+    ) {
+        Ok(grant) => {
+            let scope = params
+                .get("scope")
+                .map(String::as_str)
+                .unwrap_or(&grant.scope);
+            if let Err(message) = validate_scope_subset(scope, &grant.scope) {
+                return oauth_error(400, "invalid_scope", &message);
+            }
+            return issue_access_with_refresh(secret, issuer, resource, scope, refresh);
+        }
+        Err(persistent_error) => {
+            // Seamless migration for refresh tokens issued by builds before
+            // durable grants existed. A still-valid legacy signed refresh token
+            // is accepted once and replaced by a persistent grant.
+            if refresh.starts_with("mcp1.") {
+                if let Ok(token) = verify_signed_token(secret, refresh, issuer, resource, "refresh") {
+                    let scope = params
+                        .get("scope")
+                        .map(String::as_str)
+                        .unwrap_or(&token.scope);
+                    if let Err(message) = validate_scope_subset(scope, &token.scope) {
+                        return oauth_error(400, "invalid_scope", &message);
+                    }
+                    let migrated_client = client_id.unwrap_or("legacy-mcp-client");
+                    return issue_new_token_pair(
+                        secret,
+                        catalog,
+                        migrated_client,
+                        issuer,
+                        resource,
+                        scope,
+                    );
+                }
+            }
+            return oauth_error(400, "invalid_grant", &persistent_error);
+        }
     }
-
-    issue_token_pair(secret, issuer, resource, scope)
 }
 
-fn issue_token_pair(secret: &str, issuer: &str, resource: &str, scope: &str) -> HttpResponse {
+fn issue_new_token_pair(
+    secret: &str,
+    catalog: &GraphCatalog,
+    client_id: &str,
+    issuer: &str,
+    resource: &str,
+    scope: &str,
+) -> HttpResponse {
+    let refresh = match crate::oauth_grants::issue(
+        catalog.data_dir(),
+        secret,
+        client_id,
+        issuer,
+        resource,
+        scope,
+    ) {
+        Ok(v) => v,
+        Err(err) => return oauth_error(500, "server_error", &err),
+    };
+    issue_access_with_refresh(secret, issuer, resource, scope, &refresh)
+}
+
+fn issue_access_with_refresh(
+    secret: &str,
+    issuer: &str,
+    resource: &str,
+    scope: &str,
+    refresh: &str,
+) -> HttpResponse {
     let access = match sign_token(
         secret,
         "access",
@@ -561,17 +661,6 @@ fn issue_token_pair(secret: &str, issuer: &str, resource: &str, scope: &str) -> 
         resource,
         scope,
         ACCESS_TOKEN_TTL_SECS,
-    ) {
-        Ok(v) => v,
-        Err(err) => return oauth_error(500, "server_error", &err),
-    };
-    let refresh = match sign_token(
-        secret,
-        "refresh",
-        issuer,
-        resource,
-        scope,
-        REFRESH_TOKEN_TTL_SECS,
     ) {
         Ok(v) => v,
         Err(err) => return oauth_error(500, "server_error", &err),
@@ -674,12 +763,17 @@ fn validate_authorize_params(
 }
 
 fn allowed_mcp_client_id(client_id: &str) -> bool {
-    allowed_chatgpt_client_id(client_id) || client_id == CLAUDE_CODE_CLIENT_ID
+    allowed_chatgpt_client_id(client_id)
+        || client_id == CLAUDE_WEB_CLIENT_ID
+        || client_id == CLAUDE_CODE_CLIENT_ID
 }
 
 fn allowed_mcp_redirect(client_id: &str, uri: &str) -> bool {
     if allowed_chatgpt_client_id(client_id) {
         return allowed_chatgpt_redirect(uri);
+    }
+    if client_id == CLAUDE_WEB_CLIENT_ID {
+        return uri == CLAUDE_WEB_REDIRECT_URI;
     }
     if client_id == CLAUDE_CODE_CLIENT_ID {
         return allowed_claude_code_redirect(uri);
@@ -712,6 +806,8 @@ fn allowed_claude_code_redirect(uri: &str) -> bool {
 fn mcp_client_display_name(client_id: &str) -> &'static str {
     if allowed_chatgpt_client_id(client_id) {
         "ChatGPT"
+    } else if client_id == CLAUDE_WEB_CLIENT_ID {
+        "Claude"
     } else if client_id == CLAUDE_CODE_CLIENT_ID {
         "Claude Code"
     } else {
@@ -2104,6 +2200,7 @@ mod tests {
         assert!(allowed_mcp_client_id(
             "https://chatgpt.com/oauth/callback123/client.json"
         ));
+        assert!(allowed_mcp_client_id(CLAUDE_WEB_CLIENT_ID));
         assert!(allowed_mcp_client_id(CLAUDE_CODE_CLIENT_ID));
         assert!(!allowed_mcp_client_id("https://evil.example/client.json"));
 
@@ -2116,6 +2213,15 @@ mod tests {
             "https://chatgpt.com/connector/oauth/callback123"
         ));
         assert!(!allowed_mcp_redirect(chatgpt, "https://evil.example/callback"));
+
+        assert!(allowed_mcp_redirect(
+            CLAUDE_WEB_CLIENT_ID,
+            CLAUDE_WEB_REDIRECT_URI
+        ));
+        assert!(!allowed_mcp_redirect(
+            CLAUDE_WEB_CLIENT_ID,
+            "https://evil.example/callback"
+        ));
 
         assert!(allowed_mcp_redirect(
             CLAUDE_CODE_CLIENT_ID,

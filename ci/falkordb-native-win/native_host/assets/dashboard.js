@@ -44,7 +44,7 @@
   async function api(path) {
     const response = await fetch(path, {
       headers: {
-        'Authorization': authHeader(),
+        'X-FalkorDB-Dashboard-Authorization': authHeader(),
         'Accept': 'application/json'
       },
       cache: 'no-store'
@@ -280,35 +280,18 @@
     if (ms > 0) state.timer = setInterval(refresh, ms);
   }
 
-  function syncAuthMode() {
-    const mode = document.querySelector('input[name="authMode"]:checked').value;
-    byId('viewerFields').hidden = mode !== 'viewer';
-    byId('tokenFields').hidden = mode !== 'token';
-    byId('loginError').hidden = true;
-  }
-
-  document.querySelectorAll('input[name="authMode"]').forEach((input) => {
-    input.addEventListener('change', syncAuthMode);
-  });
-  syncAuthMode();
-
   byId('connectButton').addEventListener('click', async () => {
-    const mode = document.querySelector('input[name="authMode"]:checked').value;
     const apiToken = byId('tokenInput').value.trim();
     const username = byId('viewerUsername').value.trim();
     const password = byId('viewerPassword').value;
 
     let header = '';
-    if (mode === 'token') {
-      if (!apiToken) {
-        byId('loginError').textContent = 'Enter the read-only API token.';
-        byId('loginError').hidden = false;
-        return;
-      }
+    if (apiToken) {
       header = 'Bearer ' + apiToken;
     } else {
       if (!username || !password) {
-        byId('loginError').textContent = 'Enter the viewer username and password.';
+        byId('loginError').textContent =
+          'Enter the viewer username/password or a read-only API token.';
         byId('loginError').hidden = false;
         return;
       }

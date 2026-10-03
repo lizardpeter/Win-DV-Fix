@@ -45,6 +45,14 @@ fn asset_response(content_type: &'static str, body: Vec<u8>) -> HttpResponse {
         "Cross-Origin-Resource-Policy".to_string(),
         "same-origin".to_string(),
     ));
+    // Dashboard assets carry authentication behavior. Never allow a browser or
+    // intermediary cache to pin an older login script across server upgrades.
+    response.headers.push((
+        "Cache-Control".to_string(),
+        "no-store, no-cache, must-revalidate, max-age=0".to_string(),
+    ));
+    response.headers.push(("Pragma".to_string(), "no-cache".to_string()));
+    response.headers.push(("Expires".to_string(), "0".to_string()));
     response
 }
 

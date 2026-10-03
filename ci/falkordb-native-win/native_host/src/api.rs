@@ -1249,7 +1249,10 @@ mod tests {
             "0\r\n\r\n"
         );
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
-        let err = read_http_request(&mut reader).expect_err("ambiguous framing must fail");
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("ambiguous framing must fail"),
+            Err(err) => err,
+        };
         assert!(err.contains("both Transfer-Encoding and Content-Length"));
     }
 
@@ -1262,7 +1265,10 @@ mod tests {
             "\r\n"
         );
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
-        let err = read_http_request(&mut reader).expect_err("unsupported coding must fail");
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("unsupported coding must fail"),
+            Err(err) => err,
+        };
         assert!(err.contains("unsupported Transfer-Encoding"));
     }
 

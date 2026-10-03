@@ -30,6 +30,9 @@ const MAX_RESP_LINE_BYTES: usize = 64 * 1024;
 const MAX_RESP_ARRAY_ITEMS: usize = 100_000;
 const MAX_RESP_BULK_BYTES: usize = 512 * 1024 * 1024;
 const MAX_RESP_COMMAND_BYTES: usize = 768 * 1024 * 1024;
+const MAX_RESP_PREAUTH_ARRAY_ITEMS: usize = 16;
+const MAX_RESP_PREAUTH_BULK_BYTES: usize = 64 * 1024;
+const MAX_RESP_PREAUTH_COMMAND_BYTES: usize = 128 * 1024;
 const MAX_RESP_CONNECTIONS: usize = 256;
 const RESP_IO_TIMEOUT_SECS: u64 = 120;
 const MAX_AUTH_FAILURES_PER_CONNECTION: u8 = 10;
@@ -1143,7 +1146,16 @@ fn handle_connection_io<S: Read + Write>(
     };
 
     loop {
-        let command = match read_command(&mut reader)? {
+        let command = match if state.authenticated {
+            read_command(&mut reader)
+        } else {
+            read_command_with_limits(
+                &mut reader,
+                MAX_RESP_PREAUTH_ARRAY_ITEMS,
+                MAX_RESP_PREAUTH_BULK_BYTES,
+                MAX_RESP_PREAUTH_COMMAND_BYTES,
+            )
+        }? {
             Some(command) => command,
             None => return Ok(()),
         };
@@ -2577,6 +2589,20 @@ fn read_until_limited<R: BufRead>(
 }
 
 fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, String> {
+    read_command_with_limits(
+        reader,
+        MAX_RESP_ARRAY_ITEMS,
+        MAX_RESP_BULK_BYTES,
+        MAX_RESP_COMMAND_BYTES,
+    )
+}
+
+fn read_command_with_limits<R: BufRead>(
+    reader: &mut R,
+    max_array_items: usize,
+    max_bulk_bytes: usize,
+    max_command_bytes: usize,
+) -> Result<Option<Vec<Vec<u8>>>, String> {
     let mut first = read_until_limited(reader, b'\n', MAX_RESP_LINE_BYTES, "RESP command line")?;
     if first.is_empty() {
         return Ok(None);
@@ -2585,21 +2611,21 @@ fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, Stri
 
     if first.first() == Some(&b'*') {
         let count = parse_len(&first[1..], "array length")?;
-        if count > MAX_RESP_ARRAY_ITEMS {
+        if count > max_array_items {
             return Err(format!(
-                "RESP array length {count} exceeds maximum {MAX_RESP_ARRAY_ITEMS}"
+                "RESP array length {count} exceeds maximum {max_array_items}"
             ));
         }
         let mut args = Vec::with_capacity(count);
         let mut total_bytes = first.len();
         for _ in 0..count {
-            let arg = read_bulkish(reader)?;
+            let arg = read_bulkish(reader, max_bulk_bytes)?;
             total_bytes = total_bytes
                 .checked_add(arg.len())
                 .ok_or_else(|| "RESP command size overflow".to_string())?;
-            if total_bytes > MAX_RESP_COMMAND_BYTES {
+            if total_bytes > max_command_bytes {
                 return Err(format!(
-                    "RESP command exceeds maximum {MAX_RESP_COMMAND_BYTES} bytes"
+                    "RESP command exceeds maximum {max_command_bytes} bytes"
                 ));
             }
             args.push(arg);
@@ -2622,7 +2648,7 @@ fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, Stri
     ))
 }
 
-fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+fn read_bulkish<R: BufRead>(reader: &mut R, max_bulk_bytes: usize) -> Result<Vec<u8>, String> {
     let mut header =
         read_until_limited(reader, b'\n', MAX_RESP_LINE_BYTES, "RESP item header")?;
     if header.is_empty() {
@@ -2633,9 +2659,9 @@ fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     match header.first().copied() {
         Some(b'$') => {
             let len = parse_len(&header[1..], "bulk length")?;
-            if len > MAX_RESP_BULK_BYTES {
+            if len > max_bulk_bytes {
                 return Err(format!(
-                    "RESP bulk length {len} exceeds maximum {MAX_RESP_BULK_BYTES}"
+                    "RESP bulk length {len} exceeds maximum {max_bulk_bytes}"
                 ));
             }
             let mut data = vec![0u8; len];
@@ -2686,6 +2712,22 @@ fn trim_crlf(buf: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unauthenticated_resp_limits_reject_large_payloads_before_allocation() {
+        let raw = format!("*2\\r\\n$4\\r\\nAUTH\\r\\n${}\\r\\n", MAX_RESP_PREAUTH_BULK_BYTES + 1);
+        let mut reader = BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_command_with_limits(
+            &mut reader,
+            MAX_RESP_PREAUTH_ARRAY_ITEMS,
+            MAX_RESP_PREAUTH_BULK_BYTES,
+            MAX_RESP_PREAUTH_COMMAND_BYTES,
+        ) {
+            Ok(_) => panic!("pre-auth oversized bulk must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bulk length"));
+        assert!(err.contains("exceeds maximum"));
+    }
     #[test]
     fn resp_parser_rejects_oversized_array_before_allocation() {
         let raw = format!("*{}\r\n", MAX_RESP_ARRAY_ITEMS + 1);

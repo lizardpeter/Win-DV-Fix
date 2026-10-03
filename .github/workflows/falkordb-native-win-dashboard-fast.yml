@@ -32,6 +32,15 @@ jobs:
           toolchain: stable-x86_64-pc-windows-msvc
           targets: x86_64-pc-windows-msvc
 
+      - name: Restore Rust build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ci/falkordb-native-win/build/cargo-target
+          key: falkordb-native-rust-${{ runner.os }}-${{ hashFiles('ci/falkordb-native-win/native_host/Cargo.toml') }}
+
       - name: Restore native dependency cache
         id: native-deps
         uses: actions/cache@v4

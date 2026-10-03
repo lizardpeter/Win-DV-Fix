@@ -19,7 +19,7 @@ use crate::{
 };
 
 const PROTOCOL_MODERN: &str = "2026-07-28";
-pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v3-20261001";
+pub const OAUTH_BUILD_ID: &str = "oauth-persistent-v4-20261003";
 const SERVER_VERSION: &str = "0.5.0";
 pub const TOOLSET_VERSION: &str = "2026-10-01.4";
 const PROTOCOL_LEGACY: &str = "2025-11-25";

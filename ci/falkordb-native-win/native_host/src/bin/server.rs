@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{digest, rand::{SecureRandom, SystemRandom}};
@@ -20,6 +20,7 @@ use ring::{digest, rand::{SecureRandom, SystemRandom}};
 use windows_sys::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
+        Storage::FileSystem::{REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW},
         System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -198,6 +199,66 @@ fn load_local_secrets(root: &Path) -> Result<LocalSecrets, String> {
 }
 
 
+fn atomic_write_local_secret_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|e| format!("open temporary secret file {}: {e}", temp.display()))?;
+        file.write_all(contents)
+            .map_err(|e| format!("write temporary secret file {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary secret file {}: {e}", temp.display()))?;
+    }
+
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let target = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let replacement = temp
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let ok = unsafe {
+                ReplaceFileW(
+                    target.as_ptr(),
+                    replacement.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_IGNORE_MERGE_ERRORS,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                let _ = fs::remove_file(&temp);
+                return Err(format!(
+                    "atomically replace local secrets file {}: {err}",
+                    path.display()
+                ));
+            }
+            return Ok(());
+        }
+    }
+
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "install local secrets file {}: {err}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn persist_openai_tunnel_credentials(
     root: &Path,
     tunnel_id: &str,
@@ -230,7 +291,7 @@ fn persist_openai_tunnel_credentials(
     lines.push(format!("OPENAI_TUNNEL_API_KEY={api_key}"));
     lines.push(String::new());
 
-    fs::write(&path, lines.join("\r\n"))
+    atomic_write_local_secret_file(&path, lines.join("\r\n").as_bytes())
         .map_err(|e| format!("write OpenAI tunnel credentials to {}: {e}", path.display()))
 }
 

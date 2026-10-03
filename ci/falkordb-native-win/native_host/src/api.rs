@@ -1312,6 +1312,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http_parser_rejects_duplicate_content_length() {
+        let raw = concat!(
+            "POST /oauth/token HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Length: 4\r\n",
+            "Content-Length: 4\r\n",
+            "\r\n",
+            "test"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("duplicate Content-Length must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("duplicate security-sensitive HTTP header"));
+    }
+
+    #[test]
+    fn http_parser_rejects_oversized_request_line_before_body_allocation() {
+        let target = format!("/{}", "a".repeat(MAX_REQUEST_LINE_BYTES));
+        let raw = format!("GET {target} HTTP/1.1\r\nHost: db.example.test\r\n\r\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("oversized request line must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("HTTP request line exceeds"));
+    }
+
+    #[test]
+    fn http_parser_requires_host_for_http_11() {
+        let raw = b"GET /healthz HTTP/1.1\r\n\r\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("HTTP/1.1 without Host must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("missing Host"));
+    }
+
+    #[test]
     fn http_parser_accepts_chunked_form_post() {
         let raw = concat!(
             "POST /oauth/authorize HTTP/1.1\r\n",

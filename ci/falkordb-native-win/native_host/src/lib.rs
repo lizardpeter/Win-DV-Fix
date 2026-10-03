@@ -6,6 +6,7 @@ pub mod browser;
 pub mod dashboard;
 pub mod file_import;
 pub mod mcp;
+mod oauth_grants;
 pub mod property_index;
 pub mod query_scheduler;
 pub mod range_index;

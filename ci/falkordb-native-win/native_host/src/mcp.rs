@@ -360,13 +360,7 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
-            format!(
-                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted.</p><p>This server currently has <strong>{}</strong> distinct owner credential source(s) available for OAuth. You may paste the raw password/token, a complete FALKORDB_PASSWORD=... or FALKORDB_API_TOKEN=... line, or the complete falkordb-secrets.txt contents.</p>",
-                usize::from(config.oauth_pairing_code.is_some())
-                    + usize::from(config.oauth_owner_secret.is_some())
-                    + usize::from(config.read_write_token.is_some())
-                    + config.oauth_owner_secret_fallbacks.len()
-            ).into_bytes(),
+            b"<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The owner credential was not accepted.</p>".to_vec(),
         );
         response.headers.push((
             "Content-Security-Policy".to_string(),

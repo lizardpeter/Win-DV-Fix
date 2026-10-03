@@ -605,7 +605,14 @@ fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScop
         return AuthScope::ReadWrite;
     }
 
-    let Some(header) = headers.get("authorization") else {
+    // The built-in dashboard uses a dedicated same-origin header so it remains
+    // usable behind reverse proxies/security layers that strip or special-case
+    // the standard Authorization header. Ordinary API/MCP clients continue to
+    // use Authorization as before.
+    let Some(header) = headers
+        .get("x-falkordb-dashboard-authorization")
+        .or_else(|| headers.get("authorization"))
+    else {
         return AuthScope::None;
     };
 
@@ -1080,8 +1087,18 @@ mod tests {
         headers.insert("authorization".to_string(), format!("Basic {encoded}"));
         assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
 
+        headers.clear();
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            format!("Basic {encoded}"),
+        );
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+
         let wrong = STANDARD.encode("viewer:wrong-secret");
-        headers.insert("authorization".to_string(), format!("Basic {wrong}"));
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            format!("Basic {wrong}"),
+        );
         assert!(auth_scope(&headers, &config) == AuthScope::None);
     }
 
@@ -1099,5 +1116,12 @@ mod tests {
 
         headers.insert("authorization".to_string(), "Bearer write-secret".to_string());
         assert!(auth_scope(&headers, &config) == AuthScope::ReadWrite);
+
+        headers.clear();
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            "Bearer read-secret".to_string(),
+        );
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
     }
 }

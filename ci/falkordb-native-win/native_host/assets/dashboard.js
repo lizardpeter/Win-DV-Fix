@@ -24,29 +24,31 @@
     return (ms / 60000).toFixed(1) + ' min';
   }
 
-  function authHeader() {
-    return sessionStorage.getItem('falkordb.authHeader') || '';
-  }
-
-  function basicAuthHeader(username, password) {
-    const bytes = new TextEncoder().encode(username + ':' + password);
-    let binary = '';
-    const chunk = 0x8000;
-    for (let offset = 0; offset < bytes.length; offset += chunk) {
-      binary += String.fromCharCode.apply(
-        null,
-        bytes.subarray(offset, Math.min(offset + chunk, bytes.length))
-      );
+  function authPayload() {
+    try {
+      return JSON.parse(sessionStorage.getItem('falkordb.dashboardAuth') || 'null');
+    } catch (_) {
+      return null;
     }
-    return 'Basic ' + btoa(binary);
   }
 
-  async function api(path) {
-    const response = await fetch(path, {
+  function saveAuthPayload(payload) {
+    sessionStorage.setItem('falkordb.dashboardAuth', JSON.stringify(payload));
+  }
+
+  function clearAuthPayload() {
+    sessionStorage.removeItem('falkordb.dashboardAuth');
+  }
+
+  async function dashboardOverview(payload = authPayload()) {
+    if (!payload) throw new Error('Enter dashboard credentials.');
+    const response = await fetch('/dashboard/overview', {
+      method: 'POST',
       headers: {
-        'X-FalkorDB-Dashboard-Authorization': authHeader(),
+        'Content-Type': 'application/json',
         'Accept': 'application/json'
       },
+      body: JSON.stringify(payload),
       cache: 'no-store'
     });
     const body = await response.json().catch(() => ({}));
@@ -263,7 +265,7 @@
 
   async function refresh() {
     try {
-      const data = await api('/v1/overview');
+      const data = await dashboardOverview();
       render(data);
       byId('connectionDot').style.background = 'var(--good)';
       byId('connectionText').textContent = 'Connected';
@@ -285,9 +287,13 @@
     const username = byId('viewerUsername').value.trim();
     const password = byId('viewerPassword').value;
 
-    let header = '';
+    let payload;
     if (apiToken) {
-      header = 'Bearer ' + apiToken;
+      payload = {
+        viewer_username: '',
+        viewer_password: '',
+        api_token: apiToken
+      };
     } else {
       if (!username || !password) {
         byId('loginError').textContent =
@@ -295,13 +301,17 @@
         byId('loginError').hidden = false;
         return;
       }
-      header = basicAuthHeader(username, password);
+      payload = {
+        viewer_username: username,
+        viewer_password: password,
+        api_token: ''
+      };
     }
 
-    sessionStorage.setItem('falkordb.authHeader', header);
+    saveAuthPayload(payload);
     byId('loginError').hidden = true;
     try {
-      const data = await api('/v1/overview');
+      const data = await dashboardOverview(payload);
       byId('loginPanel').hidden = true;
       byId('dashboard').hidden = false;
       byId('tokenInput').value = '';
@@ -309,7 +319,7 @@
       render(data);
       resetTimer();
     } catch (error) {
-      sessionStorage.removeItem('falkordb.authHeader');
+      clearAuthPayload();
       byId('loginError').textContent = error.message;
       byId('loginError').hidden = false;
     }
@@ -321,7 +331,7 @@
     });
   });
   byId('disconnectButton').addEventListener('click', () => {
-    sessionStorage.removeItem('falkordb.authHeader');
+    clearAuthPayload();
     if (state.timer) clearInterval(state.timer);
     byId('dashboard').hidden = true;
     byId('loginPanel').hidden = false;
@@ -341,12 +351,12 @@
     });
   });
 
-  if (authHeader()) {
-    api('/v1/overview').then((data) => {
+  if (authPayload()) {
+    dashboardOverview().then((data) => {
       byId('loginPanel').hidden = true;
       byId('dashboard').hidden = false;
       render(data);
       resetTimer();
-    }).catch(() => sessionStorage.removeItem('falkordb.authHeader'));
+    }).catch(() => clearAuthPayload());
   }
 })();

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FalkorDB Native Graph Explorer</title>
+<link rel="stylesheet" href="/browser/style.css?v=native-browser-v1">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>FalkorDB Native</h1>
+    <p class="subtitle">Read-only graph explorer</p>
+  </div>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/openapi.json" target="_blank" rel="noreferrer">OpenAPI</a>
+  </nav>
+</header>
+
+<main>
+<section id="loginPanel" class="panel login-panel">
+  <div>
+    <h2>Connect to Graph Explorer</h2>
+    <p>Use the dedicated read-only viewer account. Credentials stay only in this browser tab and are never written to local storage.</p>
+  </div>
+  <div class="login-grid">
+    <label>Viewer username
+      <input id="viewerUsername" type="text" autocomplete="username" value="viewer">
+    </label>
+    <label>Viewer password
+      <input id="viewerPassword" type="password" autocomplete="current-password" placeholder="Viewer password">
+    </label>
+    <button id="connectButton">Connect</button>
+  </div>
+  <p id="loginError" class="error" hidden></p>
+</section>
+
+<section id="explorer" hidden>
+  <div class="toolbar panel">
+    <div class="connection">
+      <span class="dot"></span>
+      <strong>Read-only</strong>
+      <span id="connectionText" class="muted"></span>
+    </div>
+    <div class="toolbar-actions">
+      <label>Graph
+        <select id="graphSelect"></select>
+      </label>
+      <button id="sampleButton" class="secondary">Sample graph</button>
+      <button id="fitButton" class="secondary">Fit view</button>
+      <button id="disconnectButton" class="secondary">Disconnect</button>
+    </div>
+  </div>
+
+  <section class="panel query-panel">
+    <div class="section-head">
+      <div>
+        <h2>Cypher</h2>
+        <p class="muted">All queries execute through the server's enforced read-only path.</p>
+      </div>
+      <div class="query-actions">
+        <button id="runButton">Run</button>
+      </div>
+    </div>
+    <textarea id="queryInput" spellcheck="false">MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 100</textarea>
+    <div class="query-foot">
+      <span id="queryStatus" class="muted">Ready</span>
+      <span class="muted">Ctrl/Cmd + Enter to run</span>
+    </div>
+    <p id="queryError" class="error" hidden></p>
+  </section>
+
+  <section class="workspace">
+    <section class="panel canvas-panel">
+      <div class="section-head">
+        <div>
+          <h2>Graph</h2>
+          <p id="graphSummary" class="muted">No result loaded</p>
+        </div>
+        <div class="legend">
+          <span><i class="legend-node"></i>Node</span>
+          <span><i class="legend-edge"></i>Relationship</span>
+        </div>
+      </div>
+      <div id="canvasWrap">
+        <svg id="graphSvg" aria-label="Interactive graph visualization">
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L8,3 z"></path>
+            </marker>
+          </defs>
+          <g id="viewport">
+            <g id="edgesLayer"></g>
+            <g id="edgeLabelsLayer"></g>
+            <g id="nodesLayer"></g>
+          </g>
+        </svg>
+        <div id="emptyCanvas" class="empty-canvas">Run a query that returns nodes, relationships, or paths.</div>
+      </div>
+      <p class="canvas-help">Drag nodes to rearrange. Drag empty space to pan. Scroll to zoom. Double-click a node to expand its neighborhood.</p>
+    </section>
+
+    <aside class="panel inspector">
+      <div class="section-head">
+        <div>
+          <h2>Inspector</h2>
+          <p class="muted">Click a node or relationship.</p>
+        </div>
+      </div>
+      <div id="inspectorBody" class="empty-inspector">Nothing selected.</div>
+    </aside>
+  </section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <h2>Results</h2>
+        <p id="tableSummary" class="muted">No query executed</p>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="resultsTable">
+        <thead id="resultsHead"></thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+  </section>
+</section>
+</main>
+
+<script src="/browser/app.js?v=native-browser-v1" defer></script>
+</body>
+</html>

@@ -2184,16 +2184,7 @@ mod tests {
             body: Vec::new(),
         };
 
-        let response = route_http(
-            &request,
-            &GraphCatalog::open(&std::env::temp_dir().join(format!(
-                "falkordb-tunnel-prm-{}",
-                std::process::id()
-            )))
-            .expect("temporary catalog"),
-            &config,
-        )
-        .expect("tunnel metadata route");
+        let response = protected_resource_metadata(&request, &config);
         assert_eq!(response.status, 200);
         let body: JsonValue = serde_json::from_slice(&response.body).expect("metadata JSON");
         assert_eq!(

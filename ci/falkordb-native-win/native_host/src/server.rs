@@ -5,8 +5,12 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use rustls::{
@@ -15,11 +19,28 @@ use rustls::{
 };
 
 use parking_lot::RwLock;
+use subtle::ConstantTimeEq;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
     NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, file_import, native_config, query_scheduler, rdb_file, redis_dump, snapshot, udf_store, wire::WireValue,
 };
+
+const MAX_RESP_LINE_BYTES: usize = 64 * 1024;
+const MAX_RESP_ARRAY_ITEMS: usize = 100_000;
+const MAX_RESP_BULK_BYTES: usize = 512 * 1024 * 1024;
+const MAX_RESP_COMMAND_BYTES: usize = 768 * 1024 * 1024;
+const MAX_RESP_CONNECTIONS: usize = 256;
+const RESP_IO_TIMEOUT_SECS: u64 = 120;
+const MAX_AUTH_FAILURES_PER_CONNECTION: u8 = 10;
+
+struct RespConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for RespConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -982,34 +1003,53 @@ pub fn serve_with_catalog(
     );
 
     let config = Arc::new(config);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                let previous = active_connections.fetch_add(1, Ordering::AcqRel);
+                if previous >= MAX_RESP_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Release);
+                    drop(stream);
+                    continue;
+                }
+
+                let permit = RespConnectionPermit(Arc::clone(&active_connections));
                 let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
                 let tls = tls.clone();
                 thread::spawn(move || {
+                    let _permit = permit;
                     let peer = stream.peer_addr().ok();
-                    let result = if let Some(tls) = tls {
-                        stream
-                            .set_nodelay(true)
-                            .map_err(|e| format!("set TCP_NODELAY: {e}"))
-                            .and_then(|_| {
-                                let conn = ServerConnection::new(tls)
-                                    .map_err(|e| format!("create TLS server connection: {e}"))?;
-                                handle_connection_io(
-                                    StreamOwned::new(conn, stream),
-                                    &catalog,
-                                    &config,
-                                    peer,
-                                )
-                            })
-                    } else {
-                        stream
-                            .set_nodelay(true)
-                            .map_err(|e| format!("set TCP_NODELAY: {e}"))
-                            .and_then(|_| handle_connection_io(stream, &catalog, &config, peer))
-                    };
+                    let timeout = Some(Duration::from_secs(RESP_IO_TIMEOUT_SECS));
+                    let setup = stream
+                        .set_nodelay(true)
+                        .map_err(|e| format!("set TCP_NODELAY: {e}"))
+                        .and_then(|_| {
+                            stream
+                                .set_read_timeout(timeout)
+                                .map_err(|e| format!("set RESP read timeout: {e}"))
+                        })
+                        .and_then(|_| {
+                            stream
+                                .set_write_timeout(timeout)
+                                .map_err(|e| format!("set RESP write timeout: {e}"))
+                        });
+
+                    let result = setup.and_then(|_| {
+                        if let Some(tls) = tls {
+                            let conn = ServerConnection::new(tls)
+                                .map_err(|e| format!("create TLS server connection: {e}"))?;
+                            handle_connection_io(
+                                StreamOwned::new(conn, stream),
+                                &catalog,
+                                &config,
+                                peer,
+                            )
+                        } else {
+                            handle_connection_io(stream, &catalog, &config, peer)
+                        }
+                    });
 
                     if let Err(err) = result {
                         eprintln!("client connection ended with error: {err}");
@@ -1083,6 +1123,7 @@ struct ConnectionState {
     read_only: bool,
     protocol: RespProtocol,
     client_name: Option<String>,
+    auth_failures: u8,
 }
 
 fn handle_connection_io<S: Read + Write>(
@@ -1098,6 +1139,7 @@ fn handle_connection_io<S: Read + Write>(
         read_only: false,
         protocol: RespProtocol::Resp2,
         client_name: None,
+        auth_failures: 0,
     };
 
     loop {
@@ -1106,6 +1148,9 @@ fn handle_connection_io<S: Read + Write>(
             None => return Ok(()),
         };
 
+        let should_quit = command
+            .first()
+            .is_some_and(|arg| ascii_upper(arg) == "QUIT");
         let response = dispatch(command, catalog, config, &mut state);
         write_resp(reader.get_mut(), &response, state.protocol)
             .map_err(|e| format!("write response to {peer:?}: {e}"))?;
@@ -1113,6 +1158,10 @@ fn handle_connection_io<S: Read + Write>(
             .get_mut()
             .flush()
             .map_err(|e| format!("flush response: {e}"))?;
+
+        if should_quit || state.auth_failures >= MAX_AUTH_FAILURES_PER_CONNECTION {
+            return Ok(());
+        }
     }
 }
 
@@ -1463,22 +1512,29 @@ fn handle_auth(args: &[Vec<u8>], config: &ServerConfig, state: &mut ConnectionSt
         _ => return Resp::Error("ERR wrong number of arguments for 'auth' command".to_string()),
     };
 
+    let password_matches = |expected: &str| {
+        expected.len() == password.len()
+            && bool::from(expected.as_bytes().ct_eq(password.as_bytes()))
+    };
     let admin_valid = config.password.as_ref().is_none_or(|expected| {
-        username == config.username && password.as_bytes() == expected.as_bytes()
+        username == config.username && password_matches(expected)
     });
     let viewer_valid = config.viewer_password.as_ref().is_some_and(|expected| {
-        username == config.viewer_username && password.as_bytes() == expected.as_bytes()
+        username == config.viewer_username && password_matches(expected)
     });
 
     if admin_valid {
         state.authenticated = true;
         state.read_only = false;
+        state.auth_failures = 0;
         Resp::Simple("OK".to_string())
     } else if viewer_valid {
         state.authenticated = true;
         state.read_only = true;
+        state.auth_failures = 0;
         Resp::Simple("OK".to_string())
     } else {
+        state.auth_failures = state.auth_failures.saturating_add(1);
         Resp::Error("WRONGPASS invalid username-password pair or user is disabled.".to_string())
     }
 }
@@ -2500,26 +2556,63 @@ fn sanitize_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
+fn read_until_limited<R: BufRead>(
+    reader: &mut R,
+    delimiter: u8,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(limit.min(1024));
+    let mut limited = reader.take((limit + 1) as u64);
+    let read = limited
+        .read_until(delimiter, &mut out)
+        .map_err(|e| format!("read {what}: {e}"))?;
+    if read > limit {
+        return Err(format!("{what} exceeds {limit} bytes"));
+    }
+    if read > 0 && out.last().copied() != Some(delimiter) {
+        return Err(format!("unterminated {what}"));
+    }
+    Ok(out)
+}
+
 fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, String> {
-    let mut first = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut first)
-        .map_err(|e| format!("read command: {e}"))?;
-    if read == 0 {
+    let mut first = read_until_limited(reader, b'\n', MAX_RESP_LINE_BYTES, "RESP command line")?;
+    if first.is_empty() {
         return Ok(None);
     }
     trim_crlf(&mut first);
 
     if first.first() == Some(&b'*') {
         let count = parse_len(&first[1..], "array length")?;
+        if count > MAX_RESP_ARRAY_ITEMS {
+            return Err(format!(
+                "RESP array length {count} exceeds maximum {MAX_RESP_ARRAY_ITEMS}"
+            ));
+        }
         let mut args = Vec::with_capacity(count);
+        let mut total_bytes = first.len();
         for _ in 0..count {
-            args.push(read_bulkish(reader)?);
+            let arg = read_bulkish(reader)?;
+            total_bytes = total_bytes
+                .checked_add(arg.len())
+                .ok_or_else(|| "RESP command size overflow".to_string())?;
+            if total_bytes > MAX_RESP_COMMAND_BYTES {
+                return Err(format!(
+                    "RESP command exceeds maximum {MAX_RESP_COMMAND_BYTES} bytes"
+                ));
+            }
+            args.push(arg);
         }
         return Ok(Some(args));
     }
 
-    // Redis inline command compatibility, useful for manual diagnostics.
+    if first.len() > MAX_RESP_LINE_BYTES {
+        return Err(format!(
+            "inline command exceeds maximum {MAX_RESP_LINE_BYTES} bytes"
+        ));
+    }
+
     let line = std::str::from_utf8(&first)
         .map_err(|_| "inline command is not UTF-8".to_string())?;
     Ok(Some(
@@ -2530,10 +2623,8 @@ fn read_command<R: BufRead>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>, Stri
 }
 
 fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut header = Vec::new();
-    reader
-        .read_until(b'\n', &mut header)
-        .map_err(|e| format!("read RESP item: {e}"))?;
+    let mut header =
+        read_until_limited(reader, b'\n', MAX_RESP_LINE_BYTES, "RESP item header")?;
     if header.is_empty() {
         return Err("unexpected EOF inside command".to_string());
     }
@@ -2542,6 +2633,11 @@ fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     match header.first().copied() {
         Some(b'$') => {
             let len = parse_len(&header[1..], "bulk length")?;
+            if len > MAX_RESP_BULK_BYTES {
+                return Err(format!(
+                    "RESP bulk length {len} exceeds maximum {MAX_RESP_BULK_BYTES}"
+                ));
+            }
             let mut data = vec![0u8; len];
             reader
                 .read_exact(&mut data)
@@ -2555,14 +2651,25 @@ fn read_bulkish<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
             }
             Ok(data)
         }
-        Some(b'+') => Ok(header[1..].to_vec()),
-        Some(b':') => Ok(header[1..].to_vec()),
-        _ => Err(format!("unsupported RESP request item: {}", String::from_utf8_lossy(&header))),
+        Some(b'+') | Some(b':') => {
+            let data = header[1..].to_vec();
+            if data.len() > MAX_RESP_LINE_BYTES {
+                return Err("RESP scalar item is too large".to_string());
+            }
+            Ok(data)
+        }
+        _ => Err(format!(
+            "unsupported RESP request item: {}",
+            String::from_utf8_lossy(&header)
+        )),
     }
 }
 
 fn parse_len(bytes: &[u8], what: &str) -> Result<usize, String> {
     let s = std::str::from_utf8(bytes).map_err(|_| format!("invalid {what}"))?;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid {what}: {s}"));
+    }
     s.parse::<usize>().map_err(|_| format!("invalid {what}: {s}"))
 }
 
@@ -2652,6 +2759,7 @@ mod tests {
             read_only: false,
             protocol: RespProtocol::Resp2,
             client_name: None,
+            auth_failures: 0,
         };
 
         let auth = vec![

@@ -151,6 +151,12 @@ jobs:
           Set-ExecutionPolicy -Scope Process Bypass
           & '.\ci\falkordb-native-win\scripts\diagnose.ps1'
 
+      - name: Run performance regression smoke
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\ci\falkordb-native-win\scripts\perf_smoke.ps1' -WorkDir '.\ci\falkordb-native-win\build\logs\perf-smoke'
+
       - name: Upload one-file Windows server
         uses: actions/upload-artifact@v4
         with:

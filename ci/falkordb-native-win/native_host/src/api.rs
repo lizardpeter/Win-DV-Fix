@@ -323,19 +323,6 @@ fn dashboard_auth_scope(payload: &DashboardOverviewRequest, config: &ApiConfig) 
             return AuthScope::ReadOnly;
         }
 
-        // Portable deployments created before the dedicated viewer credential
-        // existed may legitimately have no FALKORDB_VIEWER_PASSWORD at all.
-        // In that case, allow the existing RESP/admin owner password to open
-        // the dashboard, but still map the session to read-only dashboard
-        // scope. A configured viewer password always takes precedence.
-        if config.viewer_password.is_none()
-            && config
-                .oauth_owner_secret
-                .as_ref()
-                .is_some_and(|expected| constant_time_eq(expected, &payload.viewer_password))
-        {
-            return AuthScope::ReadOnly;
-        }
     }
 
     AuthScope::None
@@ -346,7 +333,6 @@ fn dashboard_auth_status(config: &ApiConfig) -> HttpResponse {
         "dashboard_auth_version": 3,
         "viewer_username": config.viewer_username.clone(),
         "viewer_password_configured": config.viewer_password.is_some(),
-        "owner_password_fallback_available": config.viewer_password.is_none() && config.oauth_owner_secret.is_some(),
         "read_only_token_configured": config.read_only_token.is_some(),
         "read_write_token_configured": config.read_write_token.is_some()
     }))
@@ -398,6 +384,10 @@ fn route_http(
     }
 
     if let Some(response) = crate::dashboard::route(&request) {
+        return response;
+    }
+
+    if let Some(response) = crate::browser::route(&request) {
         return response;
     }
 
@@ -1254,17 +1244,5 @@ mod tests {
         };
         assert!(dashboard_auth_scope(&wrong, &config) == AuthScope::None);
 
-        let fallback_config = ApiConfig {
-            viewer_username: "viewer".to_string(),
-            viewer_password: None,
-            oauth_owner_secret: Some("owner-secret".to_string()),
-            ..ApiConfig::default()
-        };
-        let owner_fallback = DashboardOverviewRequest {
-            viewer_username: "viewer".to_string(),
-            viewer_password: "owner-secret".to_string(),
-            api_token: String::new(),
-        };
-        assert!(dashboard_auth_scope(&owner_fallback, &fallback_config) == AuthScope::ReadOnly);
     }
 }

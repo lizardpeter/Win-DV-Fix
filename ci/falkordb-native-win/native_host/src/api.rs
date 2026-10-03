@@ -305,7 +305,7 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
         return Err("HTTP request target must use origin-form".to_string());
     }
 
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     let mut header_bytes = 0usize;
     let mut header_count = 0usize;
     loop {

@@ -2,9 +2,12 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -21,6 +24,22 @@ use crate::{
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BATCH_QUERIES: usize = 100;
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HEADERS: usize = 100;
+const MAX_CHUNK_LINE_BYTES: usize = 1024;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+const MAX_API_CONNECTIONS: usize = 256;
+const API_IO_TIMEOUT_SECS: u64 = 30;
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -149,17 +168,38 @@ pub fn serve_api(config: ApiConfig, catalog: Arc<GraphCatalog>) -> Result<(), St
     );
 
     let config = Arc::new(config);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                let previous = active_connections.fetch_add(1, Ordering::AcqRel);
+                if previous >= MAX_API_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Release);
+                    drop(stream);
+                    continue;
+                }
+
+                let permit = ConnectionPermit(Arc::clone(&active_connections));
                 let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
                 let tls = tls.clone();
                 thread::spawn(move || {
+                    let _permit = permit;
                     let peer = stream.peer_addr().ok();
+                    let timeout = Some(Duration::from_secs(API_IO_TIMEOUT_SECS));
                     let result = stream
                         .set_nodelay(true)
                         .map_err(|e| format!("set API TCP_NODELAY: {e}"))
+                        .and_then(|_| {
+                            stream
+                                .set_read_timeout(timeout)
+                                .map_err(|e| format!("set API read timeout: {e}"))
+                        })
+                        .and_then(|_| {
+                            stream
+                                .set_write_timeout(timeout)
+                                .map_err(|e| format!("set API write timeout: {e}"))
+                        })
                         .and_then(|_| {
                             if let Some(tls) = tls {
                                 let conn = ServerConnection::new(tls)
@@ -216,15 +256,33 @@ pub(crate) struct HttpResponse {
     pub(crate) headers: Vec<(String, String)>,
 }
 
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let mut line = Vec::with_capacity(limit.min(1024));
+    let mut limited = reader.take((limit + 1) as u64);
+    let read = limited
+        .read_until(b'\n', &mut line)
+        .map_err(|e| format!("read {what}: {e}"))?;
+
+    if read > limit {
+        return Err(format!("{what} exceeds {limit} bytes"));
+    }
+    if read > 0 && !line.ends_with(b"\n") {
+        return Err(format!("unterminated {what}"));
+    }
+    Ok(line)
+}
+
 fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|e| format!("read HTTP request line: {e}"))?;
+    let request_line = read_line_limited(reader, MAX_REQUEST_LINE_BYTES, "HTTP request line")?;
     if request_line.is_empty() {
         return Err("HTTP client closed before request line".to_string());
     }
-
+    let request_line = std::str::from_utf8(&request_line)
+        .map_err(|_| "HTTP request line is not UTF-8".to_string())?;
     let mut parts = request_line.trim_end_matches(['\r', '\n']).split_whitespace();
     let method = parts
         .next()
@@ -237,36 +295,79 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
     let version = parts
         .next()
         .ok_or_else(|| "malformed HTTP version".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed HTTP request line".to_string());
+    }
     if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
         return Err(format!("unsupported HTTP version: {version}"));
     }
+    if !target.starts_with('/') {
+        return Err("HTTP request target must use origin-form".to_string());
+    }
 
     let mut headers = HashMap::new();
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read HTTP header: {e}"))?;
-        if line == "\r\n" || line == "\n" {
+        let line = read_line_limited(reader, MAX_HEADER_LINE_BYTES, "HTTP header line")?;
+        if line == b"\r\n" || line == b"\n" {
             break;
         }
         if line.is_empty() {
             return Err("unexpected EOF inside HTTP headers".to_string());
         }
+
+        header_count = header_count.saturating_add(1);
+        if header_count > MAX_HEADERS {
+            return Err(format!("too many HTTP headers; maximum is {MAX_HEADERS}"));
+        }
+        header_bytes = header_bytes
+            .checked_add(line.len())
+            .ok_or_else(|| "HTTP header size overflow".to_string())?;
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(format!("HTTP headers exceed {MAX_HEADER_BYTES} bytes"));
+        }
+
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| "HTTP header is not UTF-8".to_string())?;
+        let line = line.trim_end_matches(['\r', '\n']);
         let Some((name, value)) = line.split_once(':') else {
             return Err("malformed HTTP header".to_string());
         };
-        headers.insert(
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_string(),
-        );
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid HTTP header name".to_string());
+        }
+        let value = value.trim().to_string();
+
+        if let Some(existing) = headers.get_mut(&name) {
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "authorization"
+                    | "x-falkordb-dashboard-authorization"
+            ) {
+                return Err(format!("duplicate security-sensitive HTTP header: {name}"));
+            }
+            existing.push_str(", ");
+            existing.push_str(&value);
+        } else {
+            headers.insert(name, value);
+        }
+    }
+
+    if version == "HTTP/1.1" && !headers.contains_key("host") {
+        return Err("HTTP/1.1 request is missing Host header".to_string());
     }
 
     let transfer_encoding = headers.get("transfer-encoding").map(String::as_str);
     if transfer_encoding.is_some() && headers.contains_key("content-length") {
-        // Reject ambiguous framing rather than trying to guess which header a
-        // proxy/client intended. This prevents request-smuggling differences
-        // between the native listener and an upstream reverse proxy.
         return Err(
             "request must not send both Transfer-Encoding and Content-Length".to_string(),
         );
@@ -313,9 +414,7 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
                 .map_err(|e| format!("read HTTP request body: {e}"))?;
             body
         }
-        Some(value) if value.eq_ignore_ascii_case("chunked") => {
-            read_chunked_body(reader)?
-        }
+        Some(value) if value.eq_ignore_ascii_case("chunked") => read_chunked_body(reader)?,
         Some(_) => {
             return Err(
                 "unsupported Transfer-Encoding; only identity and chunked are supported"
@@ -332,23 +431,17 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
     })
 }
 
-
 fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
 
     loop {
-        let mut size_line = String::new();
-        reader
-            .read_line(&mut size_line)
-            .map_err(|e| format!("read HTTP chunk size: {e}"))?;
+        let size_line = read_line_limited(reader, MAX_CHUNK_LINE_BYTES, "HTTP chunk size")?;
         if size_line.is_empty() {
             return Err("unexpected EOF before HTTP chunk size".to_string());
         }
-        if !size_line.ends_with('\n') {
-            return Err("unterminated HTTP chunk size line".to_string());
-        }
-
-        let size_text = size_line.trim_end_matches(['\r', '\n']);
+        let size_text = std::str::from_utf8(&size_line)
+            .map_err(|_| "HTTP chunk size is not UTF-8".to_string())?
+            .trim_end_matches(['\r', '\n']);
         let size_hex = size_text
             .split_once(';')
             .map_or(size_text, |(size, _extensions)| size)
@@ -360,20 +453,26 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
             .map_err(|_| "invalid HTTP chunk size".to_string())?;
 
         if size == 0 {
-            // Consume optional trailer fields. We do not currently expose
-            // trailers to handlers, but we must consume them so the request is
-            // framed correctly for proxies that add them.
+            let mut trailer_bytes = 0usize;
             loop {
-                let mut trailer = String::new();
-                reader
-                    .read_line(&mut trailer)
-                    .map_err(|e| format!("read HTTP chunk trailer: {e}"))?;
-                if trailer == "\r\n" || trailer == "\n" {
+                let trailer =
+                    read_line_limited(reader, MAX_HEADER_LINE_BYTES, "HTTP chunk trailer")?;
+                if trailer == b"\r\n" || trailer == b"\n" {
                     return Ok(body);
                 }
                 if trailer.is_empty() {
                     return Err("unexpected EOF inside HTTP chunk trailers".to_string());
                 }
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer.len())
+                    .ok_or_else(|| "HTTP trailer size overflow".to_string())?;
+                if trailer_bytes > MAX_TRAILER_BYTES {
+                    return Err(format!(
+                        "HTTP chunk trailers exceed {MAX_TRAILER_BYTES} bytes"
+                    ));
+                }
+                let trailer = std::str::from_utf8(&trailer)
+                    .map_err(|_| "HTTP chunk trailer is not UTF-8".to_string())?;
                 if !trailer.contains(':') {
                     return Err("malformed HTTP chunk trailer".to_string());
                 }
@@ -403,6 +502,7 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
         }
     }
 }
+
 
 fn dashboard_auth_scope(payload: &DashboardOverviewRequest, config: &ApiConfig) -> AuthScope {
     if !payload.api_token.is_empty() {
@@ -1070,7 +1170,7 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
 
     write!(
         writer,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\nStrict-Transport-Security: max-age=31536000\r\n",
         response.status,
         reason,
         response.content_type,

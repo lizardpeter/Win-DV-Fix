@@ -58,7 +58,17 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $Root = [IO.Path]::GetFullPath('.\ci\falkordb-native-win')
-          $NativeLibDir = (Get-Content (Join-Path $Root 'build\native-lib-dir.txt') -Raw).Trim()
+          $LibDirFile = Join-Path $Root 'build\native-lib-dir.txt'
+          if (Test-Path $LibDirFile) {
+            $NativeLibDir = (Get-Content $LibDirFile -Raw).Trim()
+          } else {
+            $Candidate = Get-ChildItem -Path (Join-Path $Root 'build\native-prefix') -Recurse -Filter graphblas.lib | Select-Object -First 1
+            if (-not $Candidate) {
+              $Candidate = Get-ChildItem -Path (Join-Path $Root 'build\native-prefix') -Recurse -Filter graphblas_static.lib | Select-Object -First 1
+            }
+            if (-not $Candidate) { throw "Could not locate GraphBLAS library in cached native prefix" }
+            $NativeLibDir = $Candidate.Directory.FullName
+          }
           $env:GRAPHBLAS_LIB_DIR = $NativeLibDir
           $env:LAGRAPH_LIB_DIR = $NativeLibDir
           $env:FALKORDB_NATIVE_NO_OPENMP = "1"

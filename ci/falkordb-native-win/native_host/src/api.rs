@@ -262,30 +262,67 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
         );
     }
 
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
-    {
-        return Err("chunked/encoded request bodies are not supported".to_string());
+    let transfer_encoding = headers.get("transfer-encoding").map(String::as_str);
+    if transfer_encoding.is_some() && headers.contains_key("content-length") {
+        // Reject ambiguous framing rather than trying to guess which header a
+        // proxy/client intended. This prevents request-smuggling differences
+        // between the native listener and an upstream reverse proxy.
+        return Err(
+            "request must not send both Transfer-Encoding and Content-Length".to_string(),
+        );
     }
 
-    let content_length = headers
-        .get("content-length")
-        .map(|v| {
-            v.parse::<usize>()
-                .map_err(|_| "invalid Content-Length".to_string())
-        })
-        .transpose()?
-        .unwrap_or(0);
+    let body = match transfer_encoding {
+        None => {
+            let content_length = headers
+                .get("content-length")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|_| "invalid Content-Length".to_string())
+                })
+                .transpose()?
+                .unwrap_or(0);
 
-    if content_length > MAX_BODY_BYTES {
-        return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
-    }
+            if content_length > MAX_BODY_BYTES {
+                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            }
 
-    let mut body = vec![0u8; content_length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|e| format!("read HTTP request body: {e}"))?;
+            let mut body = vec![0u8; content_length];
+            reader
+                .read_exact(&mut body)
+                .map_err(|e| format!("read HTTP request body: {e}"))?;
+            body
+        }
+        Some(value) if value.eq_ignore_ascii_case("identity") => {
+            let content_length = headers
+                .get("content-length")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|_| "invalid Content-Length".to_string())
+                })
+                .transpose()?
+                .unwrap_or(0);
+
+            if content_length > MAX_BODY_BYTES {
+                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            }
+
+            let mut body = vec![0u8; content_length];
+            reader
+                .read_exact(&mut body)
+                .map_err(|e| format!("read HTTP request body: {e}"))?;
+            body
+        }
+        Some(value) if value.eq_ignore_ascii_case("chunked") => {
+            read_chunked_body(reader)?
+        }
+        Some(_) => {
+            return Err(
+                "unsupported Transfer-Encoding; only identity and chunked are supported"
+                    .to_string(),
+            );
+        }
+    };
 
     Ok(HttpRequest {
         method,
@@ -293,6 +330,78 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
         headers,
         body,
     })
+}
+
+
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+
+    loop {
+        let mut size_line = String::new();
+        reader
+            .read_line(&mut size_line)
+            .map_err(|e| format!("read HTTP chunk size: {e}"))?;
+        if size_line.is_empty() {
+            return Err("unexpected EOF before HTTP chunk size".to_string());
+        }
+        if !size_line.ends_with('\n') {
+            return Err("unterminated HTTP chunk size line".to_string());
+        }
+
+        let size_text = size_line.trim_end_matches(['\r', '\n']);
+        let size_hex = size_text
+            .split_once(';')
+            .map_or(size_text, |(size, _extensions)| size)
+            .trim();
+        if size_hex.is_empty() {
+            return Err("empty HTTP chunk size".to_string());
+        }
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| "invalid HTTP chunk size".to_string())?;
+
+        if size == 0 {
+            // Consume optional trailer fields. We do not currently expose
+            // trailers to handlers, but we must consume them so the request is
+            // framed correctly for proxies that add them.
+            loop {
+                let mut trailer = String::new();
+                reader
+                    .read_line(&mut trailer)
+                    .map_err(|e| format!("read HTTP chunk trailer: {e}"))?;
+                if trailer == "\r\n" || trailer == "\n" {
+                    return Ok(body);
+                }
+                if trailer.is_empty() {
+                    return Err("unexpected EOF inside HTTP chunk trailers".to_string());
+                }
+                if !trailer.contains(':') {
+                    return Err("malformed HTTP chunk trailer".to_string());
+                }
+            }
+        }
+
+        let new_len = body
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| "HTTP chunked body length overflow".to_string())?;
+        if new_len > MAX_BODY_BYTES {
+            return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+        }
+
+        let start = body.len();
+        body.resize(new_len, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(|e| format!("read HTTP chunk body: {e}"))?;
+
+        let mut terminator = [0u8; 2];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|e| format!("read HTTP chunk terminator: {e}"))?;
+        if terminator != *b"\r\n" {
+            return Err("HTTP chunk is not terminated by CRLF".to_string());
+        }
+    }
 }
 
 fn dashboard_auth_scope(payload: &DashboardOverviewRequest, config: &ApiConfig) -> AuthScope {
@@ -1101,6 +1210,61 @@ fn openapi_document() -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_parser_accepts_chunked_form_post() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "7\r\n",
+            "owner_s\r\n",
+            "A\r\n",
+            "ecret=abc\r\n",
+            "3\r\n",
+            "123\r\n",
+            "0\r\n",
+            "X-Proxy-Trailer: ok\r\n",
+            "\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let request = read_http_request(&mut reader).expect("chunked request should parse");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/oauth/authorize");
+        assert_eq!(request.body, b"owner_secret=abc123");
+    }
+
+    #[test]
+    fn http_parser_rejects_ambiguous_content_length_and_chunked() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Length: 4\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "4\r\n",
+            "test\r\n",
+            "0\r\n\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = read_http_request(&mut reader).expect_err("ambiguous framing must fail");
+        assert!(err.contains("both Transfer-Encoding and Content-Length"));
+    }
+
+    #[test]
+    fn http_parser_rejects_unsupported_transfer_codings() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = read_http_request(&mut reader).expect_err("unsupported coding must fail");
+        assert!(err.contains("unsupported Transfer-Encoding"));
+    }
 
     #[test]
     fn remote_api_requires_tls_by_default() {

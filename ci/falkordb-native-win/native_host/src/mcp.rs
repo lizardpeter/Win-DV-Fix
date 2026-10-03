@@ -19,7 +19,7 @@ use crate::{
 };
 
 const PROTOCOL_MODERN: &str = "2026-07-28";
-pub const OAUTH_BUILD_ID: &str = "oauth-persistent-v4-20261003";
+pub const OAUTH_BUILD_ID: &str = "oauth-tunnel-metadata-v5-20261003";
 const SERVER_VERSION: &str = "0.5.0";
 pub const TOOLSET_VERSION: &str = "2026-10-01.4";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
@@ -112,7 +112,14 @@ pub(crate) fn route_http(
         .split_once('?')
         .map_or(request.target.as_str(), |(path, _)| path);
 
-    if config.tunnel_mode && path != "/mcp" {
+    if config.tunnel_mode
+        && !matches!(
+            path,
+            "/mcp"
+                | "/.well-known/oauth-protected-resource"
+                | "/.well-known/oauth-protected-resource/mcp"
+        )
+    {
         return None;
     }
 
@@ -198,13 +205,28 @@ fn protected_resource_metadata(request: &HttpRequest, config: &ApiConfig) -> Htt
     let Some(base) = request_base(request, config) else {
         return oauth_error(400, "invalid_request", "missing or invalid Host header");
     };
+
+    if config.tunnel_mode {
+        // The embedded Secure MCP Tunnel authenticates the loopback hop with
+        // an injected Bearer header. From the tunnel runtime's perspective the
+        // target does not expose an end-user OAuth authorization server, but it
+        // still performs RFC 9728 protected-resource discovery at startup and
+        // requires the mandatory "resource" field.
+        return json_response(
+            200,
+            json!({
+                "resource": format!("{base}/mcp")
+            }),
+        );
+    }
+
     json_response(
         200,
         json!({
             "resource": format!("{base}/mcp"),
             "authorization_servers": [base],
             "scopes_supported": [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN],
-            "resource_documentation": format!("{}/openapi.json", request_base(request, config).unwrap_or_default())
+            "resource_documentation": format!("{base}/openapi.json")
         }),
     )
 }
@@ -2145,6 +2167,41 @@ fn oauth_error(status: u16, code: &str, description: &str) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_mode_exposes_valid_protected_resource_metadata() {
+        let config = ApiConfig {
+            tunnel_mode: true,
+            read_write_token: Some("local-hop-secret".to_string()),
+            ..ApiConfig::default()
+        };
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "127.0.0.1:18444".to_string());
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/.well-known/oauth-protected-resource/mcp".to_string(),
+            headers,
+            body: Vec::new(),
+        };
+
+        let response = route_http(
+            &request,
+            &GraphCatalog::open(&std::env::temp_dir().join(format!(
+                "falkordb-tunnel-prm-{}",
+                std::process::id()
+            )))
+            .expect("temporary catalog"),
+            &config,
+        )
+        .expect("tunnel metadata route");
+        assert_eq!(response.status, 200);
+        let body: JsonValue = serde_json::from_slice(&response.body).expect("metadata JSON");
+        assert_eq!(
+            body["resource"],
+            JsonValue::String("http://127.0.0.1:18444/mcp".to_string())
+        );
+        assert!(body.get("authorization_servers").is_none());
+    }
 
     #[test]
     fn pkce_matches_rfc7636_example() {

@@ -42,3 +42,5 @@ jobs:
           curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/hb -o /tmp/bodyauth -H 'Content-Type: application/json' --data '{"viewer_username":"viewer","viewer_password":"__definitely_wrong__","api_token":""}' "https://$HOST/dashboard/overview?probe=$TS" || echo "curl bodyauth exit=$?"
           cat /tmp/hb 2>/dev/null || true
           cat /tmp/bodyauth 2>/dev/null || true
+
+# live-auth-probe-3

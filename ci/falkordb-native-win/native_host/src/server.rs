@@ -2714,7 +2714,7 @@ mod tests {
 
     #[test]
     fn unauthenticated_resp_limits_reject_large_payloads_before_allocation() {
-        let raw = format!("*2\\r\\n$4\\r\\nAUTH\\r\\n${}\\r\\n", MAX_RESP_PREAUTH_BULK_BYTES + 1);
+        let raw = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n", MAX_RESP_PREAUTH_BULK_BYTES + 1);
         let mut reader = BufReader::new(std::io::Cursor::new(raw.as_bytes()));
         let err = match read_command_with_limits(
             &mut reader,

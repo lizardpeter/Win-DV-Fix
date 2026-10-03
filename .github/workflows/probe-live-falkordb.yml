@@ -1,0 +1,39 @@
+name: Probe Live FalkorDB Dashboard
+
+on:
+  push:
+    branches:
+      - chatgpt/falkordb-native-win-ci
+    paths:
+      - '.github/workflows/probe-live-falkordb.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe live endpoint
+        shell: bash
+        run: |
+          set -u
+          HOST='db.houseofkublai.com:18443'
+          TS="$(date +%s)"
+          echo "=== DNS ==="
+          getent ahosts db.houseofkublai.com || true
+          echo "=== DASHBOARD HEADERS/BODY ==="
+          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/h1 -o /tmp/dashboard "https://$HOST/dashboard?probe=$TS" || echo "curl dashboard exit=$?"
+          cat /tmp/h1 2>/dev/null || true
+          echo "--- dashboard markers ---"
+          grep -Eo 'dashboard-auth-v[0-9]+|/dashboard/app\.js[^" ]*|/dashboard/style\.css[^" ]*' /tmp/dashboard 2>/dev/null || true
+          echo "=== APP.JS HEADERS/BODY MARKERS ==="
+          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/h2 -o /tmp/app "https://$HOST/dashboard/app.js?probe=$TS" || echo "curl app exit=$?"
+          cat /tmp/h2 2>/dev/null || true
+          grep -E 'X-FalkorDB-Dashboard-Authorization|Authorization|authMode|viewerPassword|tokenInput' /tmp/app 2>/dev/null | head -30 || true
+          echo "=== OVERVIEW NO AUTH ==="
+          curl -k -sS --connect-timeout 10 --max-time 20 -D /tmp/h3 -o /tmp/overview "https://$HOST/v1/overview?probe=$TS" || echo "curl overview exit=$?"
+          cat /tmp/h3 2>/dev/null || true
+          cat /tmp/overview 2>/dev/null || true

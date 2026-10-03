@@ -120,6 +120,16 @@ struct DeleteGraphRequest {
     graph: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardOverviewRequest {
+    #[serde(default)]
+    viewer_username: String,
+    #[serde(default)]
+    viewer_password: String,
+    #[serde(default)]
+    api_token: String,
+}
+
 pub fn serve_api(config: ApiConfig, catalog: Arc<GraphCatalog>) -> Result<(), String> {
     config.validate()?;
     let tls = config
@@ -285,6 +295,47 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
     })
 }
 
+fn dashboard_auth_scope(payload: &DashboardOverviewRequest, config: &ApiConfig) -> AuthScope {
+    if !payload.api_token.is_empty() {
+        if config
+            .read_write_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.api_token))
+        {
+            return AuthScope::ReadWrite;
+        }
+        if config
+            .read_only_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.api_token))
+        {
+            return AuthScope::ReadOnly;
+        }
+        return AuthScope::None;
+    }
+
+    if payload.viewer_username == config.viewer_username
+        && config
+            .viewer_password
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.viewer_password))
+    {
+        return AuthScope::ReadOnly;
+    }
+
+    AuthScope::None
+}
+
+fn dashboard_auth_status(config: &ApiConfig) -> HttpResponse {
+    json_response(200, json!({
+        "dashboard_auth_version": 3,
+        "viewer_username": config.viewer_username.clone(),
+        "viewer_password_configured": config.viewer_password.is_some(),
+        "read_only_token_configured": config.read_only_token.is_some(),
+        "read_write_token_configured": config.read_write_token.is_some()
+    }))
+}
+
 fn route_http(
     request: HttpRequest,
     catalog: &GraphCatalog,
@@ -304,6 +355,30 @@ fn route_http(
 
     if config.tunnel_mode {
         return error_response(404, "not_found", "Secure MCP Tunnel backend exposes only /mcp and /healthz");
+    }
+
+    let request_path = request
+        .target
+        .split_once('?')
+        .map_or(request.target.as_str(), |(path, _)| path);
+
+    if request.method == "GET" && request_path == "/dashboard/auth-status" {
+        return dashboard_auth_status(config);
+    }
+
+    if request.method == "POST" && request_path == "/dashboard/overview" {
+        let payload: DashboardOverviewRequest = match parse_json(&request.body) {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+        if dashboard_auth_scope(&payload, config) == AuthScope::None {
+            return error_response(
+                401,
+                "unauthorized",
+                "invalid dashboard credentials",
+            );
+        }
+        return overview_response(catalog);
     }
 
     if let Some(response) = crate::dashboard::route(&request) {
@@ -1123,5 +1198,44 @@ mod tests {
             "Bearer read-secret".to_string(),
         );
         assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+    }
+
+    #[test]
+    fn dashboard_body_auth_accepts_viewer_and_tokens() {
+        let config = ApiConfig {
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            read_write_token: Some("write-secret".to_string()),
+            read_only_token: Some("read-secret".to_string()),
+            ..ApiConfig::default()
+        };
+
+        let viewer = DashboardOverviewRequest {
+            viewer_username: "viewer".to_string(),
+            viewer_password: "viewer-secret".to_string(),
+            api_token: String::new(),
+        };
+        assert!(dashboard_auth_scope(&viewer, &config) == AuthScope::ReadOnly);
+
+        let read_token = DashboardOverviewRequest {
+            viewer_username: String::new(),
+            viewer_password: String::new(),
+            api_token: "read-secret".to_string(),
+        };
+        assert!(dashboard_auth_scope(&read_token, &config) == AuthScope::ReadOnly);
+
+        let write_token = DashboardOverviewRequest {
+            viewer_username: String::new(),
+            viewer_password: String::new(),
+            api_token: "write-secret".to_string(),
+        };
+        assert!(dashboard_auth_scope(&write_token, &config) == AuthScope::ReadWrite);
+
+        let wrong = DashboardOverviewRequest {
+            viewer_username: "viewer".to_string(),
+            viewer_password: "wrong".to_string(),
+            api_token: String::new(),
+        };
+        assert!(dashboard_auth_scope(&wrong, &config) == AuthScope::None);
     }
 }

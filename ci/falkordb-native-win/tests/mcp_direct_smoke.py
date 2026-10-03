@@ -184,7 +184,26 @@ def oauth_link(
     )
 
 
+def verify_local_tunnel_oauth_metadata():
+    conn = http.client.HTTPConnection("127.0.0.1", 18444, timeout=10)
+    conn.request("GET", "/.well-known/oauth-protected-resource/mcp")
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    if resp.status != 200:
+        raise AssertionError(
+            ("local tunnel protected-resource metadata failed", resp.status, data.decode(errors="replace"))
+        )
+    metadata = json.loads(data)
+    assert metadata["resource"] == "http://127.0.0.1:18444/mcp", metadata
+    # The loopback hop is authenticated by the tunnel runtime's injected
+    # Bearer header; it must not advertise an end-user OAuth server on localhost.
+    assert "authorization_servers" not in metadata, metadata
+    print("SECURE_TUNNEL_OAUTH_METADATA_PASS")
+
+
 def write_phase(ctx, token_file: Path, import_root: Path):
+    verify_local_tunnel_oauth_metadata()
     status, _, data = request(ctx, "GET", "/.well-known/oauth-protected-resource")
     assert status == 200, (status, data)
     metadata = json.loads(data)

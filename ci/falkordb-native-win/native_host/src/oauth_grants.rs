@@ -204,16 +204,57 @@ fn save_store(data_dir: &Path, store: &GrantStore) -> Result<(), String> {
             .map_err(|e| format!("sync OAuth grant temp file {}: {e}", temp.display()))?;
     }
 
-    // Windows does not allow rename-over-existing in the same way Unix does.
-    // Keep the durable temp file until the new contents are fully flushed, then
-    // replace the small metadata file.
-    if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| format!("replace OAuth grant store {}: {e}", path.display()))?;
-    }
-    fs::rename(&temp, &path)
-        .map_err(|e| format!("install OAuth grant store {}: {e}", path.display()))?;
+    install_store_file(&temp, &path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_store_file(temp: &Path, path: &Path) -> Result<(), String> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Storage::FileSystem::{
+        REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
+    };
+
+    if !path.exists() {
+        return fs::rename(temp, path)
+            .map_err(|e| format!("install OAuth grant store {}: {e}", path.display()));
+    }
+
+    let target = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let replacement = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    let replaced = unsafe {
+        ReplaceFileW(
+            target.as_ptr(),
+            replacement.as_ptr(),
+            ptr::null(),
+            REPLACEFILE_IGNORE_MERGE_ERRORS,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        return Err(format!(
+            "atomically replace OAuth grant store {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_store_file(temp: &Path, path: &Path) -> Result<(), String> {
+    fs::rename(temp, path)
+        .map_err(|e| format!("atomically replace OAuth grant store {}: {e}", path.display()))
 }
 
 fn random_refresh_token() -> Result<String, String> {

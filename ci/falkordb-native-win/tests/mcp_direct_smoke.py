@@ -42,6 +42,35 @@ def request(ctx, method, target, body=None, headers=None):
     return result
 
 
+def request_chunked(ctx, method, target, body, headers=None):
+    conn = http.client.HTTPSConnection(HOST, PORT, context=ctx, timeout=10)
+    headers = dict(headers or {})
+    payload = body.encode() if isinstance(body, str) else bytes(body)
+    conn.putrequest(method, target)
+    for name, value in headers.items():
+        conn.putheader(name, value)
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+
+    # Send multiple chunks plus a harmless trailer to exercise the same HTTP/1.1
+    # framing a reverse proxy may use for a browser form POST.
+    cut1 = max(1, len(payload) // 3)
+    cut2 = max(cut1 + 1, (2 * len(payload)) // 3)
+    for chunk in (payload[:cut1], payload[cut1:cut2], payload[cut2:]):
+        if not chunk:
+            continue
+        conn.send(f"{len(chunk):X}\r\n".encode())
+        conn.send(chunk)
+        conn.send(b"\r\n")
+    conn.send(b"0\r\nX-Proxy-Trailer: oauth-ci\r\n\r\n")
+
+    resp = conn.getresponse()
+    data = resp.read()
+    result = (resp.status, dict(resp.getheaders()), data)
+    conn.close()
+    return result
+
+
 def rpc(ctx, method, params=None, token=None, request_id=1):
     body = {
         "jsonrpc": "2.0",
@@ -69,7 +98,13 @@ def rpc(ctx, method, params=None, token=None, request_id=1):
     return parsed["result"]
 
 
-def oauth_link(ctx, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, state="native-ci-state"):
+def oauth_link(
+    ctx,
+    client_id=CLIENT_ID,
+    redirect_uri=REDIRECT_URI,
+    state="native-ci-state",
+    chunked_authorize=False,
+):
     resource = f"https://{HOST}:{PORT}/mcp"
     scope = "graph:read graph:write graph:admin"
     auth_form = {
@@ -84,7 +119,8 @@ def oauth_link(ctx, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, state="nativ
         "api_token": API_TOKEN,
     }
     encoded = urllib.parse.urlencode(auth_form)
-    status, headers, data = request(
+    authorize_request = request_chunked if chunked_authorize else request
+    status, headers, data = authorize_request(
         ctx,
         "POST",
         "/oauth/authorize",
@@ -198,6 +234,7 @@ def write_phase(ctx, token_file: Path, import_root: Path):
         client_id=CLAUDE_WEB_CLIENT_ID,
         redirect_uri=CLAUDE_WEB_REDIRECT_URI,
         state="claude-web-ci-state",
+        chunked_authorize=True,
     )
     claude_web_read = rpc(
         ctx,
@@ -207,7 +244,7 @@ def write_phase(ctx, token_file: Path, import_root: Path):
         request_id=29,
     )
     assert claude_web_read["isError"] is False, claude_web_read
-    print("CLAUDE_WEB_OAUTH_PASS")
+    print("CLAUDE_WEB_CHUNKED_OAUTH_PASS")
 
     claude_token, _ = oauth_link(
         ctx,

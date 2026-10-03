@@ -55,6 +55,14 @@ static OPENAI_TUNNEL_NOTICE: &str = include_str!(concat!(
     "/../build/openai-tunnel-NOTICE.txt"
 ));
 
+fn generate_oauth_pairing_code() -> Result<String, String> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 24];
+    rng.fill(&mut bytes)
+        .map_err(|_| "generate OAuth pairing code: secure random generator failed".to_string())?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 fn executable_root() -> Result<PathBuf, String> {
     let exe = env::current_exe()
         .map_err(|e| format!("resolve executable path: {e}"))?;
@@ -64,14 +72,6 @@ fn executable_root() -> Result<PathBuf, String> {
     parent
         .canonicalize()
         .map_err(|e| format!("canonicalize executable directory {}: {e}", parent.display()))
-}
-
-fn generate_oauth_pairing_code() -> Result<String, String> {
-    let rng = SystemRandom::new();
-    let mut bytes = [0u8; 24];
-    rng.fill(&mut bytes)
-        .map_err(|_| "generate OAuth pairing code: secure random generator failed".to_string())?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<PathBuf, String> {
@@ -120,10 +120,10 @@ fn portable_path(root: &Path, raw: impl AsRef<Path>, label: &str) -> Result<Path
     Ok(candidate)
 }
 
-
 #[derive(Default)]
 struct LocalSecrets {
     password: Option<String>,
+    viewer_password: Option<String>,
     api_token: Option<String>,
     api_read_token: Option<String>,
     openai_tunnel_id: Option<String>,
@@ -148,7 +148,6 @@ fn parse_secret_assignment(line: &str) -> Option<(String, String)> {
     if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
         return None;
     }
-
     let (raw_name, raw_value) = line.split_once('=')?;
     let mut name = raw_name.trim();
     if let Some(rest) = name.strip_prefix("set ") {
@@ -157,9 +156,9 @@ fn parse_secret_assignment(line: &str) -> Option<(String, String)> {
     if let Some(rest) = name.strip_prefix("$env:") {
         name = rest.trim();
     }
-
     match name {
         "FALKORDB_PASSWORD"
+        | "FALKORDB_VIEWER_PASSWORD"
         | "FALKORDB_API_TOKEN"
         | "FALKORDB_API_READ_TOKEN"
         | "OPENAI_TUNNEL_ID"
@@ -175,7 +174,6 @@ fn load_local_secrets(root: &Path) -> Result<LocalSecrets, String> {
     if !path.exists() {
         return Ok(LocalSecrets::default());
     }
-
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("read local secrets file {}: {e}", path.display()))?;
     let mut secrets = LocalSecrets::default();
@@ -188,6 +186,7 @@ fn load_local_secrets(root: &Path) -> Result<LocalSecrets, String> {
         }
         match name.as_str() {
             "FALKORDB_PASSWORD" => secrets.password = Some(value),
+            "FALKORDB_VIEWER_PASSWORD" => secrets.viewer_password = Some(value),
             "FALKORDB_API_TOKEN" => secrets.api_token = Some(value),
             "FALKORDB_API_READ_TOKEN" => secrets.api_read_token = Some(value),
             "OPENAI_TUNNEL_ID" => secrets.openai_tunnel_id = Some(value),
@@ -495,9 +494,6 @@ fn configure_portable_process(root: &Path) -> Result<(), String> {
         if env::var_os("FALKORDB_DATA_DIR").is_none() {
             env::set_var("FALKORDB_DATA_DIR", "data");
         }
-        if env::var_os("FALKORDB_IMPORT_DIR").is_none() {
-            env::set_var("FALKORDB_IMPORT_DIR", root.join("imports"));
-        }
         env::set_var("TEMP", &tmp);
         env::set_var("TMP", &tmp);
         env::set_var("HOME", &profile);
@@ -556,6 +552,15 @@ fn main() -> Result<(), String> {
             config.username = username;
         }
     }
+    if let Ok(username) = env::var("FALKORDB_VIEWER_USERNAME") {
+        if !username.is_empty() {
+            config.viewer_username = username;
+        }
+    }
+    config.viewer_password = env::var("FALKORDB_VIEWER_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| local_secrets.viewer_password.clone());
 
     let resolve_env_path = |name: &str| -> Result<Option<PathBuf>, String> {
         let Some(value) = env::var_os(name) else {
@@ -628,10 +633,8 @@ fn main() -> Result<(), String> {
         .transpose()?
         .unwrap_or(256);
 
-    // A configured API credential implies local management surfaces even when
-    // no bind was specified. The Secure MCP Tunnel backend is loopback-only and
-    // remains protected by the read/write API token, so enabling it by default
-    // does not create a new network ingress path.
+    // A configured API credential implies a localhost API even when no bind
+    // was specified, making the ChatGPT surface easy to enable safely.
     if api_bind.is_none() && (api_token.is_some() || api_read_token.is_some()) {
         api_bind = Some("127.0.0.1:8443".parse().expect("valid default API bind"));
     }
@@ -694,6 +697,17 @@ fn main() -> Result<(), String> {
             }
             "--password" => {
                 config.password = Some(args.next().ok_or_else(|| "--password requires a value".to_string())?);
+            }
+            "--viewer-username" => {
+                config.viewer_username = args
+                    .next()
+                    .ok_or_else(|| "--viewer-username requires a value".to_string())?;
+            }
+            "--viewer-password" => {
+                config.viewer_password = Some(
+                    args.next()
+                        .ok_or_else(|| "--viewer-password requires a value".to_string())?,
+                );
             }
             "--tls-cert" => {
                 let value = args.next().ok_or_else(|| "--tls-cert requires a PEM path".to_string())?;
@@ -795,7 +809,7 @@ PORTABLE OPTIONS:
   --embedded-tunnel-runtime-version
                                    Print the version of the OpenAI tunnel runtime
                                    embedded inside this server.exe and exit.
-  --third-party-licenses            Print embedded OpenAI tunnel NOTICE/license.
+  --third-party-licenses           Print embedded OpenAI tunnel NOTICE/license.
                                    Relative data/TLS paths are rooted there and
                                    external/parent paths are rejected.
                                    Env: FALKORDB_PORTABLE=1
@@ -806,9 +820,12 @@ RESP/FalkorDB OPTIONS:
   --data-dir PATH                  Persistent graph data directory
                                    (portable default: .\data)
                                    Env: FALKORDB_DATA_DIR
-  --username USER                  RESP AUTH username (default: default)
-  --password PASSWORD              RESP AUTH password (or FALKORDB_PASSWORD)
-                                   Falls back to falkordb-secrets.txt beside server.exe
+  --username USER                  RESP admin username (default: default)
+  --password PASSWORD              RESP admin password (or FALKORDB_PASSWORD)
+  --viewer-username USER           Read-only Browser username (default: viewer)
+                                   Env: FALKORDB_VIEWER_USERNAME
+  --viewer-password PASSWORD       Read-only Browser password
+                                   Env: FALKORDB_VIEWER_PASSWORD
   --tls-cert PATH                  PEM server certificate/chain (or FALKORDB_TLS_CERT)
   --tls-key PATH                   PEM private key (or FALKORDB_TLS_KEY)
   --tls-client-ca PATH             Require RESP mTLS clients signed by this PEM CA
@@ -818,18 +835,13 @@ RESP/FalkorDB OPTIONS:
 CHATGPT HTTPS API OPTIONS:
   --api-bind HOST:PORT             Enable API listener, e.g. 0.0.0.0:8443
   --api-token TOKEN                Read/write Bearer token (or FALKORDB_API_TOKEN)
-                                   Falls back to falkordb-secrets.txt beside server.exe
   --api-read-token TOKEN           Optional read-only Bearer token
-                                   OAuth owner approval accepts the RESP password
-                                   and, for compatibility, the read/write API token.
-  --tunnel-mcp-bind HOST:PORT      Override the loopback-only, MCP-only backend
-                                   for OpenAI Secure MCP Tunnel.
+  --tunnel-mcp-bind HOST:PORT      Override the loopback-only MCP backend for
+                                   OpenAI Secure MCP Tunnel.
                                    Default with FALKORDB_API_TOKEN: 127.0.0.1:18444
                                    Env: FALKORDB_TUNNEL_MCP_BIND
-                                   Requires FALKORDB_API_TOKEN. server.exe embeds
-                                   and starts the OpenAI tunnel runtime itself.
-                                   On first interactive run it asks once for the
-                                   tunnel ID and runtime API key, then saves them
+                                   server.exe embeds and starts the OpenAI tunnel.
+                                   First interactive run can save tunnel ID/key
                                    to falkordb-secrets.txt.
   --api-allow-plaintext-remote     Permit non-loopback API without TLS
   --api-allow-unauthenticated-remote
@@ -903,7 +915,7 @@ including a ChatGPT custom integration.
         }
         let Some(local_token) = api_token.clone() else {
             return Err(
-                "Secure MCP Tunnel backend requires FALKORDB_API_TOKEN/--api-token for the local tunnel-client hop"
+                "Secure MCP Tunnel backend requires FALKORDB_API_TOKEN/--api-token for the local tunnel hop"
                     .to_string(),
             );
         };
@@ -912,6 +924,8 @@ including a ChatGPT custom integration.
             bind,
             read_write_token: Some(local_token.clone()),
             read_only_token: None,
+            viewer_username: config.viewer_username.clone(),
+            viewer_password: None,
             oauth_owner_secret: None,
             oauth_owner_secret_fallbacks: Vec::new(),
             oauth_pairing_code: None,
@@ -944,7 +958,7 @@ including a ChatGPT custom integration.
                 }
                 _ => {
                     eprintln!(
-                        "Embedded OpenAI tunnel is not configured yet; server.exe will prompt once when run interactively."
+                        "Embedded OpenAI tunnel is not configured yet; run server.exe interactively once to enter the tunnel ID/runtime API key, or set OPENAI_TUNNEL_ID and OPENAI_TUNNEL_API_KEY."
                     );
                 }
             }
@@ -952,6 +966,12 @@ including a ChatGPT custom integration.
     }
 
     if let Some(bind) = api_bind {
+        let oauth_pairing_code = generate_oauth_pairing_code()?;
+        eprintln!("FalkorDB OAuth build: {OAUTH_BUILD_ID}");
+        eprintln!(
+            "OAuth pairing code (valid until this server restarts): {oauth_pairing_code}"
+        );
+
         let mut oauth_owner_secret_fallbacks = Vec::new();
         for candidate in [
             local_secrets.password.as_ref(),
@@ -969,23 +989,12 @@ including a ChatGPT custom integration.
             }
         }
 
-        let oauth_pairing_code = generate_oauth_pairing_code()?;
-        eprintln!("FalkorDB OAuth build: {OAUTH_BUILD_ID}");
-        eprintln!("OAuth pairing code (valid until this server restarts): {oauth_pairing_code}");
-        eprintln!(
-            "OAuth credential diagnostics: secrets_file={} found={}, file_password={}, file_api_token={}, runtime_password={}, runtime_api_token={}",
-            executable_dir.join("falkordb-secrets.txt").display(),
-            executable_dir.join("falkordb-secrets.txt").exists(),
-            local_secrets.password.is_some(),
-            local_secrets.api_token.is_some(),
-            config.password.is_some(),
-            api_token.is_some(),
-        );
-
         let api_config = ApiConfig {
             bind,
-            read_write_token: api_token.clone(),
-            read_only_token: api_read_token.clone(),
+            read_write_token: api_token,
+            read_only_token: api_read_token,
+            viewer_username: config.viewer_username.clone(),
+            viewer_password: config.viewer_password.clone(),
             oauth_owner_secret: config.password.clone(),
             oauth_owner_secret_fallbacks,
             oauth_pairing_code: Some(oauth_pairing_code),

@@ -11,9 +11,6 @@ state stays inside the folder containing `server.exe`.** The launcher creates:
 ```text
 falkordb-native-windows-x64\
   server.exe
-  tunnel-client.exe
-  start-openai-tunnel.ps1
-  TUNNEL_CLIENT_LICENSES.txt
   start-local.ps1
   portable-env.ps1
   run-tool.ps1
@@ -183,6 +180,28 @@ Raw RDB import is intentionally non-destructive and fail-loud. It refuses
 existing destination graph names, expiring graph keys, non-zero Redis DBs,
 ordinary non-graph Redis keys, Redis FUNCTION libraries, unsupported module
 types, or non-v19 FalkorDB graph records rather than silently dropping data.
+The one explicit auxiliary exception is FalkorDB's own `telemetry{graph}`
+Redis Stream (current stream encodings 26/27): it is parsed and structurally
+validated, omitted from native graph semantics, reported in the import audit,
+and accepted only when the graph named inside the telemetry key is present in
+the same RDB.
+
+### Import an RDB through ChatGPT / MCP
+
+The authenticated MCP surface exposes an admin-only
+\`import_falkordb_rdb_file\` tool. It reads a relative file below
+\`FALKORDB_IMPORT_DIR\` (or \`<data-dir>/imports\` when unset), so large RDBs do
+not transit through the MCP request body. Supply \`expected_graph\` and
+\`sha256\` to bind the operation to the intended authoritative snapshot. Use
+\`dry_run=true\` for validation without graph creation.
+
+The MCP import refuses overwrite, verifies Redis CRC64 and optional SHA-256,
+reassembles the ordered FalkorDB v19 fragments, verifies total node and
+relationship counts after restore, checkpoints the new graph immediately, and
+rolls back graphs created by the operation if a later verification step fails.
+RDBs containing FalkorDB UDF libraries are rejected by this MCP path rather
+than discarding UDF source; use the packaged \`import-rdb\` CLI when UDF
+restoration is required.
 
 ## Import a single ordinary FalkorDB DUMP
 
@@ -207,33 +226,6 @@ whose WAL reaches the configured threshold (256 MiB by default):
 
 Set `FALKORDB_CHECKPOINT_WAL_MB` or pass `--checkpoint-wal-mb` to change the
 threshold.
-
-## OpenAI Secure MCP Tunnel — one executable
-
-The Windows `server.exe` now contains the official OpenAI
-`tunnel-client-runtime` bytes inside the executable. There is no second
-runtime EXE or PowerShell launcher to manage.
-
-When `FALKORDB_API_TOKEN` is configured, `server.exe` automatically starts
-the protected loopback MCP backend at `127.0.0.1:18444`. If OpenAI tunnel
-credentials are not already present and the process is attached to a console,
-the first interactive launch asks once for:
-
-- the OpenAI tunnel ID
-- the OpenAI runtime API key
-
-Those values are added to the existing `falkordb-secrets.txt` beside
-`server.exe` as `OPENAI_TUNNEL_ID` and `OPENAI_TUNNEL_API_KEY`. On every
-later launch, the same `server.exe` starts both FalkorDB and the embedded
-OpenAI tunnel runtime automatically.
-
-The embedded runtime receives the OpenAI runtime API key only through its
-process environment. The existing FalkorDB API token is injected only on the
-local `tunnel-client -> 127.0.0.1:18444` hop. Port 18444 remains loopback-only
-and must never be forwarded through the router.
-
-To disable automatic tunnel startup for maintenance, set
-`FALKORDB_DISABLE_OPENAI_TUNNEL=1`.
 
 ## ChatGPT HTTPS API
 

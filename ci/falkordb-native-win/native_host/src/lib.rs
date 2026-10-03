@@ -1,8 +1,12 @@
 //! Native non-Redis host for FalkorDB's `graph` crate.
 
 pub mod api;
+pub mod bulk;
+pub mod dashboard;
+pub mod file_import;
 pub mod mcp;
 pub mod property_index;
+pub mod query_scheduler;
 pub mod range_index;
 pub mod rdb_file;
 pub mod redis_dump;
@@ -37,6 +41,7 @@ use graph::{
 };
 use orx_tree::{Collection, Dfs, NodeRef};
 use parking_lot::RwLock;
+use query_scheduler::{QueryMode, QueryPermit};
 use slowlog::{SlowLog, SlowLogEntry};
 use wal::Wal;
 use wire::WireValue;
@@ -75,6 +80,16 @@ impl Drop for Engine {
         graph::threadpool::shutdown();
         matrix::shutdown();
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaSummary {
+    pub labels: usize,
+    pub relationship_types: usize,
+    pub property_keys: usize,
+    pub index_definitions: usize,
+    pub constraints: usize,
+    pub schema_version: u64,
 }
 
 #[derive(Debug)]
@@ -389,6 +404,113 @@ impl NativeGraph {
     }
 
 
+    /// Constant-time live graph cardinalities and version, read from the
+    /// committed graph snapshot without planning or executing Cypher.
+    pub fn cardinality_and_version(&self) -> (u64, u64, u64) {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        let graph = committed.borrow();
+        (graph.node_count(), graph.relationship_count(), graph.version)
+    }
+
+    /// Lightweight schema cardinalities from the committed graph snapshot.
+    /// This avoids planning multiple db.* introspection procedures merely to
+    /// populate status/monitoring surfaces.
+    pub fn schema_summary(&self) -> SchemaSummary {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        let graph = committed.borrow();
+        SchemaSummary {
+            labels: graph.get_labels().len(),
+            relationship_types: graph.get_types().len(),
+            property_keys: graph.build_global_attrs().len(),
+            index_definitions: graph.index_info().len(),
+            constraints: graph.constraints().len(),
+            schema_version: graph.schema_version,
+        }
+    }
+
+    pub fn memory_usage_report(
+        &self,
+        samples: usize,
+    ) -> graph::graph::graph::MemoryUsageReport {
+        let host_guard = self.inner.read();
+        let committed = host_guard.read();
+        committed.borrow().memory_usage_report(samples)
+    }
+
+    /// Apply an upstream-compatible GRAPH.BULK batch with a durable checkpoint boundary.
+    pub fn bulk_insert(&self, request: &bulk::BulkRequest) -> Result<String, String> {
+        let _permit = QueryPermit::acquire(&self.name, "GRAPH.BULK", QueryMode::Write)?;
+        let mut host_guard = self.inner.write();
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+
+        let mut docs = {
+            let mut graph = private.borrow_mut();
+            match bulk::apply(&mut graph, request) {
+                Ok(docs) => docs,
+                Err(err) => {
+                    drop(graph);
+                    host_guard.rollback();
+                    return Err(format!("ERR bulk insert failed: {err}"));
+                }
+            }
+        };
+
+        let mut checkpoint_sequence = None;
+        if let Some(wal) = &self.wal {
+            let sequence = wal.last_sequence().saturating_add(1);
+            let staged = {
+                let graph = private.borrow();
+                match snapshot::stage_checkpoint(wal.path(), &self.name, sequence, &graph) {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        drop(graph);
+                        host_guard.rollback();
+                        return Err(err);
+                    }
+                }
+            };
+
+            let marker_sequence = match wal.append_checkpoint_marker(self.name.as_bytes()) {
+                Ok(sequence) => sequence,
+                Err(err) => {
+                    snapshot::abort_staged_checkpoint(staged);
+                    host_guard.rollback();
+                    return Err(err);
+                }
+            };
+            debug_assert_eq!(marker_sequence, sequence);
+
+            if let Err(err) = snapshot::publish_staged_checkpoint(staged) {
+                host_guard.rollback();
+                return Err(err);
+            }
+            checkpoint_sequence = Some(sequence);
+        }
+
+        {
+            let mut graph = private.borrow_mut();
+            docs.publish(&mut graph);
+        }
+        host_guard.commit(Arc::clone(&private));
+
+        if let (Some(wal), Some(sequence)) = (&self.wal, checkpoint_sequence) {
+            if let Err(err) = wal.reset_after(sequence) {
+                eprintln!("FalkorDB native GRAPH.BULK: WAL compaction after checkpoint failed: {err}");
+            } else if let Err(err) = snapshot::cleanup_old_checkpoints(wal.path(), 2) {
+                eprintln!("FalkorDB native GRAPH.BULK: old checkpoint cleanup failed: {err}");
+            }
+        }
+
+        Ok(format!(
+            "{} nodes created, {} relations created",
+            request.node_count, request.edge_count
+        ))
+    }
+
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
         self.query_with_timeout(cypher, None)
     }
@@ -399,23 +521,32 @@ impl NativeGraph {
         per_query_timeout: Option<i64>,
     ) -> Result<QueryOutput, String> {
         let wall = Instant::now();
-        let (snapshot, first_plan) = {
+        let is_write = {
             let host_guard = self.inner.read();
             let snapshot = host_guard.read();
             let plan = {
                 let graph_ref = snapshot.borrow();
                 graph_ref.get_plan(cypher)?
             };
-            (snapshot, plan)
+            plan_is_write(&plan)
         };
 
-        let is_write = plan_is_write(&first_plan);
         let timeout_ms = native_config::effective_timeout(per_query_timeout, is_write)?;
         let result = if is_write {
-            drop(snapshot);
+            let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Write)?;
             self.execute_write(cypher, timeout_ms)
         } else {
-            self.execute_read(snapshot, first_plan, timeout_ms)
+            let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Read)?;
+            let (snapshot, plan) = {
+                let host_guard = self.inner.read();
+                let snapshot = host_guard.read();
+                let plan = {
+                    let graph_ref = snapshot.borrow();
+                    graph_ref.get_plan(cypher)?
+                };
+                (snapshot, plan)
+            };
+            self.execute_read(snapshot, plan, timeout_ms)
         };
 
         if result.is_ok() {
@@ -439,6 +570,19 @@ impl NativeGraph {
         per_query_timeout: Option<i64>,
     ) -> Result<QueryOutput, String> {
         let wall = Instant::now();
+        {
+            let host_guard = self.inner.read();
+            let snapshot = host_guard.read();
+            let plan = {
+                let graph_ref = snapshot.borrow();
+                graph_ref.get_plan(cypher)?
+            };
+            if plan_is_write(&plan) {
+                return Err("Read only query cannot perform writes".to_string());
+            }
+        }
+
+        let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Read)?;
         let (snapshot, plan) = {
             let host_guard = self.inner.read();
             let snapshot = host_guard.read();
@@ -448,11 +592,7 @@ impl NativeGraph {
             };
             (snapshot, plan)
         };
-
-        if plan_is_write(&plan) {
-            return Err("Read only query cannot perform writes".to_string());
-        }
-
+        debug_assert!(!plan_is_write(&plan));
         let timeout_ms = native_config::effective_timeout(per_query_timeout, false)?;
         let result = self.execute_read(snapshot, plan, timeout_ms);
         if result.is_ok() {
@@ -644,23 +784,33 @@ impl NativeGraph {
 
     pub fn profile(&self, cypher: &str) -> Result<Vec<String>, String> {
         let wall = Instant::now();
-        let (snapshot, first_plan) = {
+        let is_write = {
             let host_guard = self.inner.read();
             let snapshot = host_guard.read();
             let plan = {
                 let graph_ref = snapshot.borrow();
                 graph_ref.get_plan(cypher)?
             };
-            (snapshot, plan)
+            plan_is_write(&plan)
         };
 
-        let result = if plan_is_write(&first_plan) {
-            drop(snapshot);
+        let result = if is_write {
+            let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Write)?;
             self.execute_write_profile(cypher, native_config::effective_timeout(None, true)?)
         } else {
+            let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Read)?;
+            let (snapshot, plan) = {
+                let host_guard = self.inner.read();
+                let snapshot = host_guard.read();
+                let plan = {
+                    let graph_ref = snapshot.borrow();
+                    graph_ref.get_plan(cypher)?
+                };
+                (snapshot, plan)
+            };
             self.execute_read_profile(
                 snapshot,
-                first_plan,
+                plan,
                 native_config::effective_timeout(None, false)?,
             )
         };
@@ -810,7 +960,7 @@ impl NativeGraph {
 
         let mut result = runtime.query()?;
         result.stats.cached = cached;
-        Ok(capture_output(&runtime, &result))
+        capture_output(&runtime, &result)
     }
 
     fn execute_write(
@@ -871,7 +1021,17 @@ impl NativeGraph {
 
         result.stats.cached = cached;
         let modified = query_modified(&runtime, &result.stats);
-        let output = capture_output(&runtime, &result);
+        let output = match capture_output(&runtime, &result) {
+            Ok(output) => output,
+            Err(err) => {
+                if escalation.crossed() {
+                    let committed = host_guard.read();
+                    runtime.resync_published_indexes(&committed);
+                }
+                host_guard.rollback();
+                return Err(err);
+            }
+        };
         drop(result);
 
         if escalation.crossed() {
@@ -1016,7 +1176,10 @@ fn plan_is_write(plan: &Plan) -> bool {
     })
 }
 
-fn capture_output(runtime: &Runtime<'_>, result: &ResultSummary<'_>) -> QueryOutput {
+fn capture_output(
+    runtime: &Runtime<'_>,
+    result: &ResultSummary<'_>,
+) -> Result<QueryOutput, String> {
     let columns: Vec<String> = runtime
         .return_names
         .iter()
@@ -1035,7 +1198,7 @@ fn capture_output(runtime: &Runtime<'_>, result: &ResultSummary<'_>) -> QueryOut
             for var in &runtime.return_names {
                 if let Some(value) = batch.value_at(var.id, row_idx) {
                     row.push(format!("{value:?}"));
-                    wire_row.push(WireValue::capture(runtime, &value));
+                    wire_row.push(WireValue::capture(runtime, &value)?);
                 } else {
                     row.push("Null".to_string());
                     wire_row.push(WireValue::Null);
@@ -1047,11 +1210,11 @@ fn capture_output(runtime: &Runtime<'_>, result: &ResultSummary<'_>) -> QueryOut
         }
     }
 
-    QueryOutput {
+    Ok(QueryOutput {
         columns,
         rows,
         wire_rows,
         stats: OutputStats::from(&result.stats),
         graph_version,
-    }
+    })
 }

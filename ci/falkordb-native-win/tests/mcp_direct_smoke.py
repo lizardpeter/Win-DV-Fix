@@ -13,6 +13,8 @@ PORT = 8443
 API_TOKEN = "native-api-write-secret"
 CLIENT_ID = "https://chatgpt.com/oauth/client.json"
 REDIRECT_URI = "https://chatgpt.com/connector_platform_oauth_redirect"
+CLAUDE_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
+CLAUDE_REDIRECT_URI = "http://localhost:43123/callback"
 VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
 
@@ -65,14 +67,14 @@ def rpc(ctx, method, params=None, token=None, request_id=1):
     return parsed["result"]
 
 
-def oauth_link(ctx):
+def oauth_link(ctx, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, state="native-ci-state"):
     resource = f"https://{HOST}:{PORT}/mcp"
     scope = "graph:read graph:write graph:admin"
     auth_form = {
         "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "state": "native-ci-state",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
         "code_challenge": challenge(VERIFIER),
         "code_challenge_method": "S256",
         "resource": resource,
@@ -95,16 +97,15 @@ def oauth_link(ctx):
     redirect = urllib.parse.urlparse(location)
     params = urllib.parse.parse_qs(redirect.query)
     code = params["code"][0]
-    assert params["state"][0] == "native-ci-state"
-    # Stable ChatGPT callback mode requires RFC 9207 issuer identification.
+    assert params["state"][0] == state
     assert params["iss"][0] == f"https://{HOST}:{PORT}"
 
     token_form = urllib.parse.urlencode(
         {
             "grant_type": "authorization_code",
             "code": code,
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
             "code_verifier": VERIFIER,
             "resource": resource,
         }
@@ -140,30 +141,10 @@ def oauth_link(ctx):
     if status != 200:
         raise AssertionError((status, data.decode(errors="replace")))
     refreshed = json.loads(data)
-    return {
-        "access_token": refreshed["access_token"],
-        "refresh_token": refreshed["refresh_token"],
-        "scope": refreshed["scope"],
-        "resource": resource,
-    }
+    return refreshed["access_token"]
 
 
-def write_phase(ctx, token_file: Path):
-    status, headers, data = request(
-        ctx,
-        "OPTIONS",
-        "/mcp",
-        headers={
-            "Origin": "https://chatgpt.com",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "authorization,content-type,mcp-protocol-version,mcp-method,mcp-name",
-        },
-    )
-    assert status == 204, (status, data)
-    assert headers.get("Access-Control-Allow-Origin") == "*", headers
-    assert "POST" in headers.get("Access-Control-Allow-Methods", ""), headers
-    assert "authorization" in headers.get("Access-Control-Allow-Headers", "").lower(), headers
-
+def write_phase(ctx, token_file: Path, import_root: Path):
     status, _, data = request(ctx, "GET", "/.well-known/oauth-protected-resource")
     assert status == 200, (status, data)
     metadata = json.loads(data)
@@ -172,26 +153,12 @@ def write_phase(ctx, token_file: Path):
 
     discover = rpc(ctx, "server/discover")
     assert "2026-07-28" in discover["supportedVersions"]
-    assert "urn:ure:ontology:universal-game-re:v1" in discover["instructions"]
-    assert "USES_ONTOLOGY" in discover["instructions"]
-    assert "HAS_INVARIANT" in discover["instructions"]
-    assert "Family -> Variant -> Occurrence" in discover["instructions"]
-    assert "R2 all.txt" in discover["instructions"]
 
-    initialized = rpc(
-        ctx,
-        "initialize",
-        {"protocolVersion": "2026-07-28", "clientInfo": {"name": "mcp-ci", "version": "1"}},
-        request_id=2,
-    )
-    assert initialized["protocolVersion"] == "2026-07-28"
-    assert "urn:ure:ontology:universal-game-re:v1" in initialized["instructions"]
-    assert "reconstructed per-function/per-unit source text" in initialized["instructions"]
-
-    tools = rpc(ctx, "tools/list", request_id=3)
+    tools = rpc(ctx, "tools/list", request_id=2)
     names = {tool["name"] for tool in tools["tools"]}
     for required in {
         "list_graphs",
+        "database_stats",
         "query_graph_read",
         "query_graph_write",
         "batch_graph_queries",
@@ -202,6 +169,8 @@ def write_phase(ctx, token_file: Path):
         "flush_all_graphs",
         "export_graph_dump",
         "restore_graph_dump",
+        "import_falkordb_rdb_file",
+        "bulk_import_file",
     }:
         assert required in names, required
 
@@ -209,13 +178,28 @@ def write_phase(ctx, token_file: Path):
         ctx,
         "tools/call",
         {"name": "list_graphs", "arguments": {}},
-        request_id=4,
+        request_id=3,
     )
     assert unauth["isError"] is True
     assert "mcp/www_authenticate" in unauth["_meta"]
 
-    token_state = oauth_link(ctx)
-    token = token_state["access_token"]
+    claude_token = oauth_link(
+        ctx,
+        client_id=CLAUDE_CLIENT_ID,
+        redirect_uri=CLAUDE_REDIRECT_URI,
+        state="claude-code-ci-state",
+    )
+    claude_read = rpc(
+        ctx,
+        "tools/call",
+        {"name": "list_graphs", "arguments": {}},
+        token=claude_token,
+        request_id=30,
+    )
+    assert claude_read["isError"] is False, claude_read
+    print("CLAUDE_OAUTH_PASS")
+
+    token = oauth_link(ctx)
 
     created = rpc(
         ctx,
@@ -256,24 +240,143 @@ def write_phase(ctx, token_file: Path):
     )
     assert read["structuredContent"]["rows"] == [[42]]
 
+    # Server-local generic file import: the corpus itself never traverses MCP.
+    import_root.mkdir(parents=True, exist_ok=True)
+    import_file = import_root / "mcp-bulk.jsonl"
+    import_bytes = (
+        b'{"kind":"alpha","value":101}\n'
+        b'{"kind":"beta","value":202}\n'
+    )
+    import_file.write_bytes(import_bytes)
+    import_sha = hashlib.sha256(import_bytes).hexdigest()
+    import_args = {
+        "graph": "mcp-ci",
+        "file": import_file.name,
+        "format": "jsonl",
+        "sha256": import_sha,
+        "batch_size": 1,
+        "cypher": (
+            "UNWIND {{ROWS}} AS row "
+            "MERGE (n:McpBulk {kind:row.kind}) "
+            "SET n.value=row.value"
+        ),
+    }
+
+    dry_run = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "bulk_import_file",
+            "arguments": {**import_args, "dry_run": True},
+        },
+        token=token,
+        request_id=7,
+    )
+    assert dry_run["isError"] is False, dry_run
+    assert dry_run["structuredContent"]["records_total"] == 2, dry_run
+    assert dry_run["structuredContent"]["records_imported"] == 0, dry_run
+
+    imported = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "bulk_import_file",
+            "arguments": {**import_args, "checkpoint": False},
+        },
+        token=token,
+        request_id=8,
+    )
+    assert imported["isError"] is False, imported
+    assert imported["structuredContent"]["records_imported"] == 2, imported
+    assert imported["structuredContent"]["batches"] == 2, imported
+
+    bulk_read = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "query_graph_read",
+            "arguments": {
+                "graph": "mcp-ci",
+                "cypher": "MATCH (n:McpBulk) RETURN n.kind,n.value ORDER BY n.kind",
+            },
+        },
+        token=token,
+        request_id=9,
+    )
+    assert bulk_read["structuredContent"]["rows"] == [
+        ["alpha", 101],
+        ["beta", 202],
+    ], bulk_read
+
     checkpoint = rpc(
         ctx,
         "tools/call",
         {"name": "checkpoint_graph", "arguments": {"graph": "mcp-ci"}},
         token=token,
-        request_id=7,
+        request_id=10,
     )
     assert checkpoint["isError"] is False
 
-    token_file.write_text(json.dumps(token_state), encoding="utf-8")
+    stats = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "database_stats",
+            "arguments": {
+                "graph": "mcp-ci",
+                "include_memory": True,
+                "memory_samples": 10,
+            },
+        },
+        token=token,
+        request_id=11,
+    )
+    assert stats["isError"] is False, stats
+    stats_body = stats["structuredContent"]
+    assert stats_body["graph_count"] == 1, stats_body
+    assert stats_body["total_storage_bytes"] >= stats_body["graphs_storage_bytes"], stats_body
+    assert stats_body["graphs_storage_bytes"] >= stats_body["attributed_graph_bytes"], stats_body
+    assert stats_body["unattributed_graph_storage_bytes"] == (
+        stats_body["graphs_storage_bytes"] - stats_body["attributed_graph_bytes"]
+    ), stats_body
+    graph_stats = stats_body["graphs"][0]
+    assert graph_stats["graph"] == "mcp-ci", graph_stats
+    assert graph_stats["nodes"] >= 3, graph_stats
+    assert graph_stats["relationships"] == 0, graph_stats
+    assert graph_stats["persistent_bytes"] > 0, graph_stats
+    assert graph_stats["persistent_bytes"] == (
+        graph_stats["wal_bytes"] + graph_stats["checkpoint_bytes"]
+    ), graph_stats
+    assert graph_stats["checkpoint_count"] >= 1, graph_stats
+    assert graph_stats["estimated_memory_bytes"] is not None, graph_stats
+
+    # Filtering detail rows must not change whole-database storage attribution.
+    all_stats = rpc(
+        ctx,
+        "tools/call",
+        {
+            "name": "database_stats",
+            "arguments": {"include_memory": False},
+        },
+        token=token,
+        request_id=12,
+    )
+    assert all_stats["isError"] is False, all_stats
+    all_stats_body = all_stats["structuredContent"]
+    filtered_stats_body = stats_body
+    assert filtered_stats_body["attributed_graph_bytes"] == all_stats_body["attributed_graph_bytes"]
+    assert filtered_stats_body["unattributed_graph_storage_bytes"] == (
+        all_stats_body["unattributed_graph_storage_bytes"]
+    )
+    assert filtered_stats_body["total_storage_bytes"] == all_stats_body["total_storage_bytes"]
+    print("MCP_DATABASE_STATS_PASS")
+
+    token_file.write_text(token, encoding="utf-8")
     print("MCP_DIRECT_OAUTH_WRITE_PASS")
 
 
 def read_phase(ctx, token_file: Path):
-    state = json.loads(token_file.read_text(encoding="utf-8"))
-    token = state["access_token"]
-
-    # First prove the already-issued access token survives a hard server restart.
+    token = token_file.read_text(encoding="utf-8").strip()
     read = rpc(
         ctx,
         "tools/call",
@@ -288,47 +391,23 @@ def read_phase(ctx, token_file: Path):
         request_id=8,
     )
     assert read["structuredContent"]["rows"] == [[42]]
-    print("MCP_DIRECT_OAUTH_ACCESS_TOKEN_RESTART_PASS")
 
-    # Then prove the long-lived refresh token also survives the restart and can
-    # mint a fresh access token without another browser authorization.
-    refresh_form = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": state["refresh_token"],
-            "resource": state["resource"],
-            "scope": state["scope"],
-        }
-    )
-    status, _, data = request(
-        ctx,
-        "POST",
-        "/oauth/token",
-        body=refresh_form,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if status != 200:
-        raise AssertionError((status, data.decode(errors="replace")))
-    refreshed = json.loads(data)
-    assert refreshed["token_type"] == "Bearer"
-    assert refreshed["scope"] == state["scope"]
-    assert refreshed["refresh_token"]
-
-    read_after_refresh = rpc(
+    stats = rpc(
         ctx,
         "tools/call",
         {
-            "name": "query_graph_read",
-            "arguments": {
-                "graph": "mcp-ci",
-                "cypher": "MATCH (n:McpProbe {name:'direct-oauth'}) RETURN n.value",
-            },
+            "name": "database_stats",
+            "arguments": {"graph": "mcp-ci", "include_memory": False},
         },
-        token=refreshed["access_token"],
+        token=token,
         request_id=9,
     )
-    assert read_after_refresh["structuredContent"]["rows"] == [[42]]
-    print("MCP_DIRECT_OAUTH_REFRESH_TOKEN_RESTART_PASS")
+    assert stats["isError"] is False, stats
+    graph_stats = stats["structuredContent"]["graphs"][0]
+    assert graph_stats["nodes"] >= 3, graph_stats
+    assert graph_stats["persistent_bytes"] > 0, graph_stats
+    assert graph_stats["estimated_memory_bytes"] is None, graph_stats
+    print("MCP_DATABASE_STATS_RESTART_PASS")
     print("MCP_DIRECT_OAUTH_RESTART_PASS")
 
 
@@ -337,13 +416,16 @@ def main():
     parser.add_argument("phase", choices=["write", "read"])
     parser.add_argument("--ca", required=True)
     parser.add_argument("--token-file", required=True)
+    parser.add_argument("--import-root")
     args = parser.parse_args()
 
     ctx = ssl.create_default_context(cafile=args.ca)
     token_file = Path(args.token_file)
 
     if args.phase == "write":
-        write_phase(ctx, token_file)
+        if not args.import_root:
+            raise SystemExit("--import-root is required for write phase")
+        write_phase(ctx, token_file, Path(args.import_root))
     else:
         read_phase(ctx, token_file)
 

@@ -305,17 +305,31 @@ def import_bundle(args) -> None:
         portable_local_path(args.input, "--input", must_exist=True)
     )
     manifest, zf = load_bundle(input_path)
+    backup_dir_obj = tempfile.TemporaryDirectory(
+        prefix="falkordb-bundle-backup-"
+    )
+    backup_dir = Path(backup_dir_obj.name)
 
     try:
         require_standalone(raw, "destination")
 
+        # Validate the complete archive before touching destination state, but
+        # retain only metadata. Payload bytes are read and discarded one graph
+        # at a time so import memory is bounded by the largest graph, not the
+        # entire database.
+        prepared_graphs: list[tuple[str, str, dict, str, int]] = []
         for item in manifest["graphs"]:
             name = item.get("name")
             entry = item.get("entry")
             expected_hash = item.get("sha256")
+            expected_bytes = item.get("bytes")
             signature = item.get("signature")
             if not isinstance(name, str) or not isinstance(entry, str):
                 raise RuntimeError(f"invalid graph manifest entry: {item!r}")
+            if not isinstance(expected_hash, str):
+                raise RuntimeError(f"missing graph sha256 for {name!r}")
+            if not isinstance(expected_bytes, int) or expected_bytes < 0:
+                raise RuntimeError(f"invalid graph byte length for {name!r}")
             if not isinstance(signature, dict):
                 raise RuntimeError(f"missing graph signature for {name!r}")
 
@@ -326,43 +340,177 @@ def import_bundle(args) -> None:
                     f"bundle graph {name!r} sha256 mismatch: "
                     f"expected {expected_hash}, got {actual_hash}"
                 )
-            if len(payload) != item.get("bytes"):
+            if len(payload) != expected_bytes:
                 raise RuntimeError(
                     f"bundle graph {name!r} length mismatch: "
-                    f"expected {item.get('bytes')}, got {len(payload)}"
+                    f"expected {expected_bytes}, got {len(payload)}"
                 )
-
-            print(
-                f"importing {name!r}: {len(payload):,} bytes "
-                f"sha256={actual_hash}"
+            prepared_graphs.append(
+                (name, entry, signature, expected_hash, expected_bytes)
             )
-            restore_one_graph(
-                raw,
-                db,
-                name,
-                payload,
-                signature,
-                args.replace,
-            )
-            print(f"verified {name!r}: data/schema/index/constraint signature matches")
+            del payload
 
+        libraries: dict[str, str] = {}
         if not args.skip_udfs:
             udf_entry = manifest.get("udfs_entry", "udfs.json")
-            libraries = json.loads(zf.read(udf_entry))
-            if not isinstance(libraries, dict):
+            loaded = json.loads(zf.read(udf_entry))
+            if not isinstance(loaded, dict):
                 raise RuntimeError("bundle UDF payload is invalid")
-            restore_udfs(
-                db,
-                {str(name): str(code) for name, code in libraries.items()},
-                args.replace,
+            libraries = {str(name): str(code) for name, code in loaded.items()}
+
+        # Preflight every collision before the first mutation. This prevents a
+        # predictable conflict on item N from leaving items 1..N-1 imported.
+        existing_graphs = destination_graph_names(raw)
+        if not args.replace:
+            conflicts = sorted(
+                name
+                for name, _, _, _, _ in prepared_graphs
+                if name in existing_graphs
             )
-            print(f"imported {len(libraries)} UDF libraries")
+            if conflicts:
+                raise RuntimeError(
+                    "destination graph(s) already exist; rerun with --replace: "
+                    + ", ".join(repr(name) for name in conflicts)
+                )
+
+        existing_udfs = parse_udf_rows(db.udf_list(with_code=True))
+        if not args.replace:
+            udf_conflicts = sorted(
+                name for name in libraries if name in existing_udfs
+            )
+            if udf_conflicts:
+                raise RuntimeError(
+                    "destination UDF library/libraries already exist; "
+                    "rerun with --replace: "
+                    + ", ".join(repr(name) for name in udf_conflicts)
+                )
+
+        # Capture the complete replacement baseline before mutation. Each DUMP
+        # is written to disk immediately so rollback memory is also bounded by
+        # one graph at a time.
+        graph_backups: dict[str, Path | None] = {}
+        for ordinal, (name, _, _, _, _) in enumerate(prepared_graphs):
+            if name not in existing_graphs:
+                graph_backups[name] = None
+                continue
+            previous = raw.dump(name)
+            if previous is None:
+                raise RuntimeError(
+                    f"could not back up destination graph {name!r}"
+                )
+            backup_path = backup_dir / f"{ordinal:06d}.dump"
+            backup_path.write_bytes(previous)
+            del previous
+            graph_backups[name] = backup_path
+
+        udf_backups = {name: existing_udfs.get(name) for name in libraries}
+
+        imported_graphs: list[str] = []
+        udfs_started = False
+        try:
+            for name, entry, signature, expected_hash, expected_bytes in prepared_graphs:
+                payload = zf.read(entry)
+                # Archive bytes were validated during preflight. Re-check the
+                # length/hash here as a corruption guard if the archive changed
+                # on disk while this process was running.
+                actual_hash = sha256(payload)
+                if actual_hash != expected_hash or len(payload) != expected_bytes:
+                    raise RuntimeError(
+                        f"bundle graph {name!r} changed after validation"
+                    )
+
+                print(
+                    f"importing {name!r}: {len(payload):,} bytes "
+                    f"sha256={actual_hash}"
+                )
+                reply = raw.restore(
+                    name,
+                    0,
+                    payload,
+                    replace=args.replace,
+                )
+                del payload
+                if reply not in (True, b"OK", "OK"):
+                    raise RuntimeError(
+                        f"unexpected RESTORE reply for {name!r}: {reply!r}"
+                    )
+
+                # Mark the graph as mutated before semantic verification so a
+                # verification failure restores this graph as well as all
+                # earlier graphs in the bundle.
+                imported_graphs.append(name)
+                actual = canonical(graph_signature(db, name))
+                if actual != canonical(signature):
+                    raise RuntimeError(
+                        f"semantic verification failed for {name!r}\n"
+                        f"bundle={json.dumps(signature, sort_keys=True)}\n"
+                        f"destination={json.dumps(actual, sort_keys=True)}"
+                    )
+                print(
+                    f"verified {name!r}: "
+                    "data/schema/index/constraint signature matches"
+                )
+
+            if libraries:
+                udfs_started = True
+                restore_udfs(db, libraries, args.replace)
+                print(f"imported {len(libraries)} UDF libraries")
+
+        except Exception as exc:
+            rollback_errors: list[str] = []
+
+            # UDFs are process-global, so restore their full pre-import state
+            # before graph rollback. restore_udfs already rolls back its failing
+            # item; this outer pass handles any earlier successful libraries.
+            if udfs_started:
+                current_udfs = parse_udf_rows(db.udf_list(with_code=True))
+                for name in reversed(list(libraries)):
+                    previous = udf_backups[name]
+                    try:
+                        if previous is None:
+                            if name in current_udfs:
+                                db.udf_delete(name)
+                        else:
+                            db.udf_load(name, previous, True)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(
+                            f"UDF {name!r}: {rollback_exc}"
+                        )
+
+            for name in reversed(imported_graphs):
+                previous = graph_backups[name]
+                try:
+                    if previous is None:
+                        if name in destination_graph_names(raw):
+                            raw.execute_command("GRAPH.DELETE", name)
+                    else:
+                        raw.restore(
+                            name,
+                            0,
+                            previous.read_bytes(),
+                            replace=True,
+                        )
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        f"graph {name!r}: {rollback_exc}"
+                    )
+
+            if rollback_errors:
+                raise RuntimeError(
+                    f"bundle import failed: {exc}; rollback errors: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise RuntimeError(
+                f"bundle import failed: {exc}; "
+                "all prior bundle changes were rolled back"
+            ) from exc
 
         print(
-            f"BUNDLE_IMPORT_COMPLETE graphs={len(manifest['graphs'])} "
-            f"path={input_path}"
+            f"BUNDLE_IMPORT_COMPLETE graphs={len(prepared_graphs)} "
+            f"udfs={len(libraries)} path={input_path}"
         )
     finally:
+        backup_dir_obj.cleanup()
         zf.close()
         db.close()
         raw.close()

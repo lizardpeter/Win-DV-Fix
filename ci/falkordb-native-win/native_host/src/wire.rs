@@ -34,8 +34,8 @@ pub enum WireValue {
 }
 
 impl WireValue {
-    pub fn capture(runtime: &Runtime<'_>, value: &Value) -> Self {
-        match value {
+    pub fn capture(runtime: &Runtime<'_>, value: &Value) -> Result<Self, String> {
+        Ok(match value {
             Value::Null => Self::Null,
             Value::Bool(v) => Self::Bool(*v),
             Value::Int(v) => Self::Int(*v),
@@ -46,12 +46,17 @@ impl WireValue {
             Value::Time(v) => Self::Time(*v),
             Value::Duration(v) => Self::Duration(*v),
             Value::List(values) => Self::List(
-                values.iter().map(|v| Self::capture(runtime, v)).collect(),
+                values
+                    .iter()
+                    .map(|v| Self::capture(runtime, v))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
             Value::Map(map) => Self::Map(
                 map.iter()
-                    .map(|(k, v)| (k.as_str().to_owned(), Self::capture(runtime, v)))
-                    .collect(),
+                    .map(|(k, v)| {
+                        Ok((k.as_str().to_owned(), Self::capture(runtime, v)?))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
             ),
             Value::VecF32(values) => Self::VecF32(values.iter().copied().collect()),
             Value::Point(point) => Self::Point {
@@ -74,11 +79,14 @@ impl WireValue {
                         .map(|(key, value)| {
                             let attr_id = graph
                                 .get_node_attribute_id(key)
-                                .expect("deleted node attribute must remain in schema")
-                                as u64;
-                            (attr_id, Self::capture(runtime, value))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "deleted node attribute {key:?} is missing from the graph schema"
+                                    )
+                                })? as u64;
+                            Ok((attr_id, Self::capture(runtime, value)?))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, String>>()?;
                     Self::Node {
                         id: node_id,
                         labels,
@@ -93,8 +101,10 @@ impl WireValue {
                         .collect();
                     let properties = graph
                         .get_node_all_attrs_by_id(*id)
-                        .map(|(key, value)| (key as u64, Self::capture(runtime, &value)))
-                        .collect();
+                        .map(|(key, value)| {
+                            Ok((key as u64, Self::capture(runtime, &value)?))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
                     Self::Node {
                         id: node_id,
                         labels,
@@ -111,18 +121,26 @@ impl WireValue {
                     let type_id = graph
                         .get_type_id(&edge.type_name)
                         .map(usize::from)
-                        .unwrap_or_default() as u64;
+                        .ok_or_else(|| {
+                            format!(
+                                "deleted relationship type {:?} is missing from the graph schema",
+                                edge.type_name
+                            )
+                        })? as u64;
                     let properties = edge
                         .attrs
                         .iter()
                         .map(|(key, value)| {
                             let attr_id = graph
                                 .get_global_attribute_id(key)
-                                .expect("deleted relationship attribute must remain in schema")
-                                as u64;
-                            (attr_id, Self::capture(runtime, value))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "deleted relationship attribute {key:?} is missing from the graph schema"
+                                    )
+                                })? as u64;
+                            Ok((attr_id, Self::capture(runtime, value)?))
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, String>>()?;
                     Self::Relationship {
                         id: rel_id,
                         type_id,
@@ -136,8 +154,10 @@ impl WireValue {
                     let type_id = usize::from(graph.get_relationship_type_id(*rel)) as u64;
                     let properties = graph
                         .get_relationship_all_attrs_by_id(*rel)
-                        .map(|(key, value)| (key as u64, Self::capture(runtime, &value)))
-                        .collect();
+                        .map(|(key, value)| {
+                            Ok((key as u64, Self::capture(runtime, &value)?))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
                     Self::Relationship {
                         id: rel_id,
                         type_id,
@@ -152,8 +172,8 @@ impl WireValue {
                 let mut relationships = Vec::new();
                 for item in path.iter() {
                     match item {
-                        Value::Node(_) => nodes.push(Self::capture(runtime, item)),
-                        Value::Relationship(_) => relationships.push(Self::capture(runtime, item)),
+                        Value::Node(_) => nodes.push(Self::capture(runtime, item)?),
+                        Value::Relationship(_) => relationships.push(Self::capture(runtime, item)?),
                         _ => {}
                     }
                 }
@@ -162,6 +182,141 @@ impl WireValue {
                     relationships,
                 }
             }
+        })
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use graph::{
+        graph::{
+            graph::{NodeId, Plan, RelationshipId},
+            graphblas::{GrB_Mode, GrB_init},
+            mvcc_graph::MvccGraph,
+        },
+        locks::WriteEscalation,
+        runtime::{
+            functions::init_functions,
+            ordermap::OrderMap,
+            runtime::Runtime,
+            value::{DeletedNode, DeletedRelationship},
+        },
+    };
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Once},
+    };
+
+    static GRAPH_RUNTIME_INIT: Once = Once::new();
+
+    struct AlwaysWritable;
+
+    impl WriteEscalation for AlwaysWritable {
+        fn upgrade_to_write(&self) -> Result<(), String> {
+            Ok(())
         }
+    }
+
+    fn init_graph_runtime() {
+        GRAPH_RUNTIME_INIT.call_once(|| {
+            unsafe {
+                GrB_init(GrB_Mode::GrB_NONBLOCKING as _);
+            }
+            init_functions().expect("initialize FalkorDB functions for wire tests");
+        });
+    }
+
+    #[test]
+    fn deleted_node_with_missing_schema_attribute_returns_error() {
+        init_graph_runtime();
+
+        let graph = MvccGraph::new(16, 16, 25, "wire-missing-node-schema");
+        let Plan {
+            plan, parameters, ..
+        } = graph
+            .read()
+            .borrow()
+            .get_plan("RETURN 1")
+            .expect("plan simple wire test query");
+        let escalation = AlwaysWritable;
+        let runtime = Runtime::new(
+            graph.read(),
+            parameters,
+            false,
+            plan,
+            false,
+            String::new(),
+            -1,
+            false,
+            None,
+            0,
+            None,
+            &escalation,
+        );
+
+        let id = NodeId::from(7);
+        runtime.deleted_nodes.borrow_mut().insert(
+            id,
+            DeletedNode::new(
+                HashSet::new(),
+                OrderMap::from_unique_keys([(
+                    Arc::new("missing_property".to_string()),
+                    Value::Int(1),
+                )]),
+            ),
+        );
+
+        let err = WireValue::capture(&runtime, &Value::Node(id))
+            .expect_err("missing deleted-node schema metadata must be an error");
+        assert!(err.contains("missing_property"), "{err}");
+        assert!(err.contains("missing from the graph schema"), "{err}");
+    }
+
+    #[test]
+    fn deleted_relationship_with_missing_schema_type_returns_error() {
+        init_graph_runtime();
+
+        let graph = MvccGraph::new(16, 16, 25, "wire-missing-rel-schema");
+        let Plan {
+            plan, parameters, ..
+        } = graph
+            .read()
+            .borrow()
+            .get_plan("RETURN 1")
+            .expect("plan simple wire test query");
+        let escalation = AlwaysWritable;
+        let runtime = Runtime::new(
+            graph.read(),
+            parameters,
+            false,
+            plan,
+            false,
+            String::new(),
+            -1,
+            false,
+            None,
+            0,
+            None,
+            &escalation,
+        );
+
+        let id = RelationshipId::from(9);
+        runtime.deleted_relationships.borrow_mut().insert(
+            id,
+            DeletedRelationship::new(
+                NodeId::from(1),
+                NodeId::from(2),
+                Arc::new("MISSING_REL_TYPE".to_string()),
+                OrderMap::default(),
+            ),
+        );
+
+        let err = WireValue::capture(&runtime, &Value::Relationship(id))
+            .expect_err("missing deleted-relationship type metadata must be an error");
+        assert!(err.contains("MISSING_REL_TYPE"), "{err}");
+        assert!(err.contains("missing from the graph schema"), "{err}");
     }
 }

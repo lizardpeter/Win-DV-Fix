@@ -4,8 +4,10 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::Arc,
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::{ServerConnection, StreamOwned};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -25,24 +27,24 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
     pub read_write_token: Option<String>,
     pub read_only_token: Option<String>,
+    /// Optional human viewer credential shared with the read-only RESP viewer.
+    /// Accepted only as HTTP Basic auth and always maps to read-only API scope.
+    pub viewer_username: String,
+    pub viewer_password: Option<String>,
     /// Separate owner-approval secret for the interactive OAuth consent page.
-    /// The read/write API token remains an accepted fallback so existing
-    /// deployments keep working.
+    /// The read/write API token remains an accepted fallback for compatibility.
     pub oauth_owner_secret: Option<String>,
-    /// Additional accepted OAuth owner-approval secrets. This is used to
-    /// preserve the values loaded directly from falkordb-secrets.txt even
-    /// when the startup script supplies different CLI/environment values.
+    /// Additional owner-approval credentials loaded directly from the local
+    /// secrets file, preserved even if env/CLI runtime credentials differ.
     pub oauth_owner_secret_fallbacks: Vec<String>,
-    /// High-entropy restart-scoped code printed only to the server console.
-    /// This gives the machine owner an independent OAuth approval path that
-    /// does not depend on environment variables or secrets-file parsing.
+    /// High-entropy restart-scoped owner-approval code printed only to the
+    /// server console. This avoids dependence on env/secrets-file parsing.
     pub oauth_pairing_code: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
-    /// Dedicated backend for OpenAI Secure MCP Tunnel. When enabled this
-    /// listener exposes only /mcp and /healthz, suppresses OAuth discovery,
-    /// and advertises MCP tools as noauth to the product because the local
-    /// tunnel-client injects a private backend Bearer token on the loopback hop.
+    /// Dedicated loopback backend for OpenAI Secure MCP Tunnel. This surface
+    /// exposes only /mcp and /healthz and suppresses direct OAuth/dashboard
+    /// discovery because the tunnel client owns the remote transport.
     pub tunnel_mode: bool,
     pub tls: Option<TlsConfig>,
 }
@@ -53,6 +55,8 @@ impl Default for ApiConfig {
             bind: "127.0.0.1:8443".parse().expect("valid default API socket"),
             read_write_token: None,
             read_only_token: None,
+            viewer_username: "viewer".to_string(),
+            viewer_password: None,
             oauth_owner_secret: None,
             oauth_owner_secret_fallbacks: Vec::new(),
             oauth_pairing_code: None,
@@ -78,10 +82,11 @@ impl ApiConfig {
         if remote
             && self.read_write_token.is_none()
             && self.read_only_token.is_none()
+            && self.viewer_password.is_none()
             && !self.allow_unauthenticated_remote
         {
             return Err(
-                "refusing unauthenticated non-loopback HTTPS API bind; configure --api-token or --api-read-token"
+                "refusing unauthenticated non-loopback HTTPS API bind; configure an API token or viewer credential"
                     .to_string(),
             );
         }
@@ -298,11 +303,11 @@ fn route_http(
     }
 
     if config.tunnel_mode {
-        // The Secure MCP Tunnel backend is deliberately MCP-only. In
-        // particular, do not expose OAuth discovery on this listener: ChatGPT
-        // sees noauth tools while tunnel-client authenticates the private
-        // loopback hop with a static backend Bearer header.
-        return error_response(404, "not_found", "tunnel backend exposes only /mcp and /healthz");
+        return error_response(404, "not_found", "Secure MCP Tunnel backend exposes only /mcp and /healthz");
+    }
+
+    if let Some(response) = crate::dashboard::route(&request) {
+        return response;
     }
 
     if request.method == "GET"
@@ -316,7 +321,9 @@ fn route_http(
 
     let scope = auth_scope(&request.headers, config);
     if scope == AuthScope::None
-        && (config.read_write_token.is_some() || config.read_only_token.is_some())
+        && (config.read_write_token.is_some()
+            || config.read_only_token.is_some()
+            || config.viewer_password.is_some())
     {
         return error_response(401, "unauthorized", "valid Bearer token required");
     }
@@ -327,6 +334,7 @@ fn route_http(
             "database": "FalkorDB native standalone",
             "operations": [
                 "list_graphs",
+                "overview",
                 "query",
                 "batch_query",
                 "delete_graph"
@@ -337,6 +345,7 @@ fn route_http(
         ("GET", "/v1/graphs") => {
             json_response(200, json!({"graphs": catalog.list()}))
         }
+        ("GET", "/v1/overview") => overview_response(catalog),
         ("POST", "/v1/query") => {
             let payload: QueryRequest = match parse_json(&request.body) {
                 Ok(v) => v,
@@ -389,31 +398,253 @@ fn route_http(
     }
 }
 
+fn redact_query_for_dashboard(query: &str) -> String {
+    let trimmed = query.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    let query_only = if upper.starts_with("CYPHER ") {
+        [
+            " MATCH ", " RETURN ", " CREATE ", " MERGE ", " CALL ", " WITH ",
+            " UNWIND ", " DELETE ", " SET ", " REMOVE ", " OPTIONAL ",
+        ]
+        .into_iter()
+        .filter_map(|keyword| upper.find(keyword))
+        .min()
+        .map_or("[CYPHER parameters redacted]", |index| &trimmed[index..])
+    } else {
+        trimmed
+    };
+
+    // Dashboard monitoring should reveal query shape, not transient string
+    // values that may contain credentials, file paths, personal data, or other
+    // client-side secrets. Replace quoted literal contents while preserving
+    // the surrounding Cypher structure.
+    let mut out = String::with_capacity(query_only.len());
+    let mut chars = query_only.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' && ch != '"' {
+            out.push(ch);
+            continue;
+        }
+
+        let quote = ch;
+        out.push(quote);
+        out.push('…');
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if next == '\\' {
+                escaped = true;
+                continue;
+            }
+            if next == quote {
+                out.push(quote);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn overview_response(catalog: &GraphCatalog) -> HttpResponse {
+    const MEMORY_SAMPLES: usize = 50;
+    const QUERY_PREVIEW_CHARS: usize = 4096;
+
+    let stats = match catalog.database_stats(None, true, MEMORY_SAMPLES) {
+        Ok(stats) => stats,
+        Err(err) => return error_response(500, "database_stats_failed", &err),
+    };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let query_json = |id: u64,
+                      received_at: i64,
+                      graph: String,
+                      query: String,
+                      elapsed_ms: u128| {
+        let redacted = redact_query_for_dashboard(&query);
+        let mut preview = redacted
+            .chars()
+            .take(QUERY_PREVIEW_CHARS)
+            .collect::<String>();
+        let truncated = redacted.chars().count() > QUERY_PREVIEW_CHARS;
+        if truncated {
+            preview.push('…');
+        }
+        json!({
+            "id": id,
+            "received_at": received_at,
+            "graph": graph,
+            "query": preview,
+            "query_redacted": true,
+            "query_truncated": truncated,
+            "elapsed_ms": u64::try_from(elapsed_ms).unwrap_or(u64::MAX)
+        })
+    };
+
+    let running = crate::query_scheduler::snapshot_running()
+        .into_iter()
+        .map(|entry| {
+            query_json(
+                entry.id,
+                entry.received_at,
+                entry.graph_name,
+                entry.query,
+                entry.start.elapsed().as_millis(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let waiting = crate::query_scheduler::snapshot_waiting()
+        .into_iter()
+        .map(|entry| {
+            query_json(
+                entry.id,
+                entry.received_at,
+                entry.graph_name,
+                entry.query,
+                entry.enqueued.elapsed().as_millis(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut slow_queries = Vec::new();
+    for graph_stats in &stats.graphs {
+        let Some(graph) = catalog.get(&graph_stats.graph) else {
+            continue;
+        };
+        for entry in graph.slowlog_entries() {
+            slow_queries.push((
+                entry.timestamp,
+                entry.latency_ms,
+                json!({
+                    "graph": graph_stats.graph,
+                    "timestamp": entry.timestamp,
+                    "command": entry.command,
+                    "query": redact_query_for_dashboard(&entry.query),
+                    "query_redacted": true,
+                    "latency_ms": entry.latency_ms
+                }),
+            ));
+        }
+    }
+    slow_queries.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| b.1.total_cmp(&a.1))
+    });
+    let slow_queries = slow_queries
+        .into_iter()
+        .take(30)
+        .map(|(_, _, value)| value)
+        .collect::<Vec<_>>();
+
+    let graphs = stats
+        .graphs
+        .into_iter()
+        .map(|graph| {
+            json!({
+                "graph": graph.graph,
+                "nodes": graph.nodes,
+                "relationships": graph.relationships,
+                "graph_version": graph.graph_version,
+                "schema_version": graph.schema_version,
+                "labels": graph.labels,
+                "relationship_types": graph.relationship_types,
+                "property_keys": graph.property_keys,
+                "index_definitions": graph.index_definitions,
+                "constraints": graph.constraints,
+                "wal_bytes": graph.wal_bytes,
+                "checkpoint_bytes": graph.checkpoint_bytes,
+                "checkpoint_count": graph.checkpoint_count,
+                "latest_checkpoint_sequence": graph.latest_checkpoint_sequence,
+                "latest_checkpoint_bytes": graph.latest_checkpoint_bytes,
+                "persistent_bytes": graph.persistent_bytes,
+                "estimated_memory_bytes": graph.estimated_memory_bytes
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json_response(200, json!({
+        "generated_at_ms": now_ms,
+        "server": {
+            "host_version": env!("CARGO_PKG_VERSION"),
+            "api_version": 1,
+            "mcp_toolset_version": crate::mcp::TOOLSET_VERSION,
+            "available_parallelism": std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+        },
+        "database": {
+            "memory_samples": MEMORY_SAMPLES,
+            "total_storage_bytes": stats.total_storage_bytes,
+            "graphs_storage_bytes": stats.graphs_storage_bytes,
+            "attributed_graph_bytes": stats.attributed_graph_bytes,
+            "unattributed_graph_storage_bytes": stats.unattributed_graph_storage_bytes,
+            "imports_storage_bytes": stats.imports_storage_bytes,
+            "imports_inside_data_dir": stats.imports_inside_data_dir,
+            "other_storage_bytes": stats.other_storage_bytes,
+            "graphs": graphs
+        },
+        "queries": {
+            "running": running,
+            "waiting": waiting,
+            "slow": slow_queries
+        }
+    }))
+}
+
 fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScope {
-    if config.read_write_token.is_none() && config.read_only_token.is_none() {
+    if config.read_write_token.is_none()
+        && config.read_only_token.is_none()
+        && config.viewer_password.is_none()
+    {
         return AuthScope::ReadWrite;
     }
 
     let Some(header) = headers.get("authorization") else {
         return AuthScope::None;
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
-        return AuthScope::None;
-    };
 
-    if config
-        .read_write_token
-        .as_ref()
-        .is_some_and(|expected| constant_time_eq(expected, token))
-    {
-        return AuthScope::ReadWrite;
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        if config
+            .read_write_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, token))
+        {
+            return AuthScope::ReadWrite;
+        }
+        if config
+            .read_only_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, token))
+        {
+            return AuthScope::ReadOnly;
+        }
+        return AuthScope::None;
     }
-    if config
-        .read_only_token
-        .as_ref()
-        .is_some_and(|expected| constant_time_eq(expected, token))
-    {
-        return AuthScope::ReadOnly;
+
+    if let Some(encoded) = header.strip_prefix("Basic ") {
+        let Ok(decoded) = STANDARD.decode(encoded) else {
+            return AuthScope::None;
+        };
+        let Ok(decoded) = std::str::from_utf8(&decoded) else {
+            return AuthScope::None;
+        };
+        let Some((username, password)) = decoded.split_once(':') else {
+            return AuthScope::None;
+        };
+        if username == config.viewer_username
+            && config
+                .viewer_password
+                .as_ref()
+                .is_some_and(|expected| constant_time_eq(expected, password))
+        {
+            return AuthScope::ReadOnly;
+        }
     }
 
     AuthScope::None
@@ -627,7 +858,6 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
-        204 => "No Content",
         302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -702,6 +932,15 @@ fn openapi_document() -> JsonValue {
                 "get": {
                     "operationId": "listGraphs",
                     "responses": {"200": {"description": "List persistent graphs"}}
+                }
+            },
+            "/v1/overview": {
+                "get": {
+                    "operationId": "getOperationsOverview",
+                    "description": "Read-only operational overview for the built-in dashboard.",
+                    "responses": {
+                        "200": {"description": "Storage, graph cardinality, memory, and live query activity"}
+                    }
                 }
             },
             "/v1/query": {
@@ -783,6 +1022,67 @@ mod tests {
             ..ApiConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dashboard_query_redaction_hides_literals_and_cypher_params() {
+        let redacted = redact_query_for_dashboard(
+            "CYPHER token='secret' MATCH (n:User {name:'Alice'}) RETURN n"
+        );
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("Alice"));
+        assert!(!redacted.contains("token="));
+        assert!(redacted.contains("MATCH"));
+        assert!(redacted.contains("name:'…'"));
+
+        let escaped = redact_query_for_dashboard(
+            "RETURN 'a\\'b', \"private\""
+        );
+        assert!(!escaped.contains("private"));
+        assert!(escaped.contains("'…'"));
+        assert!(escaped.contains("\"…\""));
+    }
+
+    #[test]
+    fn openapi_exposes_dashboard_overview() {
+        let spec = openapi_document();
+        assert_eq!(
+            spec["paths"]["/v1/overview"]["get"]["operationId"],
+            "getOperationsOverview"
+        );
+    }
+
+    #[test]
+    fn viewer_only_config_requires_authentication() {
+        let config = ApiConfig {
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ApiConfig::default()
+        };
+        let headers = HashMap::new();
+        assert!(auth_scope(&headers, &config) == AuthScope::None);
+        assert!(
+            config.read_write_token.is_some()
+                || config.read_only_token.is_some()
+                || config.viewer_password.is_some()
+        );
+    }
+
+    #[test]
+    fn viewer_basic_auth_is_read_only() {
+        let config = ApiConfig {
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ApiConfig::default()
+        };
+
+        let encoded = STANDARD.encode("viewer:viewer-secret");
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), format!("Basic {encoded}"));
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+
+        let wrong = STANDARD.encode("viewer:wrong-secret");
+        headers.insert("authorization".to_string(), format!("Basic {wrong}"));
+        assert!(auth_scope(&headers, &config) == AuthScope::None);
     }
 
     #[test]

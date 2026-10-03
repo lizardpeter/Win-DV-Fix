@@ -82,7 +82,7 @@ fn main() -> Result<(), String> {
 
     let out = must_query(
         &graph,
-        "MATCH ()-[r:EIdx]-() WHERE r.weight >= 10 RETURN r.text",
+        "MATCH ()-[r:EIdx]->() WHERE r.weight >= 10 RETURN r.text",
     )?;
     if out.rows.len() != 1 {
         return Err(format!("edge range expected 1 row, got {:?}", out.rows));

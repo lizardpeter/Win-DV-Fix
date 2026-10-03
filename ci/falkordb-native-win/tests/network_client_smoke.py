@@ -12,6 +12,8 @@ from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 HOST = os.environ.get("FALKORDB_TEST_HOST", "localhost")
 PORT = int(os.environ.get("FALKORDB_TEST_PORT", "6391"))
 PASSWORD = os.environ.get("FALKORDB_TEST_PASSWORD", "native-ci-secret")
+VIEWER_USERNAME = os.environ.get("FALKORDB_TEST_VIEWER_USERNAME", "viewer")
+VIEWER_PASSWORD = os.environ.get("FALKORDB_TEST_VIEWER_PASSWORD", "native-viewer-secret")
 GRAPH = "network-official-client"
 REDIS_RESTORED_GRAPH = "network-redis-dump-restored"
 
@@ -35,16 +37,35 @@ def tls_kwargs(with_client_cert=True):
     return kwargs
 
 
-def connect(password=PASSWORD, with_client_cert=True):
-    return FalkorDB(
-        host=HOST,
-        port=PORT,
-        password=password,
-        socket_connect_timeout=5,
-        socket_timeout=10,
-        protocol=2,
+def connect(password=PASSWORD, with_client_cert=True, username=None):
+    kwargs = {
+        "host": HOST,
+        "port": PORT,
+        "password": password,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 10,
+        "protocol": 2,
         **tls_kwargs(with_client_cert=with_client_cert),
-    )
+    }
+    if username is not None:
+        kwargs["username"] = username
+    return FalkorDB(**kwargs)
+
+
+def redis_connect(password=PASSWORD, with_client_cert=True, username=None):
+    kwargs = {
+        "host": HOST,
+        "port": PORT,
+        "password": password,
+        "decode_responses": False,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 10,
+        "protocol": 2,
+        **tls_kwargs(with_client_cert=with_client_cert),
+    }
+    if username is not None:
+        kwargs["username"] = username
+    return Redis(**kwargs)
 
 
 def phase_write():
@@ -71,6 +92,46 @@ def phase_write():
 
     result = graph.query("RETURN 1 AS one, 'wire-ok' AS text")
     assert result.result_set == [[1, "wire-ok"]], result.result_set
+
+    viewer = connect(
+        password=VIEWER_PASSWORD,
+        username=VIEWER_USERNAME,
+    )
+    viewer_graph = viewer.select_graph(GRAPH)
+    viewer_read = viewer_graph.ro_query("RETURN 7 AS seven")
+    assert viewer_read.result_set == [[7]], viewer_read.result_set
+
+    viewer_redis = redis_connect(
+        password=VIEWER_PASSWORD,
+        username=VIEWER_USERNAME,
+    )
+    try:
+        viewer_redis.execute_command("ACL", "GETUSER", VIEWER_USERNAME)
+        raise AssertionError("viewer unexpectedly had ACL GETUSER permission")
+    except ResponseError as exc:
+        message = str(exc).lower()
+        assert "no permissions" in message or message.startswith("noperm"), exc
+
+    try:
+        viewer_redis.execute_command("GRAPH.QUERY")
+        raise AssertionError("viewer unexpectedly had GRAPH.QUERY permission")
+    except ResponseError as exc:
+        assert "permissions" in str(exc).lower(), exc
+
+    modules = viewer_redis.execute_command("MODULE", "LIST")
+    assert "graph" in str(modules).lower(), modules
+    assert viewer_redis.ttl(GRAPH) == -1
+
+    try:
+        viewer_graph.query("CREATE (:ViewerMustNotWrite)")
+        raise AssertionError("viewer unexpectedly executed a write query")
+    except ResponseError as exc:
+        assert "noperm" in str(exc).lower() or "permissions" in str(exc).lower(), exc
+
+    assert viewer_graph.ro_query(
+        "MATCH (n:ViewerMustNotWrite) RETURN count(n)"
+    ).result_set == [[0]]
+    print("BROWSER_VIEWER_READ_ONLY_PASS")
 
     # Official FalkorDB client admin/config surface.
     original_resultset_size = db.config_get("RESULTSET_SIZE")

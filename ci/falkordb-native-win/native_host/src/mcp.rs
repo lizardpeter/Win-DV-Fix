@@ -18,21 +18,21 @@ use crate::{
     server::GraphCatalog,
 };
 
-pub const OAUTH_BUILD_ID: &str = "secure-tunnel-v7-20260927";
 const PROTOCOL_MODERN: &str = "2026-07-28";
+pub const OAUTH_BUILD_ID: &str = "oauth-pairing-v3-20261001";
+const SERVER_VERSION: &str = "0.5.0";
+pub const TOOLSET_VERSION: &str = "2026-10-01.4";
 const PROTOCOL_LEGACY: &str = "2025-11-25";
 const ACCESS_TOKEN_TTL_SECS: u64 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const AUTH_CODE_TTL_SECS: u64 = 10 * 60;
 const MAX_MCP_BATCH_QUERIES: usize = 100;
-const UREGRAPH_AGENT_INSTRUCTIONS: &str = "Direct access to the user's native FalkorDB graph server. For game reverse-engineering in the named graph uregraph, bootstrap before substantive work: start from the target Project, follow USES_ONTOLOGY to urn:ure:ontology:universal-game-re:v1, and read its HAS_INVARIANT, HAS_EXTENSION_POLICY, HAS_PARTITION_POLICY, HAS_SERVER_GRAPH_POLICY, HAS_ADAPTER_CONTRACT, and HAS_AUDIT nodes plus the target Build/current work/evidence. Treat that ontology as authoritative for schema and workflow. Preserve Family -> Variant -> Occurrence separation; scope addresses/offsets to exact builds and artifacts; never merge by name/address alone; keep evidence/representations distinct from accepted assertions; preserve rejected/superseded hypotheses; append immutable Representation revisions; reconstructed per-function/per-unit source text is stored literally on its Representation revision in uregraph, with Git/R2 only as mirrors/provenance. Use graph-native work/lease/fencing rules when instantiated so concurrent agents do not duplicate or overwrite work. Large original binaries/assets remain in R2/CAS; use the R2 all.txt inventory and established GitHub Actions/CDN retrieval bridge when bytes are not locally mounted. Local absence is not file inaccessibility. Other named graphs such as medgraph and neurosurgery are isolated domains and must not inherit UREGraph ontology unless explicitly bridged. Use read tools for inspection; use write/admin tools only for requested mutations, and write validated RE findings back to uregraph with provenance.";
 
 const SCOPE_READ: &str = "graph:read";
 const SCOPE_WRITE: &str = "graph:write";
 const SCOPE_ADMIN: &str = "graph:admin";
-const SCOPE_OFFLINE: &str = "offline_access";
-const ALL_SCOPES: &str = "graph:read graph:write graph:admin offline_access";
-const AUTHORIZATION_RESPONSE_ISS_SUPPORTED: bool = true;
+const ALL_SCOPES: &str = "graph:read graph:write graph:admin";
+const CLAUDE_CODE_CLIENT_ID: &str = "https://claude.ai/oauth/claude-code-client-metadata";
 
 #[derive(Debug, Clone)]
 struct OAuthCode {
@@ -143,25 +143,27 @@ pub(crate) fn route_http(
 
     let response = match request.method.as_str() {
         "POST" => mcp_post(request, catalog, config),
-        "OPTIONS" => {
-            let mut response = raw_response(204, "text/plain; charset=utf-8", Vec::new());
-            response.headers.push(("Allow".to_string(), "POST, OPTIONS".to_string()));
-            response
-        }
-        // The 2026-07-28 stateless Streamable HTTP transport uses POST only.
-        // Legacy clients that probe GET/DELETE receive an explicit 405.
+        "OPTIONS" => mcp_options_response(),
+        // Stateless JSON-response Streamable HTTP uses POST only for protocol
+        // messages. Legacy GET/DELETE probes receive an explicit 405.
         "GET" | "DELETE" => method_not_allowed("POST, OPTIONS"),
         _ => method_not_allowed("POST, OPTIONS"),
     };
-
     Some(with_mcp_cors(response))
 }
 
+fn mcp_options_response() -> HttpResponse {
+    let mut response = raw_response(204, "text/plain; charset=utf-8", Vec::new());
+    response
+        .headers
+        .push(("Allow".to_string(), "POST, OPTIONS".to_string()));
+    response
+}
+
 fn with_mcp_cors(mut response: HttpResponse) -> HttpResponse {
-    // ChatGPT's developer-mode connection UI may perform a browser preflight
-    // before its backend begins MCP discovery. Authorization is carried in the
-    // Bearer token, not cookies, so wildcard origin is safe for CORS while the
-    // server still enforces OAuth on every privileged tool call.
+    // Authorization is carried in Bearer tokens, not cookies. Browser-based
+    // connector setup can therefore preflight safely while privileged calls
+    // remain protected by the same OAuth scope checks.
     response.headers.push((
         "Access-Control-Allow-Origin".to_string(),
         "*".to_string(),
@@ -208,7 +210,7 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
         200,
         json!({
             "issuer": base,
-            "authorization_response_iss_parameter_supported": AUTHORIZATION_RESPONSE_ISS_SUPPORTED,
+            "authorization_response_iss_parameter_supported": true,
             "authorization_endpoint": format!("{base}/oauth/authorize"),
             "token_endpoint": format!("{base}/oauth/token"),
             "client_id_metadata_document_supported": true,
@@ -219,20 +221,6 @@ fn authorization_server_metadata(request: &HttpRequest, config: &ApiConfig) -> H
             "scopes_supported": [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
         }),
     )
-}
-
-fn pairing_code_fingerprint(code: &str) -> String {
-    let digest = digest::digest(&digest::SHA256, code.as_bytes());
-    digest
-        .as_ref()
-        .iter()
-        .take(6)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<String>()
-}
-
-fn compact_pairing_input(input: &str) -> String {
-    input.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
@@ -255,25 +243,11 @@ fn oauth_authorize_get(request: &HttpRequest, config: &ApiConfig) -> HttpRespons
 
     let validated = match validate_authorize_params(&params, &base) {
         Ok(v) => v,
-        Err(message) => {
-            return authorization_error_response(&params, &base, "invalid_request", &message)
-        }
+        Err(message) => return oauth_error(400, "invalid_request", &message),
     };
 
     let scope_display = html_escape(&validated.scope);
-    let pairing_fingerprint = config
-        .oauth_pairing_code
-        .as_deref()
-        .map(pairing_code_fingerprint)
-        .unwrap_or_else(|| "none".to_string());
-    eprintln!(
-        "OAuth authorization page [{}]: pairing_fingerprint={}, client_id={}, redirect_uri={}, resource={}",
-        OAUTH_BUILD_ID,
-        pairing_fingerprint,
-        validated.client_id,
-        validated.redirect_uri,
-        validated.resource,
-    );
+    let client_display = html_escape(mcp_client_display_name(&validated.client_id));
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -292,25 +266,25 @@ code{{word-break:break-word}}
 </head>
 <body>
 <div class="card">
-<h1>Authorize ChatGPT</h1>
-<p>Grant ChatGPT direct access to this FalkorDB server with these scopes:</p>
+<h1>Authorize {client_display}</h1>
+<p>Grant {client_display} direct access to this FalkorDB server with these scopes:</p>
 <p><code>{scope_display}</code></p>
-<p><strong>Recommended:</strong> enter the restart-scoped <strong>OAuth pairing code</strong> printed in the server console. This bypasses all password, environment-variable, and secrets-file parsing.</p>
-<p>You may also use the RESP server password or <strong>FALKORDB_API_TOKEN</strong>. Raw values, complete <code>NAME=value</code> lines, and the complete two-line <code>falkordb-secrets.txt</code> are accepted.</p>
-<p class="small">OAuth build: <code>{build_id}</code><br>Pairing fingerprint: <code>{pairing_fingerprint}</code></p>
+<p><strong>Recommended:</strong> enter the restart-scoped <strong>OAuth pairing code</strong> printed in the server console. It is independent of password, environment-variable, and secrets-file parsing.</p>
+<p>You may also use the RESP server password or <strong>FALKORDB_API_TOKEN</strong>. Raw values, complete <code>NAME=value</code> lines, and the complete <code>falkordb-secrets.txt</code> contents are accepted.</p>
+<p class="small">OAuth build: <code>{build_id}</code></p>
 <form method="post" action="/oauth/authorize">
 {hidden}
 <label for="owner_secret">OAuth pairing code or FalkorDB owner secret</label>
-<input id="owner_secret" name="owner_secret" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required autofocus>
-<button type="submit">Authorize ChatGPT</button>
+<input id="owner_secret" name="owner_secret" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">Authorize {client_display}</button>
 </form>
-<p class="small">The owner secret is sent only to this server over HTTPS and is never returned to ChatGPT.</p>
+<p class="small">The owner secret is sent only to this server over HTTPS and is never returned to the MCP client.</p>
 </div>
 </body>
 </html>"#,
         hidden = validated.hidden_fields(),
         build_id = OAUTH_BUILD_ID,
-        pairing_fingerprint = pairing_fingerprint
+        client_display = client_display
     );
 
     let mut response = raw_response(200, "text/html; charset=utf-8", html.into_bytes());
@@ -344,9 +318,7 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
     let params = parse_urlencoded(body);
     let validated = match validate_authorize_params(&params, &base) {
         Ok(v) => v,
-        Err(message) => {
-            return authorization_error_response(&params, &base, "invalid_request", &message)
-        }
+        Err(message) => return oauth_error(400, "invalid_request", &message),
     };
 
     // Accept the new owner_secret field and the old api_token field so a
@@ -355,65 +327,24 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
         .get("owner_secret")
         .or_else(|| params.get("api_token"))
         .map_or("", String::as_str);
-    let matched_source = owner_secret_match_source(config, supplied);
-    if matched_source.is_none() {
-        let expected_pairing_fingerprint = config
-            .oauth_pairing_code
-            .as_deref()
-            .map(pairing_code_fingerprint)
-            .unwrap_or_else(|| "none".to_string());
-        let compact_submitted_len = compact_pairing_input(supplied).chars().count();
-        eprintln!(
-            "OAuth approval rejected [{}]: pairing_fingerprint={}, pairing_code={}, runtime_password={}, runtime_api_token={}, secrets_file_candidates={}, submitted_candidates={}, submitted_chars={}, compact_submitted_chars={}",
-            OAUTH_BUILD_ID,
-            expected_pairing_fingerprint,
-            config.oauth_pairing_code.is_some(),
-            config.oauth_owner_secret.is_some(),
-            config.read_write_token.is_some(),
-            config.oauth_owner_secret_fallbacks.len(),
-            normalize_owner_secret_candidates(supplied).len(),
-            supplied.chars().count(),
-            compact_submitted_len,
-        );
+    if !owner_secret_matches(config, supplied) {
         let mut response = raw_response(
             403,
             "text/html; charset=utf-8",
             format!(
-                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The submitted value did not match this process.</p><p>Build: <code>{}</code></p><p>Expected pairing fingerprint: <code>{}</code></p><p>Submitted characters: <strong>{}</strong>; after whitespace normalization: <strong>{}</strong>.</p><p>Pairing code active: <strong>{}</strong>; runtime password loaded: <strong>{}</strong>; runtime API token loaded: <strong>{}</strong>; secrets-file fallback candidates: <strong>{}</strong>.</p>",
-                OAUTH_BUILD_ID,
-                expected_pairing_fingerprint,
-                supplied.chars().count(),
-                compact_submitted_len,
-                config.oauth_pairing_code.is_some(),
-                config.oauth_owner_secret.is_some(),
-                config.read_write_token.is_some(),
-                config.oauth_owner_secret_fallbacks.len(),
+                "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>The FalkorDB owner secret was not accepted.</p><p>This server currently has <strong>{}</strong> distinct owner credential source(s) available for OAuth. You may paste the raw password/token, a complete FALKORDB_PASSWORD=... or FALKORDB_API_TOKEN=... line, or the complete falkordb-secrets.txt contents.</p>",
+                usize::from(config.oauth_pairing_code.is_some())
+                    + usize::from(config.oauth_owner_secret.is_some())
+                    + usize::from(config.read_write_token.is_some())
+                    + config.oauth_owner_secret_fallbacks.len()
             ).into_bytes(),
         );
         response.headers.push((
             "Content-Security-Policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string(),
         ));
-        // For a valid OAuth request, RFC 9207 requires issuer identification
-        // on authorization error responses as well. Redirect the OAuth client
-        // instead of stranding it on a server-local HTML error page.
-        return authorization_error_response(
-            &params,
-            &base,
-            "access_denied",
-            "owner approval was not accepted",
-        );
+        return response;
     }
-
-    eprintln!(
-        "OAuth approval accepted [{}] using {}; client_id={}; redirect_uri={}; resource={}; issuer={}",
-        OAUTH_BUILD_ID,
-        matched_source.unwrap_or("unknown"),
-        validated.client_id,
-        validated.redirect_uri,
-        validated.resource,
-        base,
-    );
 
     cleanup_expired_codes();
     let code = match random_token("ac_", 32) {
@@ -435,36 +366,26 @@ fn oauth_authorize_post(request: &HttpRequest, config: &ApiConfig) -> HttpRespon
 
     let separator = if validated.redirect_uri.contains('?') { '&' } else { '?' };
     let mut location = format!(
-        "{}{}code={}",
+        "{}{}code={}&iss={}",
         validated.redirect_uri,
         separator,
-        percent_encode(&code)
+        percent_encode(&code),
+        percent_encode(&base)
     );
-    if AUTHORIZATION_RESPONSE_ISS_SUPPORTED {
-        location.push_str("&iss=");
-        location.push_str(&percent_encode(&base));
-    }
     if !validated.state.is_empty() {
         location.push_str("&state=");
         location.push_str(&percent_encode(&validated.state));
     }
-    eprintln!(
-        "OAuth redirect [{}]: callback_mode={}, redirect_uri={}, iss_included={}",
-        OAUTH_BUILD_ID,
-        if AUTHORIZATION_RESPONSE_ISS_SUPPORTED { "stable" } else { "callback-specific" },
-        validated.redirect_uri,
-        AUTHORIZATION_RESPONSE_ISS_SUPPORTED,
-    );
 
     let mut response = raw_response(302, "text/plain; charset=utf-8", Vec::new());
     response.headers.push(("Location".to_string(), location));
     response
 }
 
-fn owner_secret_match_source(config: &ApiConfig, supplied: &str) -> Option<&'static str> {
+fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
     let candidates = normalize_owner_secret_candidates(supplied);
     if candidates.is_empty() {
-        return None;
+        return false;
     }
 
     let matches_expected = |expected: &str| {
@@ -473,41 +394,22 @@ fn owner_secret_match_source(config: &ApiConfig, supplied: &str) -> Option<&'sta
             .any(|candidate| constant_time_eq(expected, candidate))
     };
 
-    if let Some(expected_pairing) = config.oauth_pairing_code.as_deref() {
-        if matches_expected(expected_pairing) {
-            return Some("pairing-code");
-        }
-        let compact = compact_pairing_input(supplied);
-        if !compact.is_empty() && constant_time_eq(expected_pairing, &compact) {
-            return Some("pairing-code-whitespace-normalized");
-        }
-    }
-    if config
-        .oauth_owner_secret
+    config
+        .oauth_pairing_code
         .as_deref()
         .is_some_and(matches_expected)
-    {
-        return Some("runtime-password");
-    }
-    if config
-        .read_write_token
-        .as_deref()
-        .is_some_and(matches_expected)
-    {
-        return Some("runtime-api-token");
-    }
-    if config
-        .oauth_owner_secret_fallbacks
-        .iter()
-        .any(|expected| matches_expected(expected))
-    {
-        return Some("secrets-file");
-    }
-    None
-}
-
-fn owner_secret_matches(config: &ApiConfig, supplied: &str) -> bool {
-    owner_secret_match_source(config, supplied).is_some()
+        || config
+            .oauth_owner_secret
+            .as_deref()
+            .is_some_and(matches_expected)
+        || config
+            .read_write_token
+            .as_deref()
+            .is_some_and(matches_expected)
+        || config
+            .oauth_owner_secret_fallbacks
+            .iter()
+            .any(|expected| matches_expected(expected))
 }
 
 fn normalize_owner_secret_candidates(input: &str) -> Vec<String> {
@@ -569,7 +471,6 @@ fn unquote_owner_secret(value: &str) -> String {
 
 fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     let Some(secret) = config.read_write_token.as_deref() else {
-        eprintln!("OAuth token rejected [{}]: no API signing token configured", OAUTH_BUILD_ID);
         return oauth_error(
             503,
             "temporarily_unavailable",
@@ -578,42 +479,14 @@ fn oauth_token(request: &HttpRequest, config: &ApiConfig) -> HttpResponse {
     };
     let body = match std::str::from_utf8(&request.body) {
         Ok(body) => body,
-        Err(_) => {
-            eprintln!("OAuth token rejected [{}]: request body is not UTF-8", OAUTH_BUILD_ID);
-            return oauth_error(400, "invalid_request", "form body is not UTF-8");
-        }
+        Err(_) => return oauth_error(400, "invalid_request", "form body is not UTF-8"),
     };
     let params = parse_urlencoded(body);
-    let grant_type = params.get("grant_type").map(String::as_str).unwrap_or("<missing>");
-    eprintln!(
-        "OAuth token request [{}]: grant_type={}, client_id_present={}, redirect_uri_present={}, resource_present={}, verifier_present={}, user_agent={}",
-        OAUTH_BUILD_ID,
-        grant_type,
-        params.contains_key("client_id"),
-        params.contains_key("redirect_uri"),
-        params.contains_key("resource"),
-        params.contains_key("code_verifier"),
-        request.headers.get("user-agent").map(String::as_str).unwrap_or("<none>"),
-    );
-
-    let mut response = match grant_type {
-        "authorization_code" => exchange_authorization_code(&params, secret),
-        "refresh_token" => exchange_refresh_token(&params, secret),
+    match params.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => exchange_authorization_code(&params, secret),
+        Some("refresh_token") => exchange_refresh_token(&params, secret),
         _ => oauth_error(400, "unsupported_grant_type", "unsupported grant_type"),
-    };
-    response.headers.push(("Pragma".to_string(), "no-cache".to_string()));
-    let outcome = serde_json::from_slice::<JsonValue>(&response.body)
-        .ok()
-        .and_then(|value| {
-            value.get("error").and_then(JsonValue::as_str).map(str::to_string)
-                .or_else(|| value.get("access_token").map(|_| "token_issued".to_string()))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    eprintln!(
-        "OAuth token response [{}]: status={} outcome={}",
-        OAUTH_BUILD_ID, response.status, outcome
-    );
-    response
+    }
 }
 
 fn exchange_authorization_code(params: &HashMap<String, String>, secret: &str) -> HttpResponse {
@@ -760,13 +633,13 @@ fn validate_authorize_params(
     }
 
     let client_id = required_param(params, "client_id")?;
-    if !allowed_chatgpt_client_id(client_id) {
-        return Err("client_id is not an accepted ChatGPT OAuth client".to_string());
+    if !allowed_mcp_client_id(client_id) {
+        return Err("client_id is not an accepted MCP OAuth client".to_string());
     }
 
     let redirect_uri = required_param(params, "redirect_uri")?;
-    if !allowed_chatgpt_redirect(redirect_uri) {
-        return Err("redirect_uri is not an accepted ChatGPT OAuth callback".to_string());
+    if !allowed_mcp_redirect(client_id, redirect_uri) {
+        return Err("redirect_uri is not accepted for this MCP OAuth client".to_string());
     }
 
     if params.get("code_challenge_method").map(String::as_str) != Some("S256") {
@@ -800,6 +673,52 @@ fn validate_authorize_params(
     })
 }
 
+fn allowed_mcp_client_id(client_id: &str) -> bool {
+    allowed_chatgpt_client_id(client_id) || client_id == CLAUDE_CODE_CLIENT_ID
+}
+
+fn allowed_mcp_redirect(client_id: &str, uri: &str) -> bool {
+    if allowed_chatgpt_client_id(client_id) {
+        return allowed_chatgpt_redirect(uri);
+    }
+    if client_id == CLAUDE_CODE_CLIENT_ID {
+        return allowed_claude_code_redirect(uri);
+    }
+    false
+}
+
+fn allowed_claude_code_redirect(uri: &str) -> bool {
+    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+        .into_iter()
+        .any(|prefix| {
+            let Some(rest) = uri.strip_prefix(prefix) else {
+                return false;
+            };
+            if rest == "/callback" {
+                return true;
+            }
+            let Some(without_colon) = rest.strip_prefix(':') else {
+                return false;
+            };
+            let Some((port, path)) = without_colon.split_once('/') else {
+                return false;
+            };
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && path == "callback"
+        })
+}
+
+fn mcp_client_display_name(client_id: &str) -> &'static str {
+    if allowed_chatgpt_client_id(client_id) {
+        "ChatGPT"
+    } else if client_id == CLAUDE_CODE_CLIENT_ID {
+        "Claude Code"
+    } else {
+        "MCP client"
+    }
+}
+
 fn allowed_chatgpt_client_id(client_id: &str) -> bool {
     client_id == "https://chatgpt.com/oauth/client.json"
         || (client_id.starts_with("https://chatgpt.com/oauth/")
@@ -813,7 +732,7 @@ fn allowed_chatgpt_redirect(uri: &str) -> bool {
 
 fn validate_requested_scopes(scope: &str) -> Result<(), String> {
     for item in scope.split_whitespace() {
-        if !matches!(item, SCOPE_READ | SCOPE_WRITE | SCOPE_ADMIN | SCOPE_OFFLINE) {
+        if !matches!(item, SCOPE_READ | SCOPE_WRITE | SCOPE_ADMIN) {
             return Err(format!("unsupported scope {item:?}"));
         }
     }
@@ -832,7 +751,7 @@ fn validate_scope_subset(requested: &str, granted: &str) -> Result<(), String> {
 }
 
 fn canonical_scope(scope: &str) -> String {
-    [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN, SCOPE_OFFLINE]
+    [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
         .into_iter()
         .filter(|candidate| scope.split_whitespace().any(|item| item == *candidate))
         .collect::<Vec<_>>()
@@ -862,17 +781,6 @@ fn mcp_post(request: &HttpRequest, catalog: &GraphCatalog, config: &ApiConfig) -
     };
     let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
     let modern = is_modern_request(request, &params) || method == "server/discover";
-
-    if matches!(method, "server/discover" | "initialize" | "tools/list") {
-        eprintln!(
-            "MCP control request [{}]: method={}, modern={}, bearer_present={}, host={}",
-            OAUTH_BUILD_ID,
-            method,
-            modern,
-            request.headers.contains_key("authorization"),
-            request.headers.get("host").map(String::as_str).unwrap_or("<missing>"),
-        );
-    }
 
     // JSON-RPC notifications do not receive a JSON-RPC response.
     if object.get("id").is_none() {
@@ -919,11 +827,12 @@ fn server_discover_result() -> JsonValue {
             "2025-03-26"
         ],
         "capabilities": {
-            "tools": {"listChanged": false}
+            "tools": {"listChanged": true}
         },
-        "instructions": UREGRAPH_AGENT_INSTRUCTIONS,
+        "instructions": "Direct access to the user's native FalkorDB graph server. Use read tools for inspection. Use write/admin tools when the user asks to create, update, import, checkpoint, copy, restore, or delete graph data.",
         "ttlMs": 60000,
         "cacheScope": "private",
+        "toolsetVersion": TOOLSET_VERSION,
         "resultType": "complete",
         "_meta": server_meta()
     })
@@ -941,13 +850,14 @@ fn initialize_result(params: &JsonValue) -> JsonValue {
     json!({
         "protocolVersion": negotiated,
         "capabilities": {
-            "tools": {"listChanged": false}
+            "tools": {"listChanged": true}
         },
         "serverInfo": {
             "name": "falkordb-native-windows",
-            "version": "0.4.1"
+            "version": SERVER_VERSION
         },
-        "instructions": UREGRAPH_AGENT_INSTRUCTIONS
+        "toolsetVersion": TOOLSET_VERSION,
+        "instructions": "Direct read/write/admin access to the native FalkorDB graph server."
     })
 }
 
@@ -958,6 +868,23 @@ fn tools_list_result(modern: bool, tunnel_mode: bool) -> JsonValue {
             "List graphs",
             "List all persistent named graphs on this FalkorDB server.",
             empty_schema(),
+            RequiredScope::Read,
+            true,
+            false,
+            true,
+        ),
+        tool_definition(
+            "database_stats",
+            "Database statistics",
+            "Show exact persistent storage usage for the database and each graph: WAL bytes, checkpoint bytes/count, total graph storage, node/relationship counts, graph version, and optional sampled in-memory size. Supply graph to restrict the report to one named graph.",
+            object_schema(
+                json!({
+                    "graph": {"type": "string", "minLength": 1},
+                    "include_memory": {"type": "boolean", "default": true},
+                    "memory_samples": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 100}
+                }),
+                &[],
+            ),
             RequiredScope::Read,
             true,
             false,
@@ -1140,6 +1067,45 @@ fn tools_list_result(modern: bool, tunnel_mode: bool) -> JsonValue {
             false,
         ),
         tool_definition(
+            "bulk_import_file",
+            "Bulk import server file",
+            "High-throughput schema-agnostic import from a file already present in the server import directory. Version 1 supports format=jsonl: every non-blank line must be a JSON object. The supplied Cypher template must contain exactly one {{ROWS}} placeholder, which is replaced locally with batches of JSON records converted to Cypher maps. This supports arbitrary MATCH/MERGE/CREATE node and relationship schemas without sending the corpus through MCP. Use dry_run=true for full parse/hash validation without graph writes; start_record supports resumable imports.",
+            object_schema(
+                json!({
+                    "graph": {"type": "string", "minLength": 1},
+                    "file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Relative path below FALKORDB_IMPORT_DIR, or <data-dir>/imports when unset."
+                    },
+                    "format": {"type": "string", "enum": ["jsonl"], "default": "jsonl"},
+                    "cypher": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Batch Cypher template containing exactly one {{ROWS}} placeholder."
+                    },
+                    "sha256": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9A-Fa-f]{64}$"
+                    },
+                    "batch_size": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
+                    "max_batch_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864, "default": 8388608},
+                    "start_record": {"type": "integer", "minimum": 1, "default": 1},
+                    "max_records": {"type": "integer", "minimum": 1},
+                    "dry_run": {"type": "boolean", "default": false},
+                    "create_graph": {"type": "boolean", "default": false},
+                    "checkpoint": {"type": "boolean", "default": true}
+                }),
+                &["graph", "file", "format", "cypher"],
+            ),
+            RequiredScope::Admin,
+            false,
+            false,
+            false,
+        ),
+        tool_definition(
             "restore_graph_dump",
             "Restore graph dump",
             "Restore a base64-encoded Redis/FalkorDB DUMP payload into a named graph. Set replace=true to replace an existing graph.",
@@ -1202,13 +1168,7 @@ fn tool_definition(
             }
         ],
         "_meta": {
-            "requiredScope": scope.as_str(),
-            "securitySchemes": [
-                {
-                    "type": "oauth2",
-                    "scopes": [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
-                }
-            ]
+            "requiredScope": scope.as_str()
         }
     })
 }
@@ -1250,7 +1210,7 @@ fn call_tool(
         .unwrap_or_default();
 
     let required_scope = match name {
-        "list_graphs" | "query_graph_read" | "export_graph_dump" => RequiredScope::Read,
+        "list_graphs" | "database_stats" | "query_graph_read" | "export_graph_dump" => RequiredScope::Read,
         "create_graph" | "query_graph_write" | "batch_graph_queries" => RequiredScope::Write,
         "copy_graph"
         | "delete_graph"
@@ -1258,7 +1218,8 @@ fn call_tool(
         | "checkpoint_all_graphs"
         | "flush_all_graphs"
         | "restore_graph_dump"
-        | "import_falkordb_rdb_file" => RequiredScope::Admin,
+        | "import_falkordb_rdb_file"
+        | "bulk_import_file" => RequiredScope::Admin,
         _ => return Err(format!("unknown tool {name:?}")),
     };
 
@@ -1280,6 +1241,78 @@ fn call_tool(
 
     let result = match name {
         "list_graphs" => Ok(json!({"graphs": catalog.list()})),
+        "database_stats" => {
+            let graph_filter = args
+                .get("graph")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let include_memory = args
+                .get("include_memory")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            let memory_samples = match args.get("memory_samples") {
+                None | Some(JsonValue::Null) => 100usize,
+                Some(value) => {
+                    let value = value
+                        .as_u64()
+                        .ok_or_else(|| "memory_samples must be a positive integer".to_string())?;
+                    let value = usize::try_from(value)
+                        .map_err(|_| "memory_samples is too large".to_string())?;
+                    if value == 0 || value > 10_000 {
+                        return Err("memory_samples must be between 1 and 10000".to_string());
+                    }
+                    value
+                }
+            };
+
+            catalog
+                .database_stats(graph_filter, include_memory, memory_samples)
+                .map(|stats| {
+                    let graphs = stats
+                        .graphs
+                        .into_iter()
+                        .map(|graph| {
+                            json!({
+                                "graph": graph.graph,
+                                "nodes": graph.nodes,
+                                "relationships": graph.relationships,
+                                "graph_version": graph.graph_version,
+                                "wal_bytes": graph.wal_bytes,
+                                "wal_size": human_bytes(graph.wal_bytes),
+                                "checkpoint_bytes": graph.checkpoint_bytes,
+                                "checkpoint_size": human_bytes(graph.checkpoint_bytes),
+                                "checkpoint_count": graph.checkpoint_count,
+                                "latest_checkpoint_sequence": graph.latest_checkpoint_sequence,
+                                "latest_checkpoint_bytes": graph.latest_checkpoint_bytes,
+                                "latest_checkpoint_size": graph.latest_checkpoint_bytes.map(human_bytes),
+                                "persistent_bytes": graph.persistent_bytes,
+                                "persistent_size": human_bytes(graph.persistent_bytes),
+                                "estimated_memory_bytes": graph.estimated_memory_bytes,
+                                "estimated_memory_size": graph.estimated_memory_bytes.map(human_bytes)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    json!({
+                        "total_storage_bytes": stats.total_storage_bytes,
+                        "total_storage_size": human_bytes(stats.total_storage_bytes),
+                        "graphs_storage_bytes": stats.graphs_storage_bytes,
+                        "graphs_storage_size": human_bytes(stats.graphs_storage_bytes),
+                        "attributed_graph_bytes": stats.attributed_graph_bytes,
+                        "attributed_graph_size": human_bytes(stats.attributed_graph_bytes),
+                        "unattributed_graph_storage_bytes": stats.unattributed_graph_storage_bytes,
+                        "unattributed_graph_storage_size": human_bytes(stats.unattributed_graph_storage_bytes),
+                        "imports_storage_bytes": stats.imports_storage_bytes,
+                        "imports_storage_size": human_bytes(stats.imports_storage_bytes),
+                        "imports_inside_data_dir": stats.imports_inside_data_dir,
+                        "other_storage_bytes": stats.other_storage_bytes,
+                        "other_storage_size": human_bytes(stats.other_storage_bytes),
+                        "graph_count": graphs.len(),
+                        "memory_samples": include_memory.then_some(memory_samples),
+                        "graphs": graphs
+                    })
+                })
+        }
         "create_graph" => {
             let graph_name = required_string(&args, "graph")?;
             let existed = catalog.contains(graph_name);
@@ -1363,6 +1396,98 @@ fn call_tool(
                     "dump_base64": URL_SAFE_NO_PAD.encode(dump)
                 })
             })
+        }
+        "bulk_import_file" => {
+            let graph_name = required_string(&args, "graph")?;
+            let file = required_string(&args, "file")?;
+            let format = required_string(&args, "format")?;
+            if !format.eq_ignore_ascii_case("jsonl") {
+                return Err(format!(
+                    "bulk_import_file format {format:?} is not supported by this executable; supported formats: jsonl"
+                ));
+            }
+            let cypher = required_string(&args, "cypher")?;
+            let sha256 = args
+                .get("sha256")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty());
+
+            let to_usize = |name: &str| -> Result<Option<usize>, String> {
+                match args.get(name) {
+                    None | Some(JsonValue::Null) => Ok(None),
+                    Some(value) => {
+                        let raw = value
+                            .as_u64()
+                            .ok_or_else(|| format!("{name} must be a positive integer"))?;
+                        usize::try_from(raw)
+                            .map(Some)
+                            .map_err(|_| format!("{name} is too large for this server"))
+                    }
+                }
+            };
+
+            let batch_size = to_usize("batch_size")?;
+            let max_batch_bytes = to_usize("max_batch_bytes")?;
+            let start_record = to_usize("start_record")?;
+            let max_records = to_usize("max_records")?;
+            let dry_run = args
+                .get("dry_run")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let create_graph = args
+                .get("create_graph")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let checkpoint = args
+                .get("checkpoint")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+
+            catalog
+                .bulk_import_jsonl_file(
+                    graph_name,
+                    file,
+                    cypher,
+                    sha256,
+                    batch_size,
+                    max_batch_bytes,
+                    start_record,
+                    max_records,
+                    dry_run,
+                    create_graph,
+                    checkpoint,
+                )
+                .map(|(import_root, report)| {
+                    json!({
+                        "graph": graph_name,
+                        "format": "jsonl",
+                        "import_root": import_root.display().to_string(),
+                        "file": file,
+                        "size_bytes": report.size_bytes,
+                        "sha256": report.sha256,
+                        "records_total": report.records_total,
+                        "records_selected": report.records_selected,
+                        "records_imported": report.records_imported,
+                        "physical_lines": report.physical_lines,
+                        "start_record": report.start_record,
+                        "last_record": report.last_record,
+                        "batches": report.batches,
+                        "dry_run": report.dry_run,
+                        "checkpoint_file": report.checkpoint_file,
+                        "stats": {
+                            "labels_added": report.totals.labels_added,
+                            "labels_removed": report.totals.labels_removed,
+                            "nodes_created": report.totals.nodes_created,
+                            "relationships_created": report.totals.relationships_created,
+                            "nodes_deleted": report.totals.nodes_deleted,
+                            "relationships_deleted": report.totals.relationships_deleted,
+                            "properties_set": report.totals.properties_set,
+                            "properties_removed": report.totals.properties_removed,
+                            "indexes_created": report.totals.indexes_created,
+                            "indexes_dropped": report.totals.indexes_dropped
+                        }
+                    })
+                })
         }
         "import_falkordb_rdb_file" => {
             let file = required_string(&args, "file")?;
@@ -1479,6 +1604,21 @@ fn run_batch(args: &JsonMap<String, JsonValue>, catalog: &GraphCatalog) -> Resul
     Ok(json!({"results": results}))
 }
 
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
 fn required_string<'a>(
     args: &'a JsonMap<String, JsonValue>,
     key: &str,
@@ -1530,20 +1670,20 @@ fn auth_required_result(
 ) -> JsonValue {
     let metadata = format!("{issuer}/.well-known/oauth-protected-resource");
     let challenge = format!(
-        "Bearer resource_metadata=\"{metadata}\", scope=\"{}\", error=\"insufficient_scope\", error_description=\"Authorize ChatGPT to access this FalkorDB server\"",
+        "Bearer resource_metadata=\"{metadata}\", scope=\"{}\", error=\"insufficient_scope\", error_description=\"Authorize this MCP client to access this FalkorDB server\"",
         required.as_str()
     );
     let mut result = json!({
         "content": [{
             "type": "text",
-            "text": "Authorization required. Link this FalkorDB server in ChatGPT to continue."
+            "text": "Authorization required. Authenticate this MCP client with the FalkorDB server to continue."
         }],
         "isError": true,
         "_meta": {
             "mcp/www_authenticate": [challenge],
             "io.modelcontextprotocol/serverInfo": {
                 "name": "falkordb-native-windows",
-                "version": "0.4.0"
+                "version": SERVER_VERSION
             }
         }
     });
@@ -1615,7 +1755,8 @@ fn server_meta() -> JsonValue {
     json!({
         "io.modelcontextprotocol/serverInfo": {
             "name": "falkordb-native-windows",
-            "version": "0.4.0"
+            "version": SERVER_VERSION,
+            "toolsetVersion": TOOLSET_VERSION
         }
     })
 }
@@ -1895,47 +2036,6 @@ fn method_not_allowed(allow: &str) -> HttpResponse {
     response
 }
 
-fn authorization_error_response(
-    params: &HashMap<String, String>,
-    base: &str,
-    code: &str,
-    description: &str,
-) -> HttpResponse {
-    let client_ok = params
-        .get("client_id")
-        .is_some_and(|client_id| allowed_chatgpt_client_id(client_id));
-    let redirect = params
-        .get("redirect_uri")
-        .filter(|uri| allowed_chatgpt_redirect(uri));
-
-    if client_ok {
-        if let Some(redirect_uri) = redirect {
-            let separator = if redirect_uri.contains('?') { '&' } else { '?' };
-            let mut location = format!(
-                "{}{}error={}&error_description={}",
-                redirect_uri,
-                separator,
-                percent_encode(code),
-                percent_encode(description),
-            );
-            if AUTHORIZATION_RESPONSE_ISS_SUPPORTED {
-                location.push_str("&iss=");
-                location.push_str(&percent_encode(base));
-            }
-            if let Some(state) = params.get("state").filter(|state| !state.is_empty()) {
-                location.push_str("&state=");
-                location.push_str(&percent_encode(state));
-            }
-            let mut response = raw_response(302, "text/plain; charset=utf-8", Vec::new());
-            response.headers.push(("Location".to_string(), location));
-            response.headers.push(("Cache-Control".to_string(), "no-store".to_string()));
-            return response;
-        }
-    }
-
-    oauth_error(400, code, description)
-}
-
 fn oauth_error(status: u16, code: &str, description: &str) -> HttpResponse {
     json_response(
         status,
@@ -1998,20 +2098,49 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_oauth_callbacks_are_narrowly_allowlisted() {
-        assert!(allowed_chatgpt_client_id("https://chatgpt.com/oauth/client.json"));
-        assert!(allowed_chatgpt_client_id(
+    fn mcp_oauth_clients_are_narrowly_allowlisted() {
+        let chatgpt = "https://chatgpt.com/oauth/client.json";
+        assert!(allowed_mcp_client_id(chatgpt));
+        assert!(allowed_mcp_client_id(
             "https://chatgpt.com/oauth/callback123/client.json"
         ));
-        assert!(!allowed_chatgpt_client_id("https://evil.example/client.json"));
+        assert!(allowed_mcp_client_id(CLAUDE_CODE_CLIENT_ID));
+        assert!(!allowed_mcp_client_id("https://evil.example/client.json"));
 
-        assert!(allowed_chatgpt_redirect(
+        assert!(allowed_mcp_redirect(
+            chatgpt,
             "https://chatgpt.com/connector_platform_oauth_redirect"
         ));
-        assert!(allowed_chatgpt_redirect(
+        assert!(allowed_mcp_redirect(
+            chatgpt,
             "https://chatgpt.com/connector/oauth/callback123"
         ));
-        assert!(!allowed_chatgpt_redirect("https://evil.example/callback"));
+        assert!(!allowed_mcp_redirect(chatgpt, "https://evil.example/callback"));
+
+        assert!(allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "http://localhost/callback"
+        ));
+        assert!(allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "http://localhost:54321/callback"
+        ));
+        assert!(allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "http://127.0.0.1:3118/callback"
+        ));
+        assert!(allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "http://[::1]:49152/callback"
+        ));
+        assert!(!allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "http://localhost.evil.example/callback"
+        ));
+        assert!(!allowed_mcp_redirect(
+            CLAUDE_CODE_CLIENT_ID,
+            "https://evil.example/callback"
+        ));
     }
 
     #[test]
@@ -2064,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_pairing_code_is_an_independent_owner_approval_path() {
+    fn oauth_pairing_code_is_independent_owner_approval() {
         let config = ApiConfig {
             oauth_owner_secret: Some("wrong-runtime-password".to_string()),
             read_write_token: Some("wrong-runtime-api-token".to_string()),
@@ -2073,10 +2202,6 @@ mod tests {
             ..ApiConfig::default()
         };
 
-        assert_eq!(
-            owner_secret_match_source(&config, "restart-scoped-pairing-code"),
-            Some("pairing-code")
-        );
         assert!(owner_secret_matches(
             &config,
             "restart-scoped-pairing-code"
@@ -2085,41 +2210,23 @@ mod tests {
     }
 
     #[test]
-    fn stable_callback_mode_claims_rfc9207_issuer_response_support() {
-        assert!(AUTHORIZATION_RESPONSE_ISS_SUPPORTED);
-    }
-
-    #[test]
-    fn offline_access_is_a_supported_oauth_scope() {
-        assert!(validate_requested_scopes("graph:read offline_access").is_ok());
-        assert_eq!(
-            canonical_scope("offline_access graph:admin graph:read"),
-            "graph:read graph:admin offline_access"
-        );
-    }
-
-    #[test]
-    fn pairing_code_accepts_copy_whitespace_and_has_stable_fingerprint() {
-        let config = ApiConfig {
-            oauth_pairing_code: Some("ABCD_efgh-1234-IJKL_mnop-5678".to_string()),
-            ..ApiConfig::default()
-        };
-        assert_eq!(
-            owner_secret_match_source(
-                &config,
-                "ABCD_efgh-1234-\nIJKL_mnop-5678"
-            ),
-            Some("pairing-code-whitespace-normalized")
-        );
-        assert_eq!(
-            pairing_code_fingerprint("ABCD_efgh-1234-IJKL_mnop-5678"),
-            pairing_code_fingerprint("ABCD_efgh-1234-IJKL_mnop-5678")
-        );
+    fn mcp_options_preflight_exposes_cors_headers() {
+        let response = with_mcp_cors(mcp_options_response());
+        assert_eq!(response.status, 204);
+        assert!(response.headers.iter().any(|(k, v)| {
+            k == "Allow" && v == "POST, OPTIONS"
+        }));
+        assert!(response.headers.iter().any(|(k, v)| {
+            k == "Access-Control-Allow-Methods" && v.contains("OPTIONS")
+        }));
+        assert!(response.headers.iter().any(|(k, v)| {
+            k == "Access-Control-Allow-Headers" && v.contains("authorization")
+        }));
     }
 
     #[test]
     fn tool_list_exposes_full_read_write_admin_surface() {
-        let value = tools_list_result(false, false);
+        let value = tools_list_result(false);
         let names: Vec<&str> = value["tools"]
             .as_array()
             .unwrap()
@@ -2127,6 +2234,7 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         assert!(names.contains(&"list_graphs"));
+        assert!(names.contains(&"database_stats"));
         assert!(names.contains(&"query_graph_read"));
         assert!(names.contains(&"query_graph_write"));
         assert!(names.contains(&"batch_graph_queries"));
@@ -2135,5 +2243,6 @@ mod tests {
         assert!(names.contains(&"export_graph_dump"));
         assert!(names.contains(&"restore_graph_dump"));
         assert!(names.contains(&"import_falkordb_rdb_file"));
+        assert!(names.contains(&"bulk_import_file"));
     }
 }

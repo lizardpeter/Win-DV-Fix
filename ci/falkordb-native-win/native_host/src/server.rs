@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
@@ -17,7 +18,7 @@ use parking_lot::RwLock;
 use graph::{entity_type::EntityType, graph::constraint::ConstraintType};
 
 use crate::{
-    NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, native_config, rdb_file, redis_dump, snapshot, udf_store, wire::WireValue,
+    NativeGraph, OutputStats, PreparedFalkorImport, QueryOutput, file_import, native_config, query_scheduler, rdb_file, redis_dump, snapshot, udf_store, wire::WireValue,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,8 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub username: String,
     pub password: Option<String>,
+    pub viewer_username: String,
+    pub viewer_password: Option<String>,
     pub allow_unauthenticated_remote: bool,
     pub allow_plaintext_remote: bool,
     pub tls: Option<TlsConfig>,
@@ -46,6 +49,8 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("falkordb-native-data"),
             username: "default".to_string(),
             password: None,
+            viewer_username: "viewer".to_string(),
+            viewer_password: None,
             allow_unauthenticated_remote: false,
             allow_plaintext_remote: false,
             tls: None,
@@ -56,6 +61,27 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
         let remote = !self.bind.ip().is_loopback();
+
+        if let Some(viewer_password) = self.viewer_password.as_deref() {
+            let Some(admin_password) = self.password.as_deref() else {
+                return Err(
+                    "viewer credentials require an admin password to be configured"
+                        .to_string(),
+                );
+            };
+            if self.viewer_username == self.username {
+                return Err(
+                    "viewer username must be different from the admin username"
+                        .to_string(),
+                );
+            }
+            if viewer_password.as_bytes() == admin_password.as_bytes() {
+                return Err(
+                    "viewer password must be different from the admin password"
+                        .to_string(),
+                );
+            }
+        }
 
         if remote && self.tls.is_none() && !self.allow_plaintext_remote {
             return Err(
@@ -102,6 +128,39 @@ pub struct RdbFileGraphReport {
     pub nodes: u64,
     pub relationships: u64,
     pub checkpoint_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphDatabaseStats {
+    pub graph: String,
+    pub nodes: u64,
+    pub relationships: u64,
+    pub graph_version: u64,
+    pub schema_version: u64,
+    pub labels: usize,
+    pub relationship_types: usize,
+    pub property_keys: usize,
+    pub index_definitions: usize,
+    pub constraints: usize,
+    pub wal_bytes: u64,
+    pub checkpoint_bytes: u64,
+    pub checkpoint_count: usize,
+    pub latest_checkpoint_sequence: Option<u64>,
+    pub latest_checkpoint_bytes: Option<u64>,
+    pub persistent_bytes: u64,
+    pub estimated_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseStats {
+    pub total_storage_bytes: u64,
+    pub graphs_storage_bytes: u64,
+    pub attributed_graph_bytes: u64,
+    pub unattributed_graph_storage_bytes: u64,
+    pub imports_storage_bytes: u64,
+    pub imports_inside_data_dir: bool,
+    pub other_storage_bytes: u64,
+    pub graphs: Vec<GraphDatabaseStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +241,201 @@ impl GraphCatalog {
         let mut names: Vec<String> = self.graphs.read().keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Return exact persistent storage usage plus live graph cardinality/version
+    /// information. Optional memory usage is a sampled in-memory estimate from
+    /// the graph engine and is deliberately reported separately from disk bytes.
+    pub fn database_stats(
+        &self,
+        graph_filter: Option<&str>,
+        include_memory: bool,
+        memory_samples: usize,
+    ) -> Result<DatabaseStats, String> {
+        if include_memory && memory_samples == 0 {
+            return Err("memory_samples must be at least 1".to_string());
+        }
+
+        let total_storage_bytes = directory_size_bytes(&self.data_dir)?;
+        let graphs_storage_bytes = directory_size_bytes(&self.graph_dir)?;
+        let import_root = configured_import_root(&self.data_dir);
+        let imports_storage_bytes = directory_size_bytes(&import_root)?;
+        let imports_inside_data_dir = path_is_within(&self.data_dir, &import_root);
+        let other_storage_bytes = total_storage_bytes
+            .saturating_sub(graphs_storage_bytes)
+            .saturating_sub(if imports_inside_data_dir {
+                imports_storage_bytes
+            } else {
+                0
+            });
+
+        let all_names = self.list();
+        let names = if let Some(name) = graph_filter {
+            if !all_names.iter().any(|candidate| candidate == name) {
+                return Err(format!("graph {name:?} does not exist"));
+            }
+            vec![name.to_string()]
+        } else {
+            all_names.clone()
+        };
+
+        // Storage attribution always covers every live graph, even when the
+        // returned detail rows are filtered to one graph. Otherwise storage
+        // belonging to other live graphs would be mislabeled as orphaned.
+        let mut attributed_graph_bytes = 0u64;
+        for name in &all_names {
+            let Some(graph) = self.get(name) else {
+                // A concurrent GRAPH.DELETE may remove an entry after list().
+                // Unfiltered statistics are an eventually-consistent snapshot,
+                // so skip the vanished graph rather than failing the whole report.
+                continue;
+            };
+            let wal_bytes = graph.wal_len()?;
+            let (checkpoint_bytes, _, _, _) = self.checkpoint_storage_stats(name)?;
+            attributed_graph_bytes = attributed_graph_bytes
+                .saturating_add(wal_bytes)
+                .saturating_add(checkpoint_bytes);
+        }
+        let unattributed_graph_storage_bytes =
+            graphs_storage_bytes.saturating_sub(attributed_graph_bytes);
+
+        let mut graphs = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(graph) = self.get(&name) else {
+                if graph_filter.is_some() {
+                    return Err(format!("graph {name:?} no longer exists"));
+                }
+                continue;
+            };
+            let (nodes, relationships, graph_version) = graph.cardinality_and_version();
+            let schema = graph.schema_summary();
+            let wal_bytes = graph.wal_len()?;
+            let (
+                checkpoint_bytes,
+                checkpoint_count,
+                latest_checkpoint_sequence,
+                latest_checkpoint_bytes,
+            ) = self.checkpoint_storage_stats(&name)?;
+            let persistent_bytes = wal_bytes.saturating_add(checkpoint_bytes);
+
+            let estimated_memory_bytes = if include_memory {
+                let report = graph.memory_usage_report(memory_samples);
+                let node_attributes = report
+                    .node_attr_by_label
+                    .iter()
+                    .map(|(_, bytes)| *bytes)
+                    .sum::<usize>();
+                let edge_attributes = report
+                    .edge_attr_by_type
+                    .iter()
+                    .map(|(_, bytes)| *bytes)
+                    .sum::<usize>();
+                let total = report
+                    .label_matrices_sz
+                    .saturating_add(report.relation_matrices_sz)
+                    .saturating_add(report.node_block_storage_sz)
+                    .saturating_add(node_attributes)
+                    .saturating_add(report.unlabeled_node_attr_sz)
+                    .saturating_add(report.edge_block_storage_sz)
+                    .saturating_add(edge_attributes)
+                    .saturating_add(report.indices_sz);
+                Some(total as u64)
+            } else {
+                None
+            };
+
+            graphs.push(GraphDatabaseStats {
+                graph: name,
+                nodes,
+                relationships,
+                graph_version,
+                schema_version: schema.schema_version,
+                labels: schema.labels,
+                relationship_types: schema.relationship_types,
+                property_keys: schema.property_keys,
+                index_definitions: schema.index_definitions,
+                constraints: schema.constraints,
+                wal_bytes,
+                checkpoint_bytes,
+                checkpoint_count,
+                latest_checkpoint_sequence,
+                latest_checkpoint_bytes,
+                persistent_bytes,
+                estimated_memory_bytes,
+            });
+        }
+
+        Ok(DatabaseStats {
+            total_storage_bytes,
+            graphs_storage_bytes,
+            attributed_graph_bytes,
+            unattributed_graph_storage_bytes,
+            imports_storage_bytes,
+            imports_inside_data_dir,
+            other_storage_bytes,
+            graphs,
+        })
+    }
+
+    fn checkpoint_storage_stats(
+        &self,
+        name: &str,
+    ) -> Result<(u64, usize, Option<u64>, Option<u64>), String> {
+        let wal = self.wal_path(name);
+        let wal_name = wal
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("invalid WAL filename for graph {name:?}"))?;
+        let prefix = format!("{wal_name}.snapshot.");
+
+        let mut total = 0u64;
+        let mut count = 0usize;
+        let mut latest_sequence = None::<u64>;
+        let mut latest_bytes = None::<u64>;
+
+        for entry in fs::read_dir(&self.graph_dir)
+            .map_err(|e| format!("scan graph storage {}: {e}", self.graph_dir.display()))?
+        {
+            let entry = entry.map_err(|e| format!("read graph storage entry: {e}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("read graph storage file type: {e}"))?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let filename = entry.file_name();
+            let filename = filename.to_string_lossy();
+            let Some(rest) = filename.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(sequence_text) = rest.strip_suffix(".fgs") else {
+                continue;
+            };
+            let Ok(sequence) = sequence_text.parse::<u64>() else {
+                continue;
+            };
+            let bytes = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // Checkpoint rotation/deletion raced this directory scan.
+                    continue;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "stat checkpoint {}: {err}",
+                        entry.path().display()
+                    ));
+                }
+            };
+            total = total.saturating_add(bytes);
+            count += 1;
+            if latest_sequence.is_none_or(|current| sequence > current) {
+                latest_sequence = Some(sequence);
+                latest_bytes = Some(bytes);
+            }
+        }
+
+        Ok((total, count, latest_sequence, latest_bytes))
     }
 
     pub fn checkpoint_large_wals(
@@ -464,6 +718,74 @@ impl GraphCatalog {
         })
     }
 
+    /// Import an arbitrary server-local JSONL corpus by substituting each batch
+    /// into a caller-supplied Cypher template containing exactly one {{ROWS}}
+    /// placeholder. The executable remains schema-agnostic; the template owns
+    /// all MATCH/MERGE/CREATE semantics for the target graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_import_jsonl_file(
+        &self,
+        graph_name: &str,
+        file: &str,
+        cypher_template: &str,
+        expected_sha256: Option<&str>,
+        batch_size: Option<usize>,
+        max_batch_bytes: Option<usize>,
+        start_record: Option<usize>,
+        max_records: Option<usize>,
+        dry_run: bool,
+        create_graph: bool,
+        checkpoint: bool,
+    ) -> Result<(PathBuf, file_import::JsonlImportReport), String> {
+        let (import_root, path) = rdb_file::resolve_import_file(&self.data_dir, file)?;
+
+        let existed = self.contains(graph_name);
+        let graph = if let Some(graph) = self.get(graph_name) {
+            graph
+        } else if dry_run {
+            Arc::new(NativeGraph::new(graph_name))
+        } else if create_graph {
+            self.get_or_create(graph_name)?
+        } else {
+            return Err(format!(
+                "destination graph {graph_name:?} does not exist; set create_graph=true to create it"
+            ));
+        };
+
+        let result = file_import::import_jsonl(
+            &graph,
+            &path,
+            cypher_template,
+            expected_sha256,
+            batch_size,
+            max_batch_bytes,
+            start_record,
+            max_records,
+            dry_run,
+            checkpoint,
+        );
+
+        match result {
+            Ok(report) => Ok((import_root, report)),
+            Err(err) => {
+                // A newly-created destination can be rolled back completely.
+                // Existing graphs retain already-committed batches so an
+                // idempotent template can resume from the reported frontier.
+                if !dry_run && create_graph && !existed {
+                    match self.delete(graph_name) {
+                        Ok(_) => return Err(format!("{err}; newly-created graph was rolled back")),
+                        Err(rollback_err) => {
+                            return Err(format!(
+                                "{err}; rollback of newly-created graph also failed: {rollback_err}"
+                            ));
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
     /// Export one graph in FalkorDB's upstream v19 GRAPH.RESTORE payload
     /// format. This provides a lossless portable migration artifact.
     pub fn dump_payload(&self, name: &str) -> Result<Vec<u8>, String> {
@@ -553,6 +875,51 @@ impl GraphCatalog {
         }
         Ok(removed)
     }
+}
+
+fn configured_import_root(data_dir: &Path) -> PathBuf {
+    env::var_os("FALKORDB_IMPORT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("imports"))
+}
+
+fn path_is_within(root: &Path, candidate: &Path) -> bool {
+    match (root.canonicalize(), candidate.canonicalize()) {
+        (Ok(root), Ok(candidate)) => candidate.starts_with(root),
+        _ => candidate.starts_with(root),
+    }
+}
+
+fn directory_size_bytes(path: &Path) -> Result<u64, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(format!("stat storage path {}: {err}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)
+        .map_err(|e| format!("scan storage directory {}: {e}", path.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read storage directory entry: {e}"))?;
+        total = total.saturating_add(directory_size_bytes(&entry.path())?);
+    }
+    Ok(total)
 }
 
 fn encode_graph_name(name: &str) -> String {
@@ -713,6 +1080,7 @@ enum RespProtocol {
 
 struct ConnectionState {
     authenticated: bool,
+    read_only: bool,
     protocol: RespProtocol,
     client_name: Option<String>,
 }
@@ -727,6 +1095,7 @@ fn handle_connection_io<S: Read + Write>(
 
     let mut state = ConnectionState {
         authenticated: config.password.is_none(),
+        read_only: false,
         protocol: RespProtocol::Resp2,
         client_name: None,
     };
@@ -770,6 +1139,13 @@ fn dispatch(
         return Resp::Error("NOAUTH Authentication required.".to_string());
     }
 
+    if state.read_only && !read_only_command_allowed(&command, &args) {
+        return Resp::Error(format!(
+            "NOPERM this user has no permissions to run the '{}' command",
+            command.to_ascii_lowercase()
+        ));
+    }
+
     match command.as_str() {
         "PING" => {
             if args.len() > 1 {
@@ -793,6 +1169,8 @@ fn dispatch(
             Resp::Bulk(body.as_bytes().to_vec())
         }
         "COMMAND" => Resp::Array(Vec::new()),
+        "MODULE" => handle_module(&args),
+        "ACL" => handle_acl(&args, config, state),
         "DUMP" => {
             if args.len() != 2 {
                 return Resp::Error("ERR wrong number of arguments for 'dump' command".to_string());
@@ -808,6 +1186,7 @@ fn dispatch(
         }
         "RESTORE" | "RESTORE-ASKING" => handle_redis_restore(&args, catalog),
         "GRAPH.LIST" => Resp::Array(catalog.list().into_iter().map(bulk).collect()),
+        "GRAPH.BULK" => handle_graph_bulk(&args, catalog),
         "GRAPH.QUERY" => handle_graph_query(&args, catalog, false),
         "GRAPH.RO_QUERY" => handle_graph_query(&args, catalog, true),
         "GRAPH.EXPLAIN" => handle_graph_explain(&args, catalog),
@@ -881,6 +1260,18 @@ fn dispatch(
                 Err(err) => Resp::Error(format!("ERR {err}")),
             }
         }
+        "TTL" | "PTTL" | "EXPIRETIME" => {
+            if args.len() != 2 {
+                return Resp::Error(format!(
+                    "ERR wrong number of arguments for '{}' command",
+                    command.to_ascii_lowercase()
+                ));
+            }
+            let exists = std::str::from_utf8(&args[1])
+                .ok()
+                .is_some_and(|name| catalog.contains(name));
+            Resp::Int(if exists { -1 } else { -2 })
+        }
         "EXISTS" => {
             let count = args
                 .iter()
@@ -915,11 +1306,89 @@ fn dispatch(
             }
         }
         "GRAPH.SLOWLOG" => handle_graph_slowlog(&args, catalog),
+        "GRAPH.INFO" => handle_graph_info(&args),
+        "GRAPH.MEMORY" => handle_graph_memory(&args, catalog),
         "GRAPH.CONSTRAINT" => handle_graph_constraint(&args, catalog),
         "GRAPH.CONFIG" => handle_graph_config(&args),
         "GRAPH.UDF" => handle_graph_udf(&args, catalog),
         _ => Resp::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(&args[0]))),
     }
+}
+
+fn read_only_command_allowed(command: &str, args: &[Vec<u8>]) -> bool {
+    match command {
+        "PING" | "ECHO" | "QUIT" | "SELECT" | "CLIENT" | "INFO" | "COMMAND"
+        | "MODULE" | "DUMP" | "EXISTS" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME"
+        | "GRAPH.LIST" | "GRAPH.RO_QUERY" | "GRAPH.EXPLAIN" | "GRAPH.INFO"
+        | "GRAPH.MEMORY" => true,
+        // Let ACL reach its handler so Browser receives the exact NOPERM it
+        // expects while probing whether the authenticated user is an admin.
+        "ACL" => args.get(1).is_some_and(|sub| ascii_upper(sub) == "GETUSER"),
+        // GRAPH.QUERY is deliberately denied instead of silently downgraded:
+        // FalkorDB Browser probes this command to distinguish Read-Only from
+        // Read-Write accounts, then switches to GRAPH.RO_QUERY.
+        _ => false,
+    }
+}
+
+fn handle_module(args: &[Vec<u8>]) -> Resp {
+    if args.len() != 2 || ascii_upper(&args[1]) != "LIST" {
+        return Resp::Error("ERR only MODULE LIST is supported".to_string());
+    }
+
+    Resp::Array(vec![Resp::Array(vec![
+        bulk("name"),
+        bulk("graph"),
+        bulk("ver"),
+        Resp::Int(1),
+        bulk("path"),
+        bulk("native"),
+        bulk("args"),
+        Resp::Array(Vec::new()),
+    ])])
+}
+
+fn handle_acl(args: &[Vec<u8>], config: &ServerConfig, state: &ConnectionState) -> Resp {
+    if args.len() < 2 {
+        return Resp::Error("ERR wrong number of arguments for 'acl' command".to_string());
+    }
+    if state.read_only {
+        return Resp::Error(
+            "NOPERM this user has no permissions to run the 'acl|getuser' command".to_string(),
+        );
+    }
+    if ascii_upper(&args[1]) != "GETUSER" || args.len() != 3 {
+        return Resp::Error("ERR only ACL GETUSER is supported".to_string());
+    }
+
+    let Ok(username) = std::str::from_utf8(&args[2]) else {
+        return Resp::Null;
+    };
+    if username != config.username && username != config.viewer_username {
+        return Resp::Null;
+    }
+
+    let read_only = username == config.viewer_username;
+    let commands = if read_only {
+        "-@all +graph.explain +graph.list +graph.ro_query +graph.info +graph.memory +module|list +ping +hello +info +dump +exists +ttl +pttl +expiretime"
+    } else {
+        "+@all"
+    };
+
+    Resp::Array(vec![
+        bulk("flags"),
+        Resp::Array(vec![bulk("on")]),
+        bulk("passwords"),
+        Resp::Array(Vec::new()),
+        bulk("commands"),
+        bulk(commands),
+        bulk("keys"),
+        bulk("~*"),
+        bulk("channels"),
+        bulk(""),
+        bulk("selectors"),
+        Resp::Array(Vec::new()),
+    ])
 }
 
 fn handle_redis_restore(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
@@ -994,12 +1463,20 @@ fn handle_auth(args: &[Vec<u8>], config: &ServerConfig, state: &mut ConnectionSt
         _ => return Resp::Error("ERR wrong number of arguments for 'auth' command".to_string()),
     };
 
-    let valid = config.password.as_ref().is_none_or(|expected| {
+    let admin_valid = config.password.as_ref().is_none_or(|expected| {
         username == config.username && password.as_bytes() == expected.as_bytes()
     });
+    let viewer_valid = config.viewer_password.as_ref().is_some_and(|expected| {
+        username == config.viewer_username && password.as_bytes() == expected.as_bytes()
+    });
 
-    if valid {
+    if admin_valid {
         state.authenticated = true;
+        state.read_only = false;
+        Resp::Simple("OK".to_string())
+    } else if viewer_valid {
+        state.authenticated = true;
+        state.read_only = true;
         Resp::Simple("OK".to_string())
     } else {
         Resp::Error("WRONGPASS invalid username-password pair or user is disabled.".to_string())
@@ -1087,6 +1564,185 @@ fn handle_client(args: &[Vec<u8>], state: &mut ConnectionState) -> Resp {
     }
 }
 
+
+fn handle_graph_info(args: &[Vec<u8>]) -> Resp {
+    let all = args.len() == 1;
+    let mut running = all;
+    let mut waiting = all;
+    let mut object_pool = all;
+
+    for arg in args.iter().skip(1) {
+        match ascii_upper(arg).as_str() {
+            "RUNNINGQUERIES" => running = true,
+            "WAITINGQUERIES" => waiting = true,
+            "OBJECTPOOL" => object_pool = true,
+            _ => {}
+        }
+    }
+
+    if !(running || waiting || object_pool) {
+        return bulk("no section found");
+    }
+
+    let now = std::time::Instant::now();
+    let mut out = Vec::new();
+
+    if running {
+        out.push(bulk("# Running queries"));
+        out.push(Resp::Array(
+            query_scheduler::snapshot_running()
+                .into_iter()
+                .map(|q| {
+                    Resp::Array(vec![
+                        bulk("Received at"),
+                        Resp::Int(q.received_at),
+                        bulk("Graph name"),
+                        bulk(q.graph_name),
+                        bulk("Query"),
+                        bulk(q.query),
+                        bulk("Execution duration"),
+                        bulk(format!("{:.6}", now.duration_since(q.start).as_secs_f64() * 1000.0)),
+                        bulk("Replicated command"),
+                        Resp::Int(0),
+                    ])
+                })
+                .collect(),
+        ));
+    }
+
+    if waiting {
+        out.push(bulk("# Waiting queries"));
+        out.push(Resp::Array(
+            query_scheduler::snapshot_waiting()
+                .into_iter()
+                .map(|q| {
+                    Resp::Array(vec![
+                        bulk("Received at"),
+                        Resp::Int(q.received_at),
+                        bulk("Graph name"),
+                        bulk(q.graph_name),
+                        bulk("Query"),
+                        bulk(q.query),
+                        bulk("Wait duration"),
+                        bulk(format!("{:.6}", now.duration_since(q.enqueued).as_secs_f64() * 1000.0)),
+                    ])
+                })
+                .collect(),
+        ));
+    }
+
+    if object_pool {
+        let (count, avg) = graph::runtime::string_pool::global().stats();
+        let avg = if avg.fract() == 0.0 {
+            format!("{}", avg as i64)
+        } else {
+            format!("{avg}")
+        };
+        out.push(bulk("Object Pool"));
+        out.push(Resp::Array(vec![
+            Resp::Array(vec![bulk("Unique Objects in Pool"), Resp::Int(count as i64)]),
+            Resp::Array(vec![bulk("Average References per Object"), bulk(avg)]),
+        ]));
+    }
+
+    Resp::Array(out)
+}
+
+fn handle_graph_memory(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() != 3 && args.len() != 5 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.memory' command".to_string());
+    }
+    if ascii_upper(&args[1]) != "USAGE" {
+        return Resp::Error(
+            "ERR unknown subcommand. Try GRAPH.MEMORY USAGE <key> [SAMPLES <count>]"
+                .to_string(),
+        );
+    }
+
+    let name = match utf8(&args[2], "graph name") {
+        Ok(v) => v,
+        Err(err) => return Resp::Error(err),
+    };
+    let graph = match catalog.get(name) {
+        Some(graph) => graph,
+        None => return Resp::Error("ERR Graph does not exist".to_string()),
+    };
+
+    let samples = if args.len() == 5 {
+        if ascii_upper(&args[3]) != "SAMPLES" {
+            return Resp::Error("ERR expected SAMPLES keyword".to_string());
+        }
+        match utf8(&args[4], "SAMPLES count").and_then(|v| {
+            v.parse::<usize>()
+                .map_err(|_| "ERR SAMPLES count must be a positive integer".to_string())
+        }) {
+            Ok(0) => {
+                return Resp::Error("ERR SAMPLES count must be a positive integer".to_string())
+            }
+            Ok(v) => v,
+            Err(err) => return Resp::Error(err),
+        }
+    } else {
+        100
+    };
+
+    const MB: usize = 1 << 20;
+    let report = graph.memory_usage_report(samples);
+    let label_matrices = (report.label_matrices_sz / MB) as i64;
+    let relation_matrices = (report.relation_matrices_sz / MB) as i64;
+    let node_block = (report.node_block_storage_sz / MB) as i64;
+    let unlabeled = (report.unlabeled_node_attr_sz / MB) as i64;
+    let edge_block = (report.edge_block_storage_sz / MB) as i64;
+    let indices = (report.indices_sz / MB) as i64;
+
+    let mut node_attrs = Vec::new();
+    let mut node_attr_sum = 0i64;
+    for (name, bytes) in report.node_attr_by_label {
+        let mb = (bytes / MB) as i64;
+        node_attr_sum += mb;
+        node_attrs.push(bulk(name.as_str()));
+        node_attrs.push(Resp::Int(mb));
+    }
+
+    let mut edge_attrs = Vec::new();
+    let mut edge_attr_sum = 0i64;
+    for (name, bytes) in report.edge_attr_by_type {
+        let mb = (bytes / MB) as i64;
+        edge_attr_sum += mb;
+        edge_attrs.push(bulk(name.as_str()));
+        edge_attrs.push(Resp::Int(mb));
+    }
+
+    let total = label_matrices
+        + relation_matrices
+        + node_block
+        + node_attr_sum
+        + unlabeled
+        + edge_block
+        + edge_attr_sum
+        + indices;
+
+    Resp::Array(vec![
+        bulk("total_graph_sz_mb"),
+        Resp::Int(total),
+        bulk("label_matrices_sz_mb"),
+        Resp::Int(label_matrices),
+        bulk("relation_matrices_sz_mb"),
+        Resp::Int(relation_matrices),
+        bulk("amortized_node_block_sz_mb"),
+        Resp::Int(node_block),
+        bulk("amortized_node_attributes_by_label_sz_mb"),
+        Resp::Array(node_attrs),
+        bulk("amortized_unlabeled_nodes_attributes_sz_mb"),
+        Resp::Int(unlabeled),
+        bulk("amortized_edge_block_sz_mb"),
+        Resp::Int(edge_block),
+        bulk("amortized_edge_attributes_by_type_sz_mb"),
+        Resp::Array(edge_attrs),
+        bulk("indices_sz_mb"),
+        Resp::Int(indices),
+    ])
+}
 
 fn handle_graph_constraint(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
     if args.len() < 9 {
@@ -1423,6 +2079,54 @@ fn handle_graph_slowlog(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
             })
             .collect(),
     )
+}
+
+fn handle_graph_bulk(args: &[Vec<u8>], catalog: &GraphCatalog) -> Resp {
+    if args.len() < 6 {
+        return Resp::Error("ERR wrong number of arguments for 'graph.bulk' command".to_string());
+    }
+
+    let name = match utf8(&args[1], "graph name") {
+        Ok(v) => v.to_string(),
+        Err(err) => return Resp::Error(err),
+    };
+    let request = match crate::bulk::parse_request(&args[2..]) {
+        Ok(request) => request,
+        Err(err) => return Resp::Error(format!("ERR {err}")),
+    };
+
+    let existed = catalog.contains(&name);
+    if request.begin && existed {
+        return Resp::Error(format!(
+            "ERR Graph with name '{name}' cannot be created, as key '{name}' already exists."
+        ));
+    }
+    if !request.begin && !existed {
+        return Resp::Error("ERR Invalid graph operation on empty key".to_string());
+    }
+
+    let graph = if existed {
+        match catalog.get(&name) {
+            Some(graph) => graph,
+            None => return Resp::Error("ERR Invalid graph operation on empty key".to_string()),
+        }
+    } else {
+        match catalog.get_or_create(&name) {
+            Ok(graph) => graph,
+            Err(err) => return Resp::Error(format!("ERR {err}")),
+        }
+    };
+
+    match graph.bulk_insert(&request) {
+        Ok(reply) => Resp::Simple(reply),
+        Err(err) => {
+            drop(graph);
+            if request.begin {
+                let _ = catalog.delete(&name);
+            }
+            Resp::Error(if err.starts_with("ERR ") { err } else { format!("ERR {err}") })
+        }
+    }
 }
 
 fn handle_graph_query(args: &[Vec<u8>], catalog: &GraphCatalog, read_only: bool) -> Resp {
@@ -1883,6 +2587,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_storage_path_counts_as_zero() {
+        let path = std::env::temp_dir().join(format!(
+            "falkordb-missing-storage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(directory_size_bytes(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn viewer_credentials_require_distinct_admin_credentials() {
+        let no_admin = ServerConfig {
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(no_admin.validate().is_err());
+
+        let same_user = ServerConfig {
+            password: Some("admin-secret".to_string()),
+            viewer_username: "default".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(same_user.validate().is_err());
+
+        let same_secret = ServerConfig {
+            password: Some("shared-secret".to_string()),
+            viewer_password: Some("shared-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(same_secret.validate().is_err());
+
+        let valid = ServerConfig {
+            password: Some("admin-secret".to_string()),
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
     fn remote_unauthenticated_bind_is_rejected() {
         let config = ServerConfig {
             bind: "0.0.0.0:6379".parse().unwrap(),
@@ -1890,6 +2636,52 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn viewer_auth_is_read_only_and_browser_compatible() {
+        let config = ServerConfig {
+            username: "default".to_string(),
+            password: Some("admin-secret".to_string()),
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        let mut state = ConnectionState {
+            authenticated: false,
+            read_only: false,
+            protocol: RespProtocol::Resp2,
+            client_name: None,
+        };
+
+        let auth = vec![
+            b"AUTH".to_vec(),
+            b"viewer".to_vec(),
+            b"viewer-secret".to_vec(),
+        ];
+        assert!(matches!(
+            handle_auth(&auth, &config, &mut state),
+            Resp::Simple(ref value) if value == "OK"
+        ));
+        assert!(state.authenticated);
+        assert!(state.read_only);
+
+        assert!(read_only_command_allowed("GRAPH.RO_QUERY", &[]));
+        assert!(read_only_command_allowed("GRAPH.MEMORY", &[]));
+        assert!(read_only_command_allowed("MODULE", &[]));
+        assert!(!read_only_command_allowed("GRAPH.QUERY", &[]));
+        assert!(!read_only_command_allowed("GRAPH.DELETE", &[]));
+        assert!(!read_only_command_allowed("RESTORE", &[]));
+
+        let acl = vec![
+            b"ACL".to_vec(),
+            b"GETUSER".to_vec(),
+            b"viewer".to_vec(),
+        ];
+        assert!(matches!(
+            handle_acl(&acl, &config, &state),
+            Resp::Error(ref value) if value.starts_with("NOPERM")
+        ));
     }
 
     #[test]

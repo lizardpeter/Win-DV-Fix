@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FalkorDB Native Dashboard</title>
+<link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>FalkorDB Native</h1>
+    <p class="subtitle">Read-only operations dashboard</p>
+  </div>
+  <nav>
+    <a href="/openapi.json" target="_blank" rel="noreferrer">OpenAPI</a>
+    <a href="/.well-known/oauth-protected-resource" target="_blank" rel="noreferrer">OAuth metadata</a>
+  </nav>
+</header>
+
+<main>
+<section id="loginPanel" class="panel login-panel">
+  <div>
+    <h2>Connect</h2>
+    <p>Use the same read-only viewer login as FalkorDB Browser, or a read-only API token. Credentials stay only in this browser tab.</p>
+  </div>
+  <div class="login-grid">
+    <label>Viewer username
+      <input id="viewerUsername" type="text" autocomplete="username" value="viewer">
+    </label>
+    <label>Viewer password
+      <input id="viewerPassword" type="password" autocomplete="current-password" placeholder="Viewer password">
+    </label>
+  </div>
+  <div class="or-row"><span>or</span></div>
+  <div class="login-row">
+    <input id="tokenInput" type="password" autocomplete="off" placeholder="FALKORDB_API_READ_TOKEN (optional)">
+    <button id="connectButton">Connect</button>
+  </div>
+  <p id="loginError" class="error" hidden></p>
+</section>
+
+<section id="dashboard" hidden>
+  <div class="toolbar">
+    <div>
+      <span id="connectionDot" class="dot"></span>
+      <span id="connectionText">Connected</span>
+      <span id="lastUpdated" class="muted"></span>
+    </div>
+    <div class="toolbar-actions">
+      <label>Refresh
+        <select id="refreshInterval">
+          <option value="0">Manual</option>
+          <option value="5000">5 sec</option>
+          <option value="15000" selected>15 sec</option>
+          <option value="60000">60 sec</option>
+        </select>
+      </label>
+      <button id="refreshButton" class="secondary">Refresh now</button>
+      <button id="disconnectButton" class="secondary">Disconnect</button>
+    </div>
+  </div>
+
+  <section class="cards" id="summaryCards"></section>
+  <section id="storageWarning" class="warning" hidden></section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <h2>Graphs</h2>
+        <p class="muted">Live cardinality with exact persistent storage and sampled memory.</p>
+      </div>
+      <input id="graphFilter" class="filter" placeholder="Filter graphs">
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-sort="graph">Graph</th>
+            <th data-sort="nodes">Nodes</th>
+            <th data-sort="relationships">Relationships</th>
+            <th data-sort="graph_version">Graph ver.</th>
+            <th data-sort="schema_version">Schema ver.</th>
+            <th data-sort="labels">Labels</th>
+            <th data-sort="relationship_types">Rel types</th>
+            <th data-sort="property_keys">Properties</th>
+            <th data-sort="index_definitions">Indexes</th>
+            <th data-sort="constraints">Constraints</th>
+            <th data-sort="persistent_bytes">Persistent</th>
+            <th data-sort="wal_bytes">WAL</th>
+            <th data-sort="checkpoint_bytes">Checkpoints</th>
+            <th data-sort="estimated_memory_bytes">Memory est.</th>
+          </tr>
+        </thead>
+        <tbody id="graphsBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid-two">
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>Running queries</h2>
+          <p class="muted">Queries currently consuming worker capacity.</p>
+        </div>
+        <span id="runningCount" class="badge">0</span>
+      </div>
+      <div id="runningQueries" class="query-list empty">No running queries</div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>Waiting queries</h2>
+          <p class="muted">Queued work waiting for execution capacity.</p>
+        </div>
+        <span id="waitingCount" class="badge">0</span>
+      </div>
+      <div id="waitingQueries" class="query-list empty">No waiting queries</div>
+    </section>
+  </section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <h2>Recent slow queries</h2>
+        <p class="muted">Bounded FalkorDB slowlog entries (10 ms and above), aggregated across graphs.</p>
+      </div>
+      <span id="slowCount" class="badge">0</span>
+    </div>
+    <div id="slowQueries" class="query-list empty">No slow queries recorded</div>
+  </section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <h2>Storage accounting</h2>
+        <p class="muted">Exact bytes on disk, including staging and unattributed residue.</p>
+      </div>
+    </div>
+    <div id="storageDetails" class="detail-grid"></div>
+  </section>
+</section>
+</main>
+
+<script src="/dashboard/app.js" defer></script>
+</body>
+</html>

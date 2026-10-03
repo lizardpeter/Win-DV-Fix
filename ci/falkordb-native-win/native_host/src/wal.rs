@@ -116,6 +116,16 @@ impl Wal {
     }
 
 
+    /// Append a valid no-op effects frame used as a durable bulk/checkpoint sequence marker.
+    pub fn append_checkpoint_marker(&self, key: &[u8]) -> Result<u64, String> {
+        self.state.lock().last_error = None;
+        EffectsBuffer::new().replicate(self, key);
+        if let Some(err) = self.state.lock().last_error.take() {
+            return Err(err);
+        }
+        Ok(self.last_sequence())
+    }
+
     pub fn records(&self) -> Result<Vec<WalRecord>, String> {
         let state = self.state.lock();
         read_records_and_repair_tail(&self.path, state.floor_sequence)

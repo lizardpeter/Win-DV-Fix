@@ -27,11 +27,12 @@ Copy-Item -Force (Join-Path $Root "scripts\migrate_current_falkordb.py") (Join-P
 Copy-Item -Force (Join-Path $Root "scripts\falkordb_bundle.py") (Join-Path $Stage "falkordb_bundle.py")
 Copy-Item -Force (Join-Path $Root "scripts\import_falkordb_rdb.py") (Join-Path $Stage "import_falkordb_rdb.py")
 Copy-Item -Force (Join-Path $Root "requirements-migration.txt") (Join-Path $Stage "requirements-migration.txt")
-Copy-Item -Force (Join-Path $Root "DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
+Copy-Item -Force (Join-Path $Root "docs\DEPLOYMENT.md") (Join-Path $Stage "DEPLOYMENT.md")
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Stage "README.md")
-Copy-Item -Force (Join-Path $Root "PORT_STATUS.md") (Join-Path $Stage "PORT_STATUS.md")
+Copy-Item -Force (Join-Path $Root "CONSOLIDATION_STATUS.md") (Join-Path $Stage "CONSOLIDATION_STATUS.md")
 
-# The official OpenAI tunnel runtime is embedded directly inside server.exe.
+# Verify the embedded official OpenAI Secure MCP Tunnel runtime made it into the
+# single-file Windows server and expose its bundled notice/license in the package.
 $EmbeddedTunnelVersion = & (Join-Path $Stage "server.exe") --embedded-tunnel-runtime-version 2>&1
 if ($LASTEXITCODE -ne 0) {
     throw "Embedded OpenAI tunnel runtime version check failed with exit code $LASTEXITCODE"
@@ -198,7 +199,6 @@ Set-Location $Root
 
 $RequiredFiles = @(
     "server.exe",
-    "EMBEDDED_TUNNEL_RUNTIME.txt",
     "portable-env.ps1",
     "start-local.ps1",
     "run-tool.ps1",

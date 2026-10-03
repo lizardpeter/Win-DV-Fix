@@ -2200,7 +2200,7 @@ mod tests {
             ("state", "state-123"),
             ("code_challenge", "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"),
             ("code_challenge_method", "S256"),
-            ("resource", "https://db.example.test/mcp"),
+            ("resource", "http://db.example.test/mcp"),
             ("scope", ALL_SCOPES),
         ]
         .into_iter()
@@ -2245,7 +2245,7 @@ mod tests {
             ("state", "state-123"),
             ("code_challenge", "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"),
             ("code_challenge_method", "S256"),
-            ("resource", "https://db.example.test/mcp"),
+            ("resource", "http://db.example.test/mcp"),
             ("scope", ALL_SCOPES),
             ("owner_secret", "PAIR-123"),
         ]

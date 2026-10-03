@@ -75,6 +75,10 @@ mod tests {
         let style = String::from_utf8_lossy(include_bytes!("../assets/browser.css"));
 
         for asset in [&page, &script, &style] {
+            // The SVG DOM namespace is an identifier, not a network dependency.
+            // Remove that one standards-defined URI before checking for remote
+            // runtime resources.
+            let asset = asset.replace("http://www.w3.org/2000/svg", "");
             assert!(!asset.contains("http://"));
             assert!(!asset.contains("https://"));
             assert!(!asset.contains("//cdn."));

@@ -2687,6 +2687,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resp_parser_rejects_oversized_array_before_allocation() {
+        let raw = format!("*{}\r\n", MAX_RESP_ARRAY_ITEMS + 1);
+        let mut reader = BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_command(&mut reader) {
+            Ok(_) => panic!("oversized RESP array must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("array length"));
+        assert!(err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn resp_parser_rejects_oversized_bulk_before_allocation() {
+        let raw = format!("*1\r\n${}\r\n", MAX_RESP_BULK_BYTES + 1);
+        let mut reader = BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_command(&mut reader) {
+            Ok(_) => panic!("oversized RESP bulk must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bulk length"));
+        assert!(err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn repeated_bad_auth_is_counted_and_success_resets_counter() {
+        let config = ServerConfig {
+            password: Some("admin-secret".to_string()),
+            ..ServerConfig::default()
+        };
+        let mut state = ConnectionState {
+            authenticated: false,
+            read_only: false,
+            protocol: RespProtocol::Resp2,
+            client_name: None,
+            auth_failures: 0,
+        };
+
+        for expected in 1..=3 {
+            let bad = vec![b"AUTH".to_vec(), b"wrong-secret".to_vec()];
+            assert!(matches!(handle_auth(&bad, &config, &mut state), Resp::Error(_)));
+            assert_eq!(state.auth_failures, expected);
+        }
+
+        let good = vec![b"AUTH".to_vec(), b"admin-secret".to_vec()];
+        assert!(matches!(handle_auth(&good, &config, &mut state), Resp::Simple(_)));
+        assert_eq!(state.auth_failures, 0);
+        assert!(state.authenticated);
+    }
+
+    #[test]
     fn graph_name_filename_roundtrip() {
         for name in ["main", "T6 / Nuketown", "Δ-graph"] {
             assert_eq!(decode_graph_name(&encode_graph_name(name)).unwrap(), name);

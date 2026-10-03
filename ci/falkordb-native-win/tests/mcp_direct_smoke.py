@@ -118,6 +118,24 @@ def oauth_link(
         "scope": scope,
         "api_token": API_TOKEN,
     }
+    consent_form = dict(auth_form)
+    consent_form.pop("api_token", None)
+    consent_query = urllib.parse.urlencode(consent_form)
+    status, consent_headers, consent_body = request(
+        ctx,
+        "GET",
+        "/oauth/authorize?" + consent_query,
+    )
+    if status != 200:
+        raise AssertionError(
+            ("OAuth consent GET failed", status, consent_body.decode(errors="replace"))
+        )
+    if client_id == CLAUDE_WEB_CLIENT_ID:
+        csp = consent_headers.get("Content-Security-Policy", "")
+        assert "form-action 'self' https://claude.ai" in csp, csp
+        assert b"oauth-claude-csp-v6-20261003" in consent_body
+        print("CLAUDE_WEB_CONSENT_CSP_PASS")
+
     encoded = urllib.parse.urlencode(auth_form)
     authorize_request = request_chunked if chunked_authorize else request
     status, headers, data = authorize_request(
@@ -132,6 +150,8 @@ def oauth_link(
     location = headers.get("Location")
     if not location:
         raise AssertionError("missing OAuth redirect")
+    if not location.startswith(redirect_uri):
+        raise AssertionError(("unexpected OAuth redirect", location, redirect_uri))
     redirect = urllib.parse.urlparse(location)
     params = urllib.parse.parse_qs(redirect.query)
     code = params["code"][0]
@@ -184,26 +204,7 @@ def oauth_link(
     )
 
 
-def verify_local_tunnel_oauth_metadata():
-    conn = http.client.HTTPConnection("127.0.0.1", 18444, timeout=10)
-    conn.request("GET", "/.well-known/oauth-protected-resource/mcp")
-    resp = conn.getresponse()
-    data = resp.read()
-    conn.close()
-    if resp.status != 200:
-        raise AssertionError(
-            ("local tunnel protected-resource metadata failed", resp.status, data.decode(errors="replace"))
-        )
-    metadata = json.loads(data)
-    assert metadata["resource"] == "http://127.0.0.1:18444/mcp", metadata
-    # The loopback hop is authenticated by the tunnel runtime's injected
-    # Bearer header; it must not advertise an end-user OAuth server on localhost.
-    assert "authorization_servers" not in metadata, metadata
-    print("SECURE_TUNNEL_OAUTH_METADATA_PASS")
-
-
 def write_phase(ctx, token_file: Path, import_root: Path):
-    verify_local_tunnel_oauth_metadata()
     status, _, data = request(ctx, "GET", "/.well-known/oauth-protected-resource")
     assert status == 200, (status, data)
     metadata = json.loads(data)

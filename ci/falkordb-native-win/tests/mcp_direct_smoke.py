@@ -143,7 +143,9 @@ def oauth_link(ctx, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, state="nativ
     if status != 200:
         raise AssertionError((status, data.decode(errors="replace")))
     refreshed = json.loads(data)
-    return refreshed["access_token"]
+    return refreshed["access_token"], refreshed.get(
+        "refresh_token", token_response["refresh_token"]
+    )
 
 
 def write_phase(ctx, token_file: Path, import_root: Path):
@@ -191,7 +193,7 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert unauth["isError"] is True
     assert "mcp/www_authenticate" in unauth["_meta"]
 
-    claude_web_token = oauth_link(
+    claude_web_token, claude_web_refresh = oauth_link(
         ctx,
         client_id=CLAUDE_WEB_CLIENT_ID,
         redirect_uri=CLAUDE_WEB_REDIRECT_URI,
@@ -207,7 +209,7 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert claude_web_read["isError"] is False, claude_web_read
     print("CLAUDE_WEB_OAUTH_PASS")
 
-    claude_token = oauth_link(
+    claude_token, _ = oauth_link(
         ctx,
         client_id=CLAUDE_CODE_CLIENT_ID,
         redirect_uri=CLAUDE_CODE_REDIRECT_URI,
@@ -223,7 +225,7 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert claude_read["isError"] is False, claude_read
     print("CLAUDE_OAUTH_PASS")
 
-    token = oauth_link(ctx)
+    token, _ = oauth_link(ctx)
 
     created = rpc(
         ctx,
@@ -395,12 +397,42 @@ def write_phase(ctx, token_file: Path, import_root: Path):
     assert filtered_stats_body["total_storage_bytes"] == all_stats_body["total_storage_bytes"]
     print("MCP_DATABASE_STATS_PASS")
 
-    token_file.write_text(token, encoding="utf-8")
+    token_file.write_text(
+        json.dumps({"claude_web_refresh_token": claude_web_refresh}),
+        encoding="utf-8",
+    )
     print("MCP_DIRECT_OAUTH_WRITE_PASS")
 
 
 def read_phase(ctx, token_file: Path):
-    token = token_file.read_text(encoding="utf-8").strip()
+    persisted = json.loads(token_file.read_text(encoding="utf-8"))
+    refresh_token = persisted["claude_web_refresh_token"]
+    resource = f"https://{HOST}:{PORT}/mcp"
+    scope = "graph:read graph:write graph:admin"
+    refresh_form = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_WEB_CLIENT_ID,
+            "resource": resource,
+            "scope": scope,
+        }
+    )
+    status, _, data = request(
+        ctx,
+        "POST",
+        "/oauth/token",
+        body=refresh_form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if status != 200:
+        raise AssertionError(
+            ("persistent Claude Web refresh failed after server restart", status, data.decode(errors="replace"))
+        )
+    refreshed = json.loads(data)
+    token = refreshed["access_token"]
+    assert refreshed["refresh_token"] == refresh_token
+    print("CLAUDE_WEB_OAUTH_RESTART_REFRESH_PASS")
     read = rpc(
         ctx,
         "tools/call",

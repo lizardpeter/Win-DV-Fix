@@ -1,0 +1,11 @@
+# Build outputs (cargo target dirs, logs, packages)
+/build/
+/target/
+/native_host/target/
+/engine/graph/target/
+
+# GraphBLAS's CMake configure step writes its version into Doc/ in the source
+# tree; nothing in the build reads it.
+/engine/GraphBLAS/Doc/
+# Only native_host/Cargo.lock pins the build; the engine is a path dependency.
+/engine/graph/Cargo.lock

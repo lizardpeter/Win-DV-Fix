@@ -1,0 +1,250 @@
+import os
+import pathlib
+
+from falkordb import FalkorDB
+from redis import Redis
+from redis.exceptions import ResponseError
+
+HOST = "localhost"
+PORT = 6391
+PASSWORD = "native-ci-secret"
+GRAPH = "official-parity"
+COPY = "official-parity-copy"
+
+TLS_DIR = pathlib.Path(os.environ["FALKORDB_TEST_TLS_DIR"]).resolve()
+
+
+def connect():
+    return FalkorDB(
+        host=HOST,
+        port=PORT,
+        password=PASSWORD,
+        socket_connect_timeout=5,
+        socket_timeout=20,
+        protocol=2,
+        ssl=True,
+        ssl_ca_certs=str(TLS_DIR / "ca.pem"),
+        ssl_cert_reqs="required",
+        ssl_check_hostname=True,
+        ssl_certfile=str(TLS_DIR / "client-cert.pem"),
+        ssl_keyfile=str(TLS_DIR / "client-key.pem"),
+    )
+
+
+def connect_raw():
+    return Redis(
+        host=HOST,
+        port=PORT,
+        password=PASSWORD,
+        socket_connect_timeout=5,
+        socket_timeout=20,
+        protocol=2,
+        ssl=True,
+        ssl_ca_certs=str(TLS_DIR / "ca.pem"),
+        ssl_cert_reqs="required",
+        ssl_check_hostname=True,
+        ssl_certfile=str(TLS_DIR / "client-cert.pem"),
+        ssl_keyfile=str(TLS_DIR / "client-key.pem"),
+        decode_responses=True,
+    )
+
+
+def main():
+    db = connect()
+    raw = connect_raw()
+    graph = db.select_graph(GRAPH)
+
+    # Clean up from a retried CI phase without flushing graphs used by other
+    # network/restart tests.
+    for name in (GRAPH, COPY):
+        try:
+            db.select_graph(name).delete()
+        except ResponseError:
+            pass
+
+    graph = db.select_graph(GRAPH)
+
+    # Parameter transport and the normal official-client query envelope.
+    result = graph.query("RETURN $x AS x, $s AS s", params={"x": 7, "s": "parity"})
+    assert result.result_set == [[7, "parity"]], result.result_set
+
+    graph.query(
+        "CREATE "
+        "(a:Account {id:1,name:'alpha',required:'yes'}),"
+        "(b:Account {id:2,name:'beta',required:'yes'}),"
+        "(a)-[:LINK {id:10,required:'yes'}]->(b)"
+    )
+
+    # COUNT(expr) must ignore missing/null properties, including when every
+    # value in a vectorized batch is null and when the query is grouped. This
+    # guards the native runtime bug where an empty property vector was confused
+    # with the no-argument shape used by count(*).
+    graph.query(
+        "CREATE "
+        "(:CountProbe {g:'a',present:1}),"
+        "(:CountProbe {g:'a'}),"
+        "(:CountProbe {g:'b'})"
+    )
+    result = graph.query(
+        "MATCH (n:CountProbe) RETURN n.g, count(n.present) ORDER BY n.g"
+    )
+    assert result.result_set == [["a", 1], ["b", 0]], result.result_set
+    result = graph.query("MATCH (n:CountProbe) RETURN count(n.missing)")
+    assert result.result_set == [[0]], result.result_set
+
+    # Explain/profile must produce plans the unmodified client can parse.
+    explain = graph.explain("MATCH (n:Account) WHERE n.id=1 RETURN n.name")
+    assert explain.structured_plan is not None
+    profile = graph.profile("MATCH (n:Account) RETURN n.name")
+    assert profile.structured_plan is not None
+    assert any(
+        op.profile_stats is not None
+        for ops in profile.operations.values()
+        for op in ops
+    ), profile.plan
+
+    # Slowlog API shape/reset parity. A fast query may legitimately not appear.
+    assert isinstance(graph.slowlog(), list)
+    graph.slowlog_reset()
+    assert graph.slowlog() == []
+
+    # Native range/fulltext/vector paths plus index introspection.
+    graph.create_node_range_index("Account", "id")
+    graph.create_node_fulltext_index("Account", "name")
+    graph.create_node_vector_index("Account", "embedding", dim=2)
+    graph.query(
+        "MATCH (a:Account {id:1}),(b:Account {id:2}) "
+        "SET a.embedding=vecf32([0.0,0.0]), b.embedding=vecf32([10.0,10.0])"
+    )
+    indexes = graph.list_indices().result_set
+
+    # Current FalkorDB consolidates all index types for the same label/entity
+    # into one db.indexes() row. A property can itself have multiple index
+    # types, so row count is not the number of CREATE INDEX statements.
+    account_rows = [
+        row for row in indexes
+        if row[0] == "Account" and row[6] == "NODE"
+    ]
+    assert len(account_rows) == 1, indexes
+    account_index = account_rows[0]
+    assert set(account_index[1]) == {"id", "name", "embedding"}, account_index
+
+    index_types = account_index[2]
+    assert "RANGE" in index_types["id"], account_index
+    assert "FULLTEXT" in index_types["name"], account_index
+    assert "VECTOR" in index_types["embedding"], account_index
+
+    result = graph.query("MATCH (n:Account) WHERE n.id=2 RETURN n.name")
+    assert result.result_set == [["beta"]], result.result_set
+    result = graph.query(
+        "CALL db.idx.fulltext.queryNodes('Account','alpha') "
+        "YIELD node RETURN node.id"
+    )
+    assert result.result_set == [[1]], result.result_set
+    result = graph.query(
+        "CALL db.idx.fulltext.queryNodes('Account','alp*') "
+        "YIELD node RETURN node.id"
+    )
+    assert result.result_set == [[1]], result.result_set
+    result = graph.query(
+        "CALL db.idx.vector.queryNodes('Account','embedding',1,vecf32([0.1,0.1])) "
+        "YIELD node RETURN node.id"
+    )
+    assert result.result_set == [[1]], result.result_set
+
+    # Official-client constraint methods must reach the graph crate's real
+    # enforcement logic and survive through normal Cypher mutations.
+    graph.create_node_unique_constraint("Account", "id")
+    constraints = graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Account"
+        and "id" in c["properties"]
+        for c in constraints
+    ), constraints
+
+    try:
+        graph.query("CREATE (:Account {id:1,name:'duplicate',required:'yes'})")
+        raise AssertionError("UNIQUE constraint accepted duplicate Account.id")
+    except ResponseError:
+        pass
+
+    graph.create_node_mandatory_constraint("Account", "required")
+    try:
+        graph.query("CREATE (:Account {id:3,name:'missing-required'})")
+        raise AssertionError("MANDATORY constraint accepted missing property")
+    except ResponseError:
+        pass
+
+    # GRAPH.COPY must include data, index DDL, and constraints because it is
+    # reconstructed from the committed effects stream.
+    clone = graph.copy(COPY)
+    result = clone.query("MATCH (n:Account) WHERE n.id=1 RETURN n.name")
+    assert result.result_set == [["alpha"]], result.result_set
+    result = clone.query(
+        "CALL db.idx.fulltext.queryNodes('Account','beta') "
+        "YIELD node RETURN node.id"
+    )
+    assert result.result_set == [[2]], result.result_set
+    copied_constraints = clone.list_constraints()
+    assert any(c["type"] == "UNIQUE" for c in copied_constraints), copied_constraints
+    try:
+        clone.query("CREATE (:Account {id:1,name:'copy-duplicate',required:'yes'})")
+        raise AssertionError("copied UNIQUE constraint was not enforced")
+    except ResponseError:
+        pass
+
+    assert GRAPH in db.list_graphs()
+    assert COPY in db.list_graphs()
+
+    # Constraint drops must work through the official client's command path.
+    graph.drop_node_mandatory_constraint("Account", "required")
+    graph.drop_node_unique_constraint("Account", "id")
+    remaining = graph.list_constraints()
+    assert not any(c["type"] in ("UNIQUE", "MANDATORY") for c in remaining), remaining
+
+    clone.delete()
+    assert COPY not in db.list_graphs()
+
+    # GRAPH.CONFIG API shape should be accepted by the official client even
+    # when the setting is not relevant to the standalone deployment.
+    assert db.config_get("RESULTSET_SIZE") is not None
+
+    # Operational command parity: GRAPH.MEMORY returns FalkorDB's flat
+    # nine-pair report and GRAPH.INFO exposes scheduler/object-pool state.
+    memory = raw.execute_command("GRAPH.MEMORY", "USAGE", GRAPH, "SAMPLES", 10)
+    assert len(memory) == 18, memory
+    memory_map = dict(zip(memory[0::2], memory[1::2]))
+    assert set(memory_map) == {
+        "total_graph_sz_mb",
+        "label_matrices_sz_mb",
+        "relation_matrices_sz_mb",
+        "amortized_node_block_sz_mb",
+        "amortized_node_attributes_by_label_sz_mb",
+        "amortized_unlabeled_nodes_attributes_sz_mb",
+        "amortized_edge_block_sz_mb",
+        "amortized_edge_attributes_by_type_sz_mb",
+        "indices_sz_mb",
+    }, memory_map
+    assert isinstance(memory_map["total_graph_sz_mb"], int), memory_map
+
+    info = raw.execute_command("GRAPH.INFO")
+    assert "# Running queries" in info, info
+    assert "# Waiting queries" in info, info
+    assert "Object Pool" in info, info
+
+    object_pool = raw.execute_command("GRAPH.INFO", "ObjectPool")
+    assert object_pool[0] == "Object Pool", object_pool
+    assert len(object_pool[1]) == 2, object_pool
+
+    no_section = raw.execute_command("GRAPH.INFO", "not-a-section")
+    assert no_section == "no section found", no_section
+
+    raw.close()
+    db.close()
+    print("OFFICIAL_FALKORDB_MEMORY_INFO_PASS")
+    print("OFFICIAL_FALKORDB_PARITY_GATE_PASS")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,104 @@
+name: FalkorDB Windows Package
+
+on:
+  push:
+    branches:
+      - main
+      # Build branch in the public lizardpeter/win-dv-fix repo, where Actions
+      # minutes are free: pushing this tree there builds and tests server.exe.
+      - windows-build
+    paths:
+      - 'native_host/**'
+      - 'engine/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - 'requirements-migration.txt'
+      - 'docs/DEPLOYMENT.md'
+      - '.github/workflows/falkordb-native-win-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: falkordb-native-win-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-package:
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust MSVC
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore Rust build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/cargo-target
+          key: falkordb-native-rust-v3-${{ runner.os }}-${{ hashFiles('native_host/Cargo.toml', 'native_host/Cargo.lock', 'engine/graph/Cargo.toml', 'engine/graph/build.rs') }}
+
+      - name: Audit resolved Rust dependencies
+        shell: pwsh
+        run: |
+          cargo metadata --manifest-path '.\native_host\Cargo.toml' --locked --format-version 1 > $null
+          if ($LASTEXITCODE -ne 0) { throw "native_host/Cargo.lock is missing or out of date" }
+          cargo install cargo-audit --version 0.22.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-audit installation failed" }
+          Push-Location '.\native_host'
+          try {
+            cargo audit
+            if ($LASTEXITCODE -ne 0) { throw "RustSec dependency audit failed" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build, test, and package tunnel-enabled server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath('.\build\cargo-target')
+
+          cargo test --manifest-path '.\native_host\Cargo.toml' --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw "Native host unit tests failed" }
+
+          cargo build --manifest-path '.\native_host\Cargo.toml' --bin server --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Tunnel-enabled server build failed" }
+
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\scripts\package_windows.ps1'
+
+          # package_windows.ps1 changes directory; resolve from the workspace.
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'build\package\falkordb-native-windows-x64.zip'
+          $toolsZip = Join-Path $env:GITHUB_WORKSPACE 'build\package\falkordb-native-windows-x64-tools.zip'
+          if (-not (Test-Path $zip)) { throw "Deployable ZIP was not produced" }
+          if (-not (Test-Path $toolsZip)) { throw "Tools ZIP was not produced" }
+          Get-FileHash -Algorithm SHA256 $zip | Format-List
+          Get-FileHash -Algorithm SHA256 $toolsZip | Format-List
+
+      - name: Upload deployable Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: falkordb-native-windows-x64
+          path: build/package/falkordb-native-windows-x64/server.exe
+          if-no-files-found: error
+
+      - name: Upload optional Windows migration tools
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: falkordb-native-windows-x64-tools
+          path: build/package/falkordb-native-windows-x64-tools.zip
+          if-no-files-found: error

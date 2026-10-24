@@ -1,0 +1,491 @@
+import argparse
+import os
+import pathlib
+import sys
+
+from falkordb import FalkorDB
+from falkordb.node import Node
+from falkordb.edge import Edge
+from redis import Redis
+from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
+
+HOST = os.environ.get("FALKORDB_TEST_HOST", "localhost")
+PORT = int(os.environ.get("FALKORDB_TEST_PORT", "6391"))
+PASSWORD = os.environ.get("FALKORDB_TEST_PASSWORD", "native-ci-secret")
+VIEWER_USERNAME = os.environ.get("FALKORDB_TEST_VIEWER_USERNAME", "viewer")
+VIEWER_PASSWORD = os.environ.get("FALKORDB_TEST_VIEWER_PASSWORD", "native-viewer-secret")
+GRAPH = "network-official-client"
+REDIS_RESTORED_GRAPH = "network-redis-dump-restored"
+
+TLS_DIR = pathlib.Path(
+    os.environ.get("FALKORDB_TEST_TLS_DIR", "")
+).resolve() if os.environ.get("FALKORDB_TEST_TLS_DIR") else None
+
+
+def tls_kwargs(with_client_cert=True):
+    if TLS_DIR is None:
+        return {}
+    kwargs = {
+        "ssl": True,
+        "ssl_ca_certs": str(TLS_DIR / "ca.pem"),
+        "ssl_cert_reqs": "required",
+        "ssl_check_hostname": True,
+    }
+    if with_client_cert:
+        kwargs["ssl_certfile"] = str(TLS_DIR / "client-cert.pem")
+        kwargs["ssl_keyfile"] = str(TLS_DIR / "client-key.pem")
+    return kwargs
+
+
+def connect(password=PASSWORD, with_client_cert=True, username=None):
+    kwargs = {
+        "host": HOST,
+        "port": PORT,
+        "password": password,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 10,
+        "protocol": 2,
+        **tls_kwargs(with_client_cert=with_client_cert),
+    }
+    if username is not None:
+        kwargs["username"] = username
+    return FalkorDB(**kwargs)
+
+
+def redis_connect(password=PASSWORD, with_client_cert=True, username=None):
+    kwargs = {
+        "host": HOST,
+        "port": PORT,
+        "password": password,
+        "decode_responses": False,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 10,
+        "protocol": 2,
+        **tls_kwargs(with_client_cert=with_client_cert),
+    }
+    if username is not None:
+        kwargs["username"] = username
+    return Redis(**kwargs)
+
+
+def phase_write():
+    # mTLS must actually gate the socket before RESP authentication.
+    if TLS_DIR is not None:
+        try:
+            no_cert = connect(with_client_cert=False)
+            no_cert.list_graphs()
+            raise AssertionError("mTLS connection without a client certificate unexpectedly succeeded")
+        except (ConnectionError, OSError):
+            pass
+
+    # Authentication must actually gate commands.
+    try:
+        bad = connect("definitely-wrong")
+        bad.list_graphs()
+        raise AssertionError("wrong password unexpectedly authenticated")
+    except (AuthenticationError, ResponseError):
+        pass
+
+    db = connect()
+    db.flushdb()
+    graph = db.select_graph(GRAPH)
+
+    result = graph.query("RETURN 1 AS one, 'wire-ok' AS text")
+    assert result.result_set == [[1, "wire-ok"]], result.result_set
+
+    viewer = connect(
+        password=VIEWER_PASSWORD,
+        username=VIEWER_USERNAME,
+    )
+    viewer_graph = viewer.select_graph(GRAPH)
+    viewer_read = viewer_graph.ro_query("RETURN 7 AS seven")
+    assert viewer_read.result_set == [[7]], viewer_read.result_set
+
+    viewer_redis = redis_connect(
+        password=VIEWER_PASSWORD,
+        username=VIEWER_USERNAME,
+    )
+    try:
+        viewer_redis.execute_command("ACL", "GETUSER", VIEWER_USERNAME)
+        raise AssertionError("viewer unexpectedly had ACL GETUSER permission")
+    except ResponseError as exc:
+        message = str(exc).lower()
+        assert "no permissions" in message or message.startswith("noperm"), exc
+
+    try:
+        viewer_redis.execute_command("GRAPH.QUERY")
+        raise AssertionError("viewer unexpectedly had GRAPH.QUERY permission")
+    except ResponseError as exc:
+        assert "permissions" in str(exc).lower(), exc
+
+    modules = viewer_redis.execute_command("MODULE", "LIST")
+    assert "graph" in str(modules).lower(), modules
+    assert viewer_redis.ttl(GRAPH) == -1
+
+    try:
+        viewer_graph.query("CREATE (:ViewerMustNotWrite)")
+        raise AssertionError("viewer unexpectedly executed a write query")
+    except ResponseError as exc:
+        assert "noperm" in str(exc).lower() or "permissions" in str(exc).lower(), exc
+
+    assert viewer_graph.ro_query(
+        "MATCH (n:ViewerMustNotWrite) RETURN count(n)"
+    ).result_set == [[0]]
+    print("BROWSER_VIEWER_READ_ONLY_PASS")
+
+    # Official FalkorDB client admin/config surface.
+    original_resultset_size = db.config_get("RESULTSET_SIZE")
+    assert int(original_resultset_size) == -1, original_resultset_size
+    db.config_set("RESULTSET_SIZE", 1)
+    limited = graph.query("UNWIND [1,2,3] AS x RETURN x")
+    assert limited.result_set == [[1]], limited.result_set
+    db.config_set("RESULTSET_SIZE", -1)
+
+    db.config_set("TIMEOUT_MAX", 1)
+    try:
+        graph.query("RETURN 1", timeout=2)
+        raise AssertionError("per-query timeout above TIMEOUT_MAX unexpectedly succeeded")
+    except ResponseError as exc:
+        assert "TIMEOUT_MAX" in str(exc), exc
+    db.config_set("TIMEOUT_MAX", 0)
+
+    graph.create_node_range_index("Person", "age")
+    graph.create_node_fulltext_index("Person", "name")
+    graph.create_node_vector_index("Person", "embedding", dim=2)
+    graph.create_edge_range_index("KNOWS", "since")
+    graph.create_edge_fulltext_index("KNOWS", "note")
+    graph.create_edge_vector_index("KNOWS", "embedding", dim=2)
+
+    graph.query(
+        "CREATE (a:Person {name:'Alice',age:40,embedding:vecf32([0.0,0.0])}), "
+        "(b:Person {name:'Bob',age:30,embedding:vecf32([10.0,10.0])}), "
+        "(a)-[:KNOWS {since:2026,note:'long term colleague',"
+        "embedding:vecf32([1.0,1.0])}]->(b)"
+    )
+
+    # Mirror upstream FalkorDB's persistence corpus so the migration path proves
+    # every currently persisted SIValue family rather than only scalars.
+    graph.query(
+        "CREATE (:Types {"
+        "strval:'str', numval:5.5, boolval:true, array:[1,2,3], "
+        "pointval:point({latitude:5.5, longitude:6}), "
+        "vector:vecf32([1,0,3]), "
+        "arr_of_vecs:[vecf32([1,8,3]),vecf32([1,-1,4]),vecf32([2,2,3])], "
+        "date:date({year:1984,month:10,day:21}), "
+        "time:localtime({hour:10,minute:30,second:10}), "
+        "datetime:localdatetime({year:1984,month:10,day:21,hour:5,minute:30,second:10}), "
+        "duration:duration({years:1,months:1,days:1,hours:1,minutes:1,seconds:1})"
+        "})"
+    )
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+
+    # Parallel relationships use FalkorDB's multi-edge tensor serialization,
+    # which is distinct from the ordinary single-edge relationship matrix.
+    graph.query(
+        "MATCH (a:Person {name:'Alice'}),(b:Person {name:'Bob'}) "
+        "CREATE (a)-[:PARALLEL {slot:1}]->(b),"
+        "(a)-[:PARALLEL {slot:2}]->(b)"
+    )
+
+    # Explain/profile are parsed into the official client's ExecutionPlan type.
+    explain = graph.explain("MATCH (n:Person) RETURN n.name")
+    assert explain.plan and len(explain.plan) > 0, explain.plan
+    profile = graph.profile("MATCH (n:Person) RETURN n.name")
+    assert profile.plan and len(profile.plan) > 0, profile.plan
+
+    # Real per-graph slowlog plus reset. Upstream FalkorDB intentionally
+    # ignores queries faster than 10 ms, so use progressively larger work
+    # rather than relying on CI runner timing for a tiny MATCH.
+    graph.slowlog_reset()
+    slow = []
+    for upper in (50_000, 200_000, 800_000):
+        graph.query(f"UNWIND range(1,{upper}) AS x RETURN sum(x)")
+        slow = graph.slowlog()
+        if slow:
+            break
+    assert len(slow) > 0, "no query crossed FalkorDB's 10 ms slowlog threshold"
+    graph.slowlog_reset()
+    assert graph.slowlog() == [], graph.slowlog()
+
+    # Constraint creation/enforcement through official high-level helpers.
+    assert graph.create_node_unique_constraint("Person", "name") == "OK"
+    constraints = graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in constraints
+    ), constraints
+    try:
+        graph.query("CREATE (:Person {name:'Alice',age:99})")
+        raise AssertionError("unique constraint did not reject duplicate Person.name")
+    except ResponseError:
+        pass
+
+    # GRAPH.COPY must produce an independently queryable durable graph.
+    clone = graph.copy("network-official-client-copy")
+    clone_result = clone.query("MATCH (n:Person) RETURN count(n)")
+    assert clone_result.result_set == [[2]], clone_result.result_set
+
+    # This exercises compact Node/Edge encoding plus schema-id refresh through
+    # DB.LABELS, DB.PROPERTYKEYS and DB.RELATIONSHIPTYPES.
+    result = graph.query(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a,r,b"
+    )
+    assert len(result.result_set) == 1
+    a, edge, b = result.result_set[0]
+    assert isinstance(a, Node), type(a)
+    assert isinstance(edge, Edge), type(edge)
+    assert isinstance(b, Node), type(b)
+    assert a.properties["name"] == "Alice", a.properties
+    assert a.properties["age"] == 40, a.properties
+    assert b.properties["name"] == "Bob", b.properties
+    assert edge.relation == "KNOWS", edge.relation
+    assert edge.properties["since"] == 2026, edge.properties
+
+    result = graph.query(
+        "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name ORDER BY n.name"
+    )
+    assert result.result_set == [["Alice"]], result.result_set
+
+    result = graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert result.result_set == [["Alice"]], result.result_set
+
+    # Standard Redis DUMP/RESTORE compatibility is the migration bridge for
+    # an existing FalkorDB deployment. Redis MIGRATE emits the same RESTORE
+    # request after serializing the graph module key with DUMP.
+    raw = Redis(
+        host=HOST,
+        port=PORT,
+        password=PASSWORD,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        protocol=2,
+        decode_responses=False,
+        **tls_kwargs(with_client_cert=True),
+    )
+    dump_payload = raw.dump(GRAPH)
+    assert dump_payload and len(dump_payload) > 10
+    restore_reply = raw.restore(REDIS_RESTORED_GRAPH, 0, dump_payload)
+    assert restore_reply in (True, b"OK", "OK"), restore_reply
+    restored_graph = db.select_graph(REDIS_RESTORED_GRAPH)
+    restored = restored_graph.query(
+        "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) "
+        "RETURN a.age, r.since, b.age"
+    )
+    assert restored.result_set == [[40, 2026, 30]], restored.result_set
+    restored_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
+
+    restored_vec = restored_graph.query(
+        "CALL db.idx.vector.queryNodes('Person','embedding',1,vecf32([0.1,0.1])) "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_vec.result_set == [["Alice"]], restored_vec.result_set
+
+    restored_edge_range = restored_graph.query(
+        "MATCH ()-[r:KNOWS]->() WHERE r.since = 2026 RETURN r.note"
+    )
+    assert restored_edge_range.result_set == [["long term colleague"]], restored_edge_range.result_set
+
+    restored_edge_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryRelationships('KNOWS','colleague') "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_ft.result_set == [[2026]], restored_edge_ft.result_set
+
+    restored_edge_vec = restored_graph.query(
+        "CALL db.idx.vector.queryRelationships('KNOWS','embedding',1,vecf32([1.1,1.1])) "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
+
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
+
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
+
+    # Schema migration must preserve UNIQUE constraint enforcement, not just
+    # graph data and indexes.
+    try:
+        restored_graph.query("CREATE (:Person {name:'Alice',age:99})")
+        raise AssertionError("restored UNIQUE constraint accepted duplicate Person.name")
+    except ResponseError:
+        pass
+
+    # A malformed REPLACE must not destroy the existing destination graph.
+    try:
+        raw.restore(REDIS_RESTORED_GRAPH, 0, b"not-a-valid-redis-dump", replace=True)
+        raise AssertionError("corrupt RESTORE REPLACE unexpectedly succeeded")
+    except ResponseError:
+        pass
+    preserved = restored_graph.query(
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name"
+    )
+    assert preserved.result_set == [["Alice"], ["Bob"]], preserved.result_set
+    raw.close()
+
+    # Read-only command must work for reads and reject writes.
+    result = graph.ro_query("MATCH (n:Person) RETURN count(n)")
+    assert result.result_set == [[2]], result.result_set
+    try:
+        graph.ro_query("CREATE (:ShouldFail)")
+        raise AssertionError("GRAPH.RO_QUERY accepted a write")
+    except ResponseError:
+        pass
+
+    udf_script = """
+    function PersistedAdd(x) { return x + 7; }
+    falkor.register("PersistedAdd", PersistedAdd);
+    """
+    assert db.udf_load("native_ci", udf_script, True) == "OK"
+    udf_result = graph.query("RETURN native_ci.PersistedAdd(35)")
+    assert udf_result.result_set == [[42]], udf_result.result_set
+
+    udf_list = db.udf_list("native_ci", with_code=True)
+    assert len(udf_list) == 1, udf_list
+    assert udf_list[0][1] == "native_ci", udf_list
+    assert "PersistedAdd" in udf_list[0][3], udf_list
+
+    names = db.list_graphs()
+    assert GRAPH in names, names
+    db.close()
+    print("OFFICIAL_FALKORDB_CLIENT_UDF_WRITE_PASS")
+    print("NATIVE_REDIS_DUMP_RESTORE_MIGRATION_PASS")
+    print("OFFICIAL_FALKORDB_CLIENT_WRITE_PASS")
+    if TLS_DIR is not None:
+        print("OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS")
+
+
+def phase_read():
+    db = connect()
+    graph = db.select_graph(GRAPH)
+
+    # Server process was terminated between phases. This result must therefore
+    # come from the standalone WAL recovery path.
+    result = graph.query(
+        "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) "
+        "RETURN a.age, r.since, b.age"
+    )
+    assert result.result_set == [[40, 2026, 30]], result.result_set
+
+    constraints = graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in constraints
+    ), constraints
+
+    clone = db.select_graph("network-official-client-copy")
+    clone_result = clone.query("MATCH (n:Person) RETURN count(n)")
+    assert clone_result.result_set == [[2]], clone_result.result_set
+
+    restored_graph = db.select_graph(REDIS_RESTORED_GRAPH)
+    restored_result = restored_graph.query(
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name"
+    )
+    assert restored_result.result_set == [["Alice"], ["Bob"]], restored_result.result_set
+
+    type_query = (
+        "MATCH (p:Types) RETURN "
+        "p.boolval,p.numval,p.strval,p.array,p.pointval,p.vector,p.arr_of_vecs,"
+        "p.date,p.time,p.datetime,p.duration"
+    )
+    original_types = graph.query(type_query).result_set
+    restored_types = restored_graph.query(type_query).result_set
+    assert restored_types == original_types, (original_types, restored_types)
+
+    restored_parallel = restored_graph.query(
+        "MATCH (:Person {name:'Alice'})-[r:PARALLEL]->(:Person {name:'Bob'}) "
+        "RETURN r.slot ORDER BY r.slot"
+    )
+    assert restored_parallel.result_set == [[1], [2]], restored_parallel.result_set
+
+    restored_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_ft.result_set == [["Alice"]], restored_ft.result_set
+
+    restored_vec = restored_graph.query(
+        "CALL db.idx.vector.queryNodes('Person','embedding',1,vecf32([0.1,0.1])) "
+        "YIELD node RETURN node.name"
+    )
+    assert restored_vec.result_set == [["Alice"]], restored_vec.result_set
+
+    restored_edge_ft = restored_graph.query(
+        "CALL db.idx.fulltext.queryRelationships('KNOWS','colleague') "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_ft.result_set == [[2026]], restored_edge_ft.result_set
+
+    restored_edge_vec = restored_graph.query(
+        "CALL db.idx.vector.queryRelationships('KNOWS','embedding',1,vecf32([1.1,1.1])) "
+        "YIELD relationship RETURN relationship.since"
+    )
+    assert restored_edge_vec.result_set == [[2026]], restored_edge_vec.result_set
+
+    restored_constraints = restored_graph.list_constraints()
+    assert any(
+        c["type"] == "UNIQUE"
+        and c["label"] == "Person"
+        and "name" in c["properties"]
+        for c in restored_constraints
+    ), restored_constraints
+    try:
+        restored_graph.query("CREATE (:Person {name:'Alice',age:999})")
+        raise AssertionError("restarted restored UNIQUE constraint accepted duplicate")
+    except ResponseError:
+        pass
+
+    result = graph.query(
+        "MATCH (n:Person) WHERE n.age >= 35 RETURN n.name"
+    )
+    assert result.result_set == [["Alice"]], result.result_set
+
+    result = graph.query(
+        "CALL db.idx.fulltext.queryNodes('Person','Alice') "
+        "YIELD node RETURN node.name"
+    )
+    assert result.result_set == [["Alice"]], result.result_set
+
+    # GRAPH.UDF is process-global upstream state. The standalone server persists
+    # it beside graph WAL/checkpoints and must restore it on a fresh process.
+    udf_result = graph.query("RETURN native_ci.PersistedAdd(35)")
+    assert udf_result.result_set == [[42]], udf_result.result_set
+    udf_list = db.udf_list("native_ci")
+    assert len(udf_list) == 1, udf_list
+
+    assert GRAPH in db.list_graphs()
+    db.close()
+    print("OFFICIAL_FALKORDB_CLIENT_UDF_RESTART_PASS")
+    print("NATIVE_REDIS_DUMP_RESTORE_RESTART_PASS")
+    print("OFFICIAL_FALKORDB_CLIENT_RESTART_PASS")
+    if TLS_DIR is not None:
+        print("OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("phase", choices=["write", "read"])
+    args = parser.parse_args()
+    if args.phase == "write":
+        phase_write()
+    else:
+        phase_read()

@@ -1,0 +1,609 @@
+param(
+    [string]$WorkDir = "$PSScriptRoot\..\build"
+)
+
+$ErrorActionPreference = "Stop"
+$WorkDir = [IO.Path]::GetFullPath($WorkDir)
+$Logs = Join-Path $WorkDir "logs"
+New-Item -ItemType Directory -Force -Path $Logs | Out-Null
+
+# Everything is built from this repository: the vendored engine (engine/graph)
+# compiles GraphBLAS and LAGraph from engine/GraphBLAS and engine/LAGraph in
+# its build script, and native_host/build.rs unpacks the vendored tunnel
+# runtime. No bootstrap or library paths are needed.
+
+# Keep the deployable EXEs independent of the separately installed MSVC
+# redistributable. The engine build script compiles GraphBLAS/LAGraph with the
+# matching static CRT.
+$StaticCrtFlag = "-C target-feature=+crt-static"
+if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+    $env:RUSTFLAGS = $StaticCrtFlag
+} elseif (-not $env:RUSTFLAGS.Contains("target-feature=+crt-static")) {
+    $env:RUSTFLAGS = "$($env:RUSTFLAGS) $StaticCrtFlag"
+}
+$env:CARGO_TARGET_DIR = Join-Path $WorkDir "cargo-target"
+
+rustc -Vv | Tee-Object -FilePath (Join-Path $Logs "00_rustc.txt")
+cargo -V | Tee-Object -FilePath (Join-Path $Logs "00_cargo.txt")
+cmake --version | Tee-Object -FilePath (Join-Path $Logs "00_cmake.txt")
+
+$HostManifest = Join-Path $PSScriptRoot "..\native_host\Cargo.toml"
+
+Write-Host "=== Stage 1: engine type-check (builds vendored GraphBLAS/LAGraph) ==="
+cargo check --manifest-path $HostManifest -p graph --locked 2>&1 | Tee-Object -FilePath (Join-Path $Logs "01_graph_check.txt")
+if ($LASTEXITCODE -ne 0) { throw "Engine cargo check failed with exit code $LASTEXITCODE" }
+
+Write-Host "=== Stage 2: native host type-check ==="
+cargo check --manifest-path $HostManifest 2>&1 | Tee-Object -FilePath (Join-Path $Logs "02_host_check.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native host cargo check failed with exit code $LASTEXITCODE" }
+
+Write-Host "=== Stage 3: native host unit tests ==="
+cargo test --manifest-path $HostManifest --lib 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "03_host_tests.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native host unit tests failed with exit code $LASTEXITCODE" }
+
+Write-Host "=== Stage 4: native smoke executable link ==="
+cargo build --manifest-path $HostManifest --bin smoke --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "04_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Native smoke build failed with exit code $LASTEXITCODE" }
+
+Write-Host "=== Stage 5: native smoke execution ==="
+$SmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\smoke.exe"
+if (-not (Test-Path $SmokeExe)) {
+    throw "Smoke executable was not produced: $SmokeExe"
+}
+$SmokeOutput = & $SmokeExe 2>&1 | Tee-Object -FilePath (Join-Path $Logs "05_smoke_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Native smoke executable failed with exit code $LASTEXITCODE"
+}
+if (($SmokeOutput -join "`n") -notmatch "NATIVE_SMOKE_OK") {
+    throw "Native smoke executable did not emit NATIVE_SMOKE_OK"
+}
+
+Write-Host "=== Stage 6: Cypher-visible native index + WAL restart smoke ==="
+cargo build --manifest-path $HostManifest --bin indexed_smoke --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "06_indexed_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Indexed smoke build failed with exit code $LASTEXITCODE" }
+
+$IndexedSmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\indexed_smoke.exe"
+if (-not (Test-Path $IndexedSmokeExe)) {
+    throw "Indexed smoke executable was not produced: $IndexedSmokeExe"
+}
+$IndexedOutput = & $IndexedSmokeExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_indexed_smoke_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Indexed smoke executable failed with exit code $LASTEXITCODE"
+}
+$IndexedText = $IndexedOutput -join "`n"
+if ($IndexedText -notmatch "NATIVE_CYPHER_INDEX_INTEGRATION_PASS") {
+    throw "Indexed smoke did not emit NATIVE_CYPHER_INDEX_INTEGRATION_PASS"
+}
+if ($IndexedText -notmatch "NATIVE_WAL_INDEX_RESTART_PASS") {
+    throw "Indexed smoke did not emit NATIVE_WAL_INDEX_RESTART_PASS"
+}
+if ($IndexedText -notmatch "NATIVE_CHECKPOINT_WAL_ROTATION_PASS") {
+    throw "Indexed smoke did not emit NATIVE_CHECKPOINT_WAL_ROTATION_PASS"
+}
+
+Write-Host "=== Stage 6b: persistent multi-graph concurrency smoke ==="
+cargo build --manifest-path $HostManifest --bin concurrency_smoke --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07b_concurrency_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Concurrency smoke build failed with exit code $LASTEXITCODE"
+}
+$ConcurrencySmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\concurrency_smoke.exe"
+if (-not (Test-Path $ConcurrencySmokeExe)) {
+    throw "Concurrency smoke executable was not produced: $ConcurrencySmokeExe"
+}
+$ConcurrencyOutput = & $ConcurrencySmokeExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07c_concurrency_smoke_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Concurrency smoke executable failed with exit code $LASTEXITCODE"
+}
+if (($ConcurrencyOutput -join "`n") -notmatch "CONCURRENCY_SMOKE_PASS") {
+    throw "Concurrency smoke did not emit CONCURRENCY_SMOKE_PASS"
+}
+
+Write-Host "=== Stage 6c: WHERE survives a later MATCH (planner regression) ==="
+cargo build --manifest-path $HostManifest --bin filter_regression --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_filter_regression_build.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "filter_regression build failed with exit code $LASTEXITCODE"
+}
+$FilterRegressionExe = Join-Path $env:CARGO_TARGET_DIR "release\filter_regression.exe"
+if (-not (Test-Path $FilterRegressionExe)) {
+    throw "filter_regression executable was not produced: $FilterRegressionExe"
+}
+$FilterRegressionOutput = & $FilterRegressionExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_filter_regression_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "filter_regression failed with exit code $LASTEXITCODE"
+}
+if (($FilterRegressionOutput -join "`n") -notmatch "all filter regression cases passed") {
+    throw "filter_regression did not report all cases passed"
+}
+
+Write-Host "=== Stage 6d: durability, restore and wedge regressions ==="
+cargo build --manifest-path $HostManifest --bin host_regression --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_host_regression_build.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "host_regression build failed with exit code $LASTEXITCODE"
+}
+$HostRegressionExe = Join-Path $env:CARGO_TARGET_DIR "release\host_regression.exe"
+if (-not (Test-Path $HostRegressionExe)) {
+    throw "host_regression executable was not produced: $HostRegressionExe"
+}
+$HostRegressionOutput = & $HostRegressionExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07_host_regression_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "host_regression failed with exit code $LASTEXITCODE"
+}
+if (($HostRegressionOutput -join "`n") -notmatch "all host regression cases passed") {
+    throw "host_regression did not report all cases passed"
+}
+
+Write-Host ""
+Write-Host "NATIVE_WINDOWS_FULL_STANDALONE_PASS"
+Write-Host "Logs: $Logs"
+
+
+Write-Host "=== Stage 7: official FalkorDB client network compatibility ==="
+cargo build --manifest-path $HostManifest --bin server --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "08_server_build.txt")
+if ($LASTEXITCODE -ne 0) { throw "Network server build failed with exit code $LASTEXITCODE" }
+
+$ServerExe = Join-Path $env:CARGO_TARGET_DIR "release\server.exe"
+if (-not (Test-Path $ServerExe)) {
+    throw "Network server executable was not produced: $ServerExe"
+}
+
+$NetworkData = Join-Path $WorkDir "network-data"
+Remove-Item -Recurse -Force $NetworkData -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $NetworkData | Out-Null
+$ClientSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\network_client_smoke.py"))
+$ApiSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\chatgpt_api_smoke.py"))
+$McpSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\mcp_direct_smoke.py"))
+$McpTokenFile = Join-Path $WorkDir "mcp-oauth-token.txt"
+Remove-Item -Force $McpTokenFile -ErrorAction SilentlyContinue
+$ParitySmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\falkordb_parity_smoke.py"))
+$UpstreamFixtureTest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\upstream_dump_fixture.py"))
+$UpstreamFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.dump"
+$UpstreamRdbFixture = Join-Path $WorkDir "upstream-fixture\upstream-real.rdb"
+$RawRdbImporter = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "import_falkordb_rdb.py"))
+$MigrationUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "migrate_current_falkordb.py"))
+$BundleUtility = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "falkordb_bundle.py"))
+$BundleAtomicSmoke = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\bundle_atomic_smoke.py"))
+$TlsGenerator = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\tests\generate_tls_fixtures.py"))
+$TlsDir = Join-Path $WorkDir "tls-fixtures"
+Remove-Item -Recurse -Force $TlsDir -ErrorAction SilentlyContinue
+python $TlsGenerator $TlsDir 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "09_tls_fixture_generation.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "TLS fixture generation failed with exit code $LASTEXITCODE"
+}
+$env:FALKORDB_TEST_TLS_DIR = $TlsDir
+
+function Wait-NativeServer([int]$Port) {
+    for ($i = 0; $i -lt 100; $i++) {
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $async = $tcp.ConnectAsync("127.0.0.1", $Port)
+            if ($async.Wait(100) -and $tcp.Connected) {
+                $tcp.Dispose()
+                return
+            }
+            $tcp.Dispose()
+        } catch {}
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Native RESP server did not become ready on port $Port"
+}
+
+function Start-NativeServer([string]$Suffix) {
+    $out = Join-Path $Logs ("09_server_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("09_server_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        # Test data lives under build\, outside the executable's portable
+        # state folder; portable mode (the default) would reject it.
+        "--no-portable",
+        "--bind", "127.0.0.1:6391",
+        "--data-dir", $NetworkData,
+        "--password", "native-ci-secret",
+        "--viewer-username", "viewer",
+        "--viewer-password", "native-viewer-secret",
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem"),
+        "--api-bind", "127.0.0.1:8443",
+        "--api-token", "native-api-write-secret",
+        "--api-read-token", "native-api-read-secret"
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6391
+    Wait-NativeServer 8443
+    return $proc
+}
+
+$MigrationData = Join-Path $WorkDir "migration-destination-data"
+Remove-Item -Recurse -Force $MigrationData -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $MigrationData | Out-Null
+
+function Start-MigrationDestination([string]$Suffix) {
+    $out = Join-Path $Logs ("10_migration_dest_" + $Suffix + "_stdout.txt")
+    $err = Join-Path $Logs ("10_migration_dest_" + $Suffix + "_stderr.txt")
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList @(
+        # Test data lives under build\, outside the executable's portable
+        # state folder; portable mode (the default) would reject it.
+        "--no-portable",
+        "--bind", "127.0.0.1:6392",
+        "--data-dir", $MigrationData,
+        "--password", "native-ci-secret",
+        "--tls-cert", (Join-Path $TlsDir "server-cert.pem"),
+        "--tls-key", (Join-Path $TlsDir "server-key.pem"),
+        "--tls-client-ca", (Join-Path $TlsDir "ca.pem")
+    ) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Wait-NativeServer 6392
+    return $proc
+}
+
+$Server = $null
+try {
+    $Server = Start-NativeServer "first"
+
+    if (-not (Test-Path $UpstreamRdbFixture)) {
+        throw "Official upstream FalkorDB dump.rdb artifact is missing: $UpstreamRdbFixture"
+    }
+
+    python $RawRdbImporter inspect --rdb $UpstreamRdbFixture 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_inspect.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb inspect failed with exit code $LASTEXITCODE"
+    }
+
+    python $RawRdbImporter import `
+        --rdb $UpstreamRdbFixture `
+        --destination-host localhost `
+        --destination-port 6391 `
+        --destination-password native-ci-secret `
+        --destination-ssl `
+        --destination-ca (Join-Path $TlsDir "ca.pem") `
+        --destination-cert (Join-Path $TlsDir "client-cert.pem") `
+        --destination-key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_import.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb import failed with exit code $LASTEXITCODE"
+    }
+    $RawImportText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_import.txt") -Raw)
+    if ($RawImportText -notmatch "RAW_RDB_IMPORT_COMPLETE") {
+        throw "Official upstream FalkorDB dump.rdb import did not emit completion marker"
+    }
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --target-graph upstream-real-fixture `
+        --verify-udf `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_verify.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb query/UDF verification failed with exit code $LASTEXITCODE"
+    }
+    $RawVerifyText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_verify.txt") -Raw)
+    if ($RawVerifyText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS") {
+        throw "Official upstream FalkorDB dump.rdb did not preserve UDF library"
+    }
+    Write-Host "NATIVE_RAW_FALKORDB_RDB_IMPORT_PASS"
+
+    # Prove raw dump.rdb durability before the general client smoke deliberately
+    # executes FLUSHDB as part of its clean-room setup.
+    Stop-Process -Id $Server.Id -Force
+    Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    $Server = $null
+    Start-Sleep -Milliseconds 300
+
+    $Server = Start-NativeServer "raw-rdb-restart"
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --target-graph upstream-real-fixture `
+        --verify-udf `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_raw_rdb_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB dump.rdb immediate restart verification failed with exit code $LASTEXITCODE"
+    }
+    $RawRestartText = (Get-Content (Join-Path $Logs "10_upstream_raw_rdb_restart.txt") -Raw)
+    if ($RawRestartText -notmatch "UPSTREAM_FALKORDB_RDB_UDF_PASS" -or
+        $RawRestartText -notmatch "UPSTREAM_FALKORDB_RAW_RDB_MULTIGRAPH_PASS") {
+        throw "Official upstream FalkorDB dump.rdb data/UDFs did not survive native restart"
+    }
+    Write-Host "NATIVE_RAW_FALKORDB_RDB_RESTART_PASS"
+
+    python $ClientSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_official_client_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB client write/network phase failed with exit code $LASTEXITCODE"
+    }
+    $WriteText = (Get-Content (Join-Path $Logs "10_official_client_write.txt") -Raw)
+    if ($WriteText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_WRITE_PASS") {
+        throw "Official FalkorDB client did not prove mTLS write connectivity"
+    }
+
+    if (-not (Test-Path $UpstreamFixture)) {
+        throw "Official upstream FalkorDB DUMP artifact is missing: $UpstreamFixture"
+    }
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_upstream_dump_restore.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB DUMP restore verification failed with exit code $LASTEXITCODE"
+    }
+    $UpstreamRestoreText = (Get-Content (Join-Path $Logs "10_upstream_dump_restore.txt") -Raw)
+    if ($UpstreamRestoreText -notmatch "UPSTREAM_FALKORDB_DUMP_RESTORE_PASS") {
+        throw "Official upstream FalkorDB DUMP did not emit restore success marker"
+    }
+
+    python $ApiSmoke write 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_chatgpt_api_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT HTTPS API write phase failed with exit code $LASTEXITCODE"
+    }
+    $ApiWriteText = (Get-Content (Join-Path $Logs "10_chatgpt_api_write.txt") -Raw)
+    if ($ApiWriteText -notmatch "CHATGPT_HTTPS_API_WRITE_PASS") {
+        throw "ChatGPT HTTPS API did not prove authenticated write/read connectivity"
+    }
+
+    python $McpSmoke write --ca (Join-Path $TlsDir "ca.pem") --token-file $McpTokenFile --import-root (Join-Path $NetworkData "imports") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_mcp_direct_oauth_write.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Direct MCP OAuth write phase failed with exit code $LASTEXITCODE"
+    }
+    $McpWriteText = (Get-Content (Join-Path $Logs "10_mcp_direct_oauth_write.txt") -Raw)
+    if ($McpWriteText -notmatch "MCP_DIRECT_OAUTH_WRITE_PASS") {
+        throw "Direct MCP OAuth write phase did not emit success marker"
+    }
+
+    python $ParitySmoke 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "10_official_client_parity.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB parity gate failed with exit code $LASTEXITCODE"
+    }
+    $ParityText = (Get-Content (Join-Path $Logs "10_official_client_parity.txt") -Raw)
+    if ($ParityText -notmatch "OFFICIAL_FALKORDB_PARITY_GATE_PASS") {
+        throw "Official FalkorDB parity gate did not emit success marker"
+    }
+
+    # Prove the actual whole-database migration utility, not only the
+    # server-side DUMP/RESTORE primitives. Use a second independent native
+    # process and hard-restart it before the normal restart verifier.
+    $MigrationServer = $null
+    try {
+        $MigrationServer = Start-MigrationDestination "first"
+        $MigrationArgs = @(
+            "--source-host", "localhost",
+            "--source-port", "6391",
+            "--source-password", "native-ci-secret",
+            "--source-ssl",
+            "--source-ca", (Join-Path $TlsDir "ca.pem"),
+            "--source-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--source-key", (Join-Path $TlsDir "client-key.pem"),
+            "--destination-host", "localhost",
+            "--destination-port", "6392",
+            "--destination-password", "native-ci-secret",
+            "--destination-ssl",
+            "--destination-ca", (Join-Path $TlsDir "ca.pem"),
+            "--destination-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--destination-key", (Join-Path $TlsDir "client-key.pem")
+        )
+
+        python $MigrationUtility @MigrationArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_first.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Whole-database migration utility failed with exit code $LASTEXITCODE"
+        }
+        $MigrationText = (Get-Content (Join-Path $Logs "10_migration_utility_first.txt") -Raw)
+        if ($MigrationText -notmatch "MIGRATION_COMPLETE") {
+            throw "Whole-database migration utility did not emit completion marker"
+        }
+
+        # Exercise replacement backup and verification against populated data.
+        python $MigrationUtility @MigrationArgs --replace 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_replace.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Whole-database migration --replace failed with exit code $LASTEXITCODE"
+        }
+
+        # Prove the offline migration format as the final state before restart:
+        # export all graph DUMPs/signatures/UDF source to one portable ZIP, then
+        # import that bundle with replacement and semantic verification.
+        $BundlePath = Join-Path $WorkDir "falkordb-portable-migration.zip"
+        Remove-Item -Force $BundlePath -ErrorAction SilentlyContinue
+
+        $BundleExportArgs = @(
+            "export",
+            "--source-host", "localhost",
+            "--source-port", "6391",
+            "--source-password", "native-ci-secret",
+            "--source-ssl",
+            "--source-ca", (Join-Path $TlsDir "ca.pem"),
+            "--source-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--source-key", (Join-Path $TlsDir "client-key.pem"),
+            "--output", $BundlePath
+        )
+        python $BundleUtility @BundleExportArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_export.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle export failed with exit code $LASTEXITCODE"
+        }
+        $BundleExportText = (Get-Content (Join-Path $Logs "10_bundle_export.txt") -Raw)
+        if ($BundleExportText -notmatch "BUNDLE_EXPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle export did not emit completion marker"
+        }
+
+        python $BundleUtility inspect --input $BundlePath 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_inspect.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle inspect failed with exit code $LASTEXITCODE"
+        }
+
+        $BundleImportArgs = @(
+            "import",
+            "--destination-host", "localhost",
+            "--destination-port", "6392",
+            "--destination-password", "native-ci-secret",
+            "--destination-ssl",
+            "--destination-ca", (Join-Path $TlsDir "ca.pem"),
+            "--destination-cert", (Join-Path $TlsDir "client-cert.pem"),
+            "--destination-key", (Join-Path $TlsDir "client-key.pem"),
+            "--input", $BundlePath,
+            "--replace"
+        )
+        python $BundleUtility @BundleImportArgs 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_import.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Portable FalkorDB bundle import failed with exit code $LASTEXITCODE"
+        }
+        $BundleImportText = (Get-Content (Join-Path $Logs "10_bundle_import.txt") -Raw)
+        if ($BundleImportText -notmatch "BUNDLE_IMPORT_COMPLETE") {
+            throw "Portable FalkorDB bundle import did not emit completion marker"
+        }
+        Write-Host "NATIVE_OFFLINE_BUNDLE_MIGRATION_PASS"
+
+        python $BundleAtomicSmoke `
+            --bundle $BundlePath `
+            --utility $BundleUtility `
+            --host localhost `
+            --port 6392 `
+            --password native-ci-secret `
+            --ssl `
+            --ca (Join-Path $TlsDir "ca.pem") `
+            --cert (Join-Path $TlsDir "client-cert.pem") `
+            --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_bundle_atomic_rollback.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Atomic bundle rollback smoke failed with exit code $LASTEXITCODE"
+        }
+        $AtomicRollbackText = (Get-Content (Join-Path $Logs "10_bundle_atomic_rollback.txt") -Raw)
+        if ($AtomicRollbackText -notmatch "BUNDLE_ATOMIC_ROLLBACK_PASS") {
+            throw "Atomic bundle rollback smoke did not emit success marker"
+        }
+
+        Stop-Process -Id $MigrationServer.Id -Force
+        Wait-Process -Id $MigrationServer.Id -ErrorAction SilentlyContinue
+        $MigrationServer = $null
+        Start-Sleep -Milliseconds 300
+
+        $MigrationServer = Start-MigrationDestination "restart"
+        $env:FALKORDB_TEST_PORT = "6392"
+        python $ClientSmoke read 2>&1 |
+            Tee-Object -FilePath (Join-Path $Logs "10_migration_utility_restart_verify.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Migrated destination restart verification failed with exit code $LASTEXITCODE"
+        }
+        $MigrationRestartText = (Get-Content (Join-Path $Logs "10_migration_utility_restart_verify.txt") -Raw)
+        if ($MigrationRestartText -notmatch "NATIVE_REDIS_DUMP_RESTORE_RESTART_PASS") {
+            throw "Migrated destination did not pass restart verification"
+        }
+        Write-Host "NATIVE_WHOLE_DATABASE_MIGRATION_PASS"
+    } finally {
+        Remove-Item Env:FALKORDB_TEST_PORT -ErrorAction SilentlyContinue
+        if ($null -ne $MigrationServer -and -not $MigrationServer.HasExited) {
+            Stop-Process -Id $MigrationServer.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $MigrationServer.Id -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Hard-stop the server to prove committed graph state is recoverable solely
+    # from the native WAL on a fresh process.
+    Stop-Process -Id $Server.Id -Force
+    Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    $Server = $null
+    Start-Sleep -Milliseconds 300
+
+    $Server = Start-NativeServer "restart"
+
+    python $ClientSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_official_client_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official FalkorDB client restart/network phase failed with exit code $LASTEXITCODE"
+    }
+    $RestartText = (Get-Content (Join-Path $Logs "11_official_client_restart.txt") -Raw)
+    if ($RestartText -notmatch "OFFICIAL_FALKORDB_CLIENT_MTLS_RESTART_PASS") {
+        throw "Official FalkorDB client did not prove mTLS restart connectivity"
+    }
+
+    python $UpstreamFixtureTest verify `
+        --input $UpstreamFixture `
+        --skip-restore `
+        --host localhost `
+        --port 6391 `
+        --password native-ci-secret `
+        --ssl `
+        --ca (Join-Path $TlsDir "ca.pem") `
+        --cert (Join-Path $TlsDir "client-cert.pem") `
+        --key (Join-Path $TlsDir "client-key.pem") 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_upstream_dump_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official upstream FalkorDB DUMP restart verification failed with exit code $LASTEXITCODE"
+    }
+    $UpstreamRestartText = (Get-Content (Join-Path $Logs "11_upstream_dump_restart.txt") -Raw)
+    if ($UpstreamRestartText -notmatch "UPSTREAM_FALKORDB_DUMP_RESTART_PASS") {
+        throw "Official upstream FalkorDB DUMP did not survive native restart"
+    }
+
+    python $ApiSmoke read 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_chatgpt_api_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ChatGPT HTTPS API restart phase failed with exit code $LASTEXITCODE"
+    }
+    $ApiRestartText = (Get-Content (Join-Path $Logs "11_chatgpt_api_restart.txt") -Raw)
+    if ($ApiRestartText -notmatch "CHATGPT_HTTPS_API_RESTART_PASS") {
+        throw "ChatGPT HTTPS API did not prove restart/WAL recovery"
+    }
+
+    python $McpSmoke read --ca (Join-Path $TlsDir "ca.pem") --token-file $McpTokenFile 2>&1 |
+        Tee-Object -FilePath (Join-Path $Logs "11_mcp_direct_oauth_restart.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Direct MCP OAuth restart phase failed with exit code $LASTEXITCODE"
+    }
+    $McpRestartText = (Get-Content (Join-Path $Logs "11_mcp_direct_oauth_restart.txt") -Raw)
+    if ($McpRestartText -notmatch "MCP_DIRECT_OAUTH_RESTART_PASS") {
+        throw "Direct MCP OAuth token/data did not survive restart"
+    }
+} finally {
+    if ($null -ne $Server -and -not $Server.HasExited) {
+        Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $Server.Id -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host ""
+Write-Host "NATIVE_WINDOWS_NETWORK_FALKORDB_CLIENT_PASS"
+Write-Host "NATIVE_WINDOWS_MTLS_FALKORDB_CLIENT_PASS"
+Write-Host "NATIVE_WINDOWS_CHATGPT_HTTPS_API_PASS"
+Write-Host "NATIVE_WINDOWS_CHATGPT_MCP_OAUTH_PASS"
+Write-Host "NATIVE_WINDOWS_FALKORDB_PARITY_GATE_PASS"
+Write-Host "NATIVE_WINDOWS_WHOLE_DATABASE_MIGRATION_PASS"
+Write-Host "NATIVE_WINDOWS_OFFLINE_BUNDLE_MIGRATION_PASS"
+Write-Host "NATIVE_WINDOWS_UPSTREAM_FALKORDB_DUMP_PASS"
+Write-Host "NATIVE_WINDOWS_RAW_FALKORDB_RDB_PASS"
+

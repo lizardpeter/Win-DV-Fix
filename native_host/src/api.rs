@@ -1,0 +1,1708 @@
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader, Read, Write},
+    net::{IpAddr, SocketAddr, TcpListener},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use rustls::{ServerConnection, StreamOwned};
+use serde::Deserialize;
+use serde_json::{Value as JsonValue, json};
+use subtle::ConstantTimeEq;
+use parking_lot::Mutex;
+
+use crate::{
+    OutputStats, QueryOutput,
+    server::{GraphCatalog, TlsConfig, load_tls_config},
+    wire::WireValue,
+};
+
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BATCH_QUERIES: usize = 100;
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HEADERS: usize = 100;
+const MAX_CHUNK_LINE_BYTES: usize = 1024;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+const MAX_API_CONNECTIONS: usize = 256;
+const API_IO_TIMEOUT_SECS: u64 = 30;
+const AUTH_FAILURE_WINDOW_SECS: u64 = 5 * 60;
+const AUTH_BLOCK_SECS: u64 = 15 * 60;
+const MAX_AUTH_FAILURES_PER_REMOTE_IP: u16 = 20;
+const MAX_AUTH_THROTTLE_IPS: usize = 4096;
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct AuthFailureState {
+    failures: u16,
+    window_started: Instant,
+    blocked_until: Option<Instant>,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct AuthThrottle {
+    entries: Mutex<HashMap<IpAddr, AuthFailureState>>,
+}
+
+impl AuthThrottle {
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        if ip.is_loopback() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let Some(state) = entries.get_mut(&ip) else {
+            return false;
+        };
+        state.last_seen = now;
+
+        if let Some(until) = state.blocked_until {
+            if until > now {
+                return true;
+            }
+            state.blocked_until = None;
+            state.failures = 0;
+            state.window_started = now;
+        }
+
+        if now.saturating_duration_since(state.window_started)
+            > Duration::from_secs(AUTH_FAILURE_WINDOW_SECS)
+        {
+            state.failures = 0;
+            state.window_started = now;
+        }
+        false
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        if ip.is_loopback() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+
+        if entries.len() >= MAX_AUTH_THROTTLE_IPS && !entries.contains_key(&ip) {
+            let stale_after = Duration::from_secs(AUTH_FAILURE_WINDOW_SECS + AUTH_BLOCK_SECS);
+            entries.retain(|_, state| now.saturating_duration_since(state.last_seen) <= stale_after);
+            if entries.len() >= MAX_AUTH_THROTTLE_IPS {
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, state)| state.last_seen)
+                    .map(|(key, _)| *key)
+                {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+
+        let state = entries.entry(ip).or_insert_with(|| AuthFailureState {
+            failures: 0,
+            window_started: now,
+            blocked_until: None,
+            last_seen: now,
+        });
+        state.last_seen = now;
+
+        if now.saturating_duration_since(state.window_started)
+            > Duration::from_secs(AUTH_FAILURE_WINDOW_SECS)
+        {
+            state.failures = 0;
+            state.window_started = now;
+            state.blocked_until = None;
+        }
+
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= MAX_AUTH_FAILURES_PER_REMOTE_IP {
+            state.blocked_until = Some(now + Duration::from_secs(AUTH_BLOCK_SECS));
+            state.failures = 0;
+            state.window_started = now;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiConfig {
+    pub bind: SocketAddr,
+    pub read_write_token: Option<String>,
+    pub read_only_token: Option<String>,
+    /// Optional human viewer credential shared with the read-only RESP viewer.
+    /// Accepted only as HTTP Basic auth and always maps to read-only API scope.
+    pub viewer_username: String,
+    pub viewer_password: Option<String>,
+    /// Separate owner-approval secret for the interactive OAuth consent page.
+    /// The read/write API token remains an accepted fallback for compatibility.
+    pub oauth_owner_secret: Option<String>,
+    /// Additional owner-approval credentials loaded directly from the local
+    /// secrets file, preserved even if env/CLI runtime credentials differ.
+    pub oauth_owner_secret_fallbacks: Vec<String>,
+    /// High-entropy restart-scoped owner-approval code printed only to the
+    /// server console. This avoids dependence on env/secrets-file parsing.
+    pub oauth_pairing_code: Option<String>,
+    pub allow_unauthenticated_remote: bool,
+    pub allow_plaintext_remote: bool,
+    /// Dedicated loopback backend for OpenAI Secure MCP Tunnel. This surface
+    /// exposes only /mcp and /healthz and suppresses direct OAuth/dashboard
+    /// discovery because the tunnel client owns the remote transport.
+    pub tunnel_mode: bool,
+    pub tls: Option<TlsConfig>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8443".parse().expect("valid default API socket"),
+            read_write_token: None,
+            read_only_token: None,
+            viewer_username: "viewer".to_string(),
+            viewer_password: None,
+            oauth_owner_secret: None,
+            oauth_owner_secret_fallbacks: Vec::new(),
+            oauth_pairing_code: None,
+            allow_unauthenticated_remote: false,
+            allow_plaintext_remote: false,
+            tunnel_mode: false,
+            tls: None,
+        }
+    }
+}
+
+impl ApiConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let remote = !self.bind.ip().is_loopback();
+
+        if remote && self.tls.is_none() && !self.allow_plaintext_remote {
+            return Err(
+                "refusing plaintext non-loopback HTTPS API bind; configure TLS or explicitly pass --api-allow-plaintext-remote"
+                    .to_string(),
+            );
+        }
+
+        if remote
+            && self.read_write_token.is_none()
+            && self.read_only_token.is_none()
+            && self.viewer_password.is_none()
+            && !self.allow_unauthenticated_remote
+        {
+            return Err(
+                "refusing unauthenticated non-loopback HTTPS API bind; configure an API token or viewer credential"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthScope {
+    None,
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryRequest {
+    graph: String,
+    cypher: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchRequest {
+    queries: Vec<QueryRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteGraphRequest {
+    graph: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardOverviewRequest {
+    #[serde(default)]
+    viewer_username: String,
+    #[serde(default)]
+    viewer_password: String,
+    #[serde(default)]
+    api_token: String,
+}
+
+pub fn serve_api(config: ApiConfig, catalog: Arc<GraphCatalog>) -> Result<(), String> {
+    config.validate()?;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(load_tls_config)
+        .transpose()?
+        .map(Arc::new);
+
+    let listener = TcpListener::bind(config.bind)
+        .map_err(|e| format!("bind ChatGPT HTTPS API {}: {e}", config.bind))?;
+
+    eprintln!(
+        "FalkorDB native ChatGPT API listening on {}{}",
+        if tls.is_some() { "https://" } else { "http://" },
+        config.bind
+    );
+
+    let config = Arc::new(config);
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let auth_throttle = Arc::new(AuthThrottle::default());
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(stream) => {
+                let previous = active_connections.fetch_add(1, Ordering::AcqRel);
+                if previous >= MAX_API_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::Release);
+                    drop(stream);
+                    continue;
+                }
+
+                let permit = ConnectionPermit(Arc::clone(&active_connections));
+                let catalog = Arc::clone(&catalog);
+                let config = Arc::clone(&config);
+                let tls = tls.clone();
+                let auth_throttle = Arc::clone(&auth_throttle);
+                thread::spawn(move || {
+                    let _permit = permit;
+                    let peer = stream.peer_addr().ok();
+                    let timeout = Some(Duration::from_secs(API_IO_TIMEOUT_SECS));
+                    let result = stream
+                        .set_nodelay(true)
+                        .map_err(|e| format!("set API TCP_NODELAY: {e}"))
+                        .and_then(|_| {
+                            stream
+                                .set_read_timeout(timeout)
+                                .map_err(|e| format!("set API read timeout: {e}"))
+                        })
+                        .and_then(|_| {
+                            stream
+                                .set_write_timeout(timeout)
+                                .map_err(|e| format!("set API write timeout: {e}"))
+                        })
+                        .and_then(|_| {
+                            if let Some(tls) = tls {
+                                let conn = ServerConnection::new(tls)
+                                    .map_err(|e| format!("create API TLS connection: {e}"))?;
+                                handle_http_connection(
+                                    StreamOwned::new(conn, stream),
+                                    &catalog,
+                                    &config,
+                                    peer.map(|value| value.ip()),
+                                    &auth_throttle,
+                                )
+                            } else {
+                                handle_http_connection(
+                                    stream,
+                                    &catalog,
+                                    &config,
+                                    peer.map(|value| value.ip()),
+                                    &auth_throttle,
+                                )
+                            }
+                        });
+
+                    if let Err(err) = result {
+                        eprintln!("ChatGPT API connection {peer:?} ended with error: {err}");
+                    }
+                });
+            }
+            Err(err) => eprintln!("ChatGPT API accept failed: {err}"),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_http_connection<S: Read + Write>(
+    io: S,
+    catalog: &GraphCatalog,
+    config: &ApiConfig,
+    peer_ip: Option<IpAddr>,
+    auth_throttle: &AuthThrottle,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(io);
+    let request = read_http_request(&mut reader)?;
+
+    let health_request = request.method == "GET"
+        && request
+            .target
+            .split_once('?')
+            .map_or(request.target.as_str(), |(path, _)| path)
+            == "/healthz";
+    let response = if !health_request
+        && peer_ip.is_some_and(|ip| auth_throttle.is_blocked(ip))
+    {
+        error_response(
+            429,
+            "too_many_auth_failures",
+            "too many failed authentication attempts from this address; retry later",
+        )
+    } else {
+        route_http(request, catalog, config)
+    };
+
+    if response.status == 401 || response.auth_failure {
+        if let Some(ip) = peer_ip {
+            auth_throttle.record_failure(ip);
+        }
+    }
+
+    write_http_response(reader.get_mut(), response)
+        .map_err(|e| format!("write ChatGPT API response: {e}"))?;
+    reader
+        .get_mut()
+        .flush()
+        .map_err(|e| format!("flush ChatGPT API response: {e}"))
+}
+
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+}
+
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) content_type: &'static str,
+    pub(crate) headers: Vec<(String, String)>,
+    /// A failed credential check that is not reported as HTTP 401 — a
+    /// rejected OAuth owner secret (403), an invalid authorization code or
+    /// refresh token (400 invalid_grant), or an invalid bearer token on /mcp
+    /// (a JSON-RPC result with HTTP 200). Counted by the auth throttle like a
+    /// 401, so guessing cannot sidestep it by choosing an endpoint.
+    pub(crate) auth_failure: bool,
+}
+
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let mut line = Vec::with_capacity(limit.min(1024));
+    let mut limited = reader.take((limit + 1) as u64);
+    let read = limited
+        .read_until(b'\n', &mut line)
+        .map_err(|e| format!("read {what}: {e}"))?;
+
+    if read > limit {
+        return Err(format!("{what} exceeds {limit} bytes"));
+    }
+    if read > 0 && !line.ends_with(b"\n") {
+        return Err(format!("unterminated {what}"));
+    }
+    Ok(line)
+}
+
+fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
+    let request_line = read_line_limited(reader, MAX_REQUEST_LINE_BYTES, "HTTP request line")?;
+    if request_line.is_empty() {
+        return Err("HTTP client closed before request line".to_string());
+    }
+    let request_line = std::str::from_utf8(&request_line)
+        .map_err(|_| "HTTP request line is not UTF-8".to_string())?;
+    let mut parts = request_line.trim_end_matches(['\r', '\n']).split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "malformed HTTP request line".to_string())?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or_else(|| "malformed HTTP request target".to_string())?
+        .to_string();
+    let version = parts
+        .next()
+        .ok_or_else(|| "malformed HTTP version".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed HTTP request line".to_string());
+    }
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(format!("unsupported HTTP version: {version}"));
+    }
+    if !target.starts_with('/') {
+        return Err("HTTP request target must use origin-form".to_string());
+    }
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
+    loop {
+        let line = read_line_limited(reader, MAX_HEADER_LINE_BYTES, "HTTP header line")?;
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        if line.is_empty() {
+            return Err("unexpected EOF inside HTTP headers".to_string());
+        }
+
+        header_count = header_count.saturating_add(1);
+        if header_count > MAX_HEADERS {
+            return Err(format!("too many HTTP headers; maximum is {MAX_HEADERS}"));
+        }
+        header_bytes = header_bytes
+            .checked_add(line.len())
+            .ok_or_else(|| "HTTP header size overflow".to_string())?;
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(format!("HTTP headers exceed {MAX_HEADER_BYTES} bytes"));
+        }
+
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| "HTTP header is not UTF-8".to_string())?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("malformed HTTP header".to_string());
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid HTTP header name".to_string());
+        }
+        let value = value.trim().to_string();
+
+        if let Some(existing) = headers.get_mut(&name) {
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "authorization"
+                    | "x-falkordb-dashboard-authorization"
+            ) {
+                return Err(format!("duplicate security-sensitive HTTP header: {name}"));
+            }
+            existing.push_str(", ");
+            existing.push_str(&value);
+        } else {
+            headers.insert(name, value);
+        }
+    }
+
+    if version == "HTTP/1.1" && !headers.contains_key("host") {
+        return Err("HTTP/1.1 request is missing Host header".to_string());
+    }
+
+    let transfer_encoding = headers.get("transfer-encoding").map(String::as_str);
+    if transfer_encoding.is_some() && headers.contains_key("content-length") {
+        return Err(
+            "request must not send both Transfer-Encoding and Content-Length".to_string(),
+        );
+    }
+
+    let body = match transfer_encoding {
+        None => {
+            let content_length = headers
+                .get("content-length")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|_| "invalid Content-Length".to_string())
+                })
+                .transpose()?
+                .unwrap_or(0);
+
+            if content_length > MAX_BODY_BYTES {
+                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            }
+
+            // Grows as bytes arrive rather than trusting Content-Length.
+            crate::server::read_exact_growing(reader, content_length, "read HTTP request body")?
+        }
+        Some(value) if value.eq_ignore_ascii_case("identity") => {
+            let content_length = headers
+                .get("content-length")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|_| "invalid Content-Length".to_string())
+                })
+                .transpose()?
+                .unwrap_or(0);
+
+            if content_length > MAX_BODY_BYTES {
+                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            }
+
+            // Grows as bytes arrive rather than trusting Content-Length.
+            crate::server::read_exact_growing(reader, content_length, "read HTTP request body")?
+        }
+        Some(value) if value.eq_ignore_ascii_case("chunked") => read_chunked_body(reader)?,
+        Some(_) => {
+            return Err(
+                "unsupported Transfer-Encoding; only identity and chunked are supported"
+                    .to_string(),
+            );
+        }
+    };
+
+    Ok(HttpRequest {
+        method,
+        target,
+        headers,
+        body,
+    })
+}
+
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+
+    loop {
+        let size_line = read_line_limited(reader, MAX_CHUNK_LINE_BYTES, "HTTP chunk size")?;
+        if size_line.is_empty() {
+            return Err("unexpected EOF before HTTP chunk size".to_string());
+        }
+        let size_text = std::str::from_utf8(&size_line)
+            .map_err(|_| "HTTP chunk size is not UTF-8".to_string())?
+            .trim_end_matches(['\r', '\n']);
+        let size_hex = size_text
+            .split_once(';')
+            .map_or(size_text, |(size, _extensions)| size)
+            .trim();
+        if size_hex.is_empty() {
+            return Err("empty HTTP chunk size".to_string());
+        }
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| "invalid HTTP chunk size".to_string())?;
+
+        if size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer =
+                    read_line_limited(reader, MAX_HEADER_LINE_BYTES, "HTTP chunk trailer")?;
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    return Ok(body);
+                }
+                if trailer.is_empty() {
+                    return Err("unexpected EOF inside HTTP chunk trailers".to_string());
+                }
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer.len())
+                    .ok_or_else(|| "HTTP trailer size overflow".to_string())?;
+                if trailer_bytes > MAX_TRAILER_BYTES {
+                    return Err(format!(
+                        "HTTP chunk trailers exceed {MAX_TRAILER_BYTES} bytes"
+                    ));
+                }
+                let trailer = std::str::from_utf8(&trailer)
+                    .map_err(|_| "HTTP chunk trailer is not UTF-8".to_string())?;
+                if !trailer.contains(':') {
+                    return Err("malformed HTTP chunk trailer".to_string());
+                }
+            }
+        }
+
+        let new_len = body
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| "HTTP chunked body length overflow".to_string())?;
+        if new_len > MAX_BODY_BYTES {
+            return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+        }
+
+        let start = body.len();
+        body.resize(new_len, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(|e| format!("read HTTP chunk body: {e}"))?;
+
+        let mut terminator = [0u8; 2];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|e| format!("read HTTP chunk terminator: {e}"))?;
+        if terminator != *b"\r\n" {
+            return Err("HTTP chunk is not terminated by CRLF".to_string());
+        }
+    }
+}
+
+
+fn dashboard_auth_scope(payload: &DashboardOverviewRequest, config: &ApiConfig) -> AuthScope {
+    if !payload.api_token.is_empty() {
+        if config
+            .read_write_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.api_token))
+        {
+            return AuthScope::ReadWrite;
+        }
+        if config
+            .read_only_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.api_token))
+        {
+            return AuthScope::ReadOnly;
+        }
+        return AuthScope::None;
+    }
+
+    if payload.viewer_username == config.viewer_username {
+        if config
+            .viewer_password
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, &payload.viewer_password))
+        {
+            return AuthScope::ReadOnly;
+        }
+
+    }
+
+    AuthScope::None
+}
+
+fn dashboard_auth_status(config: &ApiConfig) -> HttpResponse {
+    json_response(200, json!({
+        "dashboard_auth_version": 3,
+        "viewer_username": config.viewer_username.clone(),
+        "viewer_password_configured": config.viewer_password.is_some(),
+        "read_only_token_configured": config.read_only_token.is_some(),
+        "read_write_token_configured": config.read_write_token.is_some()
+    }))
+}
+
+fn route_http(
+    request: HttpRequest,
+    catalog: &GraphCatalog,
+    config: &ApiConfig,
+) -> HttpResponse {
+    if let Some(response) = crate::mcp::route_http(&request, catalog, config) {
+        return response;
+    }
+
+    if request.method == "GET" && request.target == "/healthz" {
+        return json_response(200, json!({
+            "ok": true,
+            "service": "falkordb-native-chatgpt-api",
+            "version": 1
+        }));
+    }
+
+    if config.tunnel_mode {
+        return error_response(404, "not_found", "Secure MCP Tunnel backend exposes only /mcp and /healthz");
+    }
+
+    let request_path = request
+        .target
+        .split_once('?')
+        .map_or(request.target.as_str(), |(path, _)| path);
+
+    if request.method == "GET" && request_path == "/dashboard/auth-status" {
+        return dashboard_auth_status(config);
+    }
+
+    if request.method == "POST" && request_path == "/dashboard/overview" {
+        let payload: DashboardOverviewRequest = match parse_json(&request.body) {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+        if dashboard_auth_scope(&payload, config) == AuthScope::None {
+            return error_response(
+                401,
+                "unauthorized",
+                "invalid dashboard credentials",
+            );
+        }
+        return overview_response(catalog);
+    }
+
+    if let Some(response) = crate::dashboard::route(&request) {
+        return response;
+    }
+
+    if let Some(response) = crate::browser::route(&request) {
+        return response;
+    }
+
+    if request.method == "GET"
+        && matches!(
+            request.target.as_str(),
+            "/openapi.json" | "/.well-known/openapi.json"
+        )
+    {
+        return json_response(200, openapi_document());
+    }
+
+    let scope = auth_scope(&request.headers, config);
+    if scope == AuthScope::None
+        && (config.read_write_token.is_some()
+            || config.read_only_token.is_some()
+            || config.viewer_password.is_some())
+    {
+        return error_response(401, "unauthorized", "valid Bearer token required");
+    }
+
+    match (request.method.as_str(), request.target.as_str()) {
+        ("GET", "/v1/capabilities") => json_response(200, json!({
+            "api_version": 1,
+            "database": "FalkorDB native standalone",
+            "operations": [
+                "list_graphs",
+                "overview",
+                "query",
+                "batch_query",
+                "delete_graph"
+            ],
+            "max_batch_queries": MAX_BATCH_QUERIES,
+            "max_body_bytes": MAX_BODY_BYTES
+        })),
+        ("GET", "/v1/graphs") => {
+            json_response(200, json!({"graphs": catalog.list()}))
+        }
+        ("GET", "/v1/overview") => overview_response(catalog),
+        ("POST", "/v1/query") => {
+            let payload: QueryRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            run_query(payload, catalog, scope)
+        }
+        ("POST", "/v1/batch") => {
+            let payload: BatchRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            if payload.queries.len() > MAX_BATCH_QUERIES {
+                return error_response(
+                    400,
+                    "batch_too_large",
+                    &format!("at most {MAX_BATCH_QUERIES} queries are allowed per batch"),
+                );
+            }
+
+            let mut results = Vec::with_capacity(payload.queries.len());
+            for query in payload.queries {
+                let response = run_query(query, catalog, scope);
+                let body: JsonValue = serde_json::from_slice(&response.body)
+                    .unwrap_or_else(|_| json!({"error": "invalid_internal_json"}));
+                results.push(json!({
+                    "status": response.status,
+                    "body": body
+                }));
+            }
+            json_response(200, json!({"results": results}))
+        }
+        ("POST", "/v1/graphs/delete") => {
+            if scope != AuthScope::ReadWrite {
+                return error_response(403, "read_only_token", "write scope required");
+            }
+            let payload: DeleteGraphRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            match catalog.delete(&payload.graph) {
+                Ok(removed) => json_response(200, json!({
+                    "graph": payload.graph,
+                    "deleted": removed
+                })),
+                Err(err) => error_response(409, "graph_delete_failed", &err),
+            }
+        }
+        _ => error_response(404, "not_found", "unknown API route"),
+    }
+}
+
+fn redact_query_for_dashboard(query: &str) -> String {
+    let trimmed = query.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    let query_only = if upper.starts_with("CYPHER ") {
+        [
+            " MATCH ", " RETURN ", " CREATE ", " MERGE ", " CALL ", " WITH ",
+            " UNWIND ", " DELETE ", " SET ", " REMOVE ", " OPTIONAL ",
+        ]
+        .into_iter()
+        .filter_map(|keyword| upper.find(keyword))
+        .min()
+        .map_or("[CYPHER parameters redacted]", |index| &trimmed[index..])
+    } else {
+        trimmed
+    };
+
+    // Dashboard monitoring should reveal query shape, not transient string
+    // values that may contain credentials, file paths, personal data, or other
+    // client-side secrets. Replace quoted literal contents while preserving
+    // the surrounding Cypher structure.
+    let mut out = String::with_capacity(query_only.len());
+    let mut chars = query_only.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' && ch != '"' {
+            out.push(ch);
+            continue;
+        }
+
+        let quote = ch;
+        out.push(quote);
+        out.push('…');
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if next == '\\' {
+                escaped = true;
+                continue;
+            }
+            if next == quote {
+                out.push(quote);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn overview_response(catalog: &GraphCatalog) -> HttpResponse {
+    const MEMORY_SAMPLES: usize = 50;
+    const QUERY_PREVIEW_CHARS: usize = 4096;
+
+    let stats = match catalog.database_stats(None, true, MEMORY_SAMPLES) {
+        Ok(stats) => stats,
+        Err(err) => return error_response(500, "database_stats_failed", &err),
+    };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let query_json = |id: u64,
+                      received_at: i64,
+                      graph: String,
+                      query: String,
+                      elapsed_ms: u128| {
+        let redacted = redact_query_for_dashboard(&query);
+        let mut preview = redacted
+            .chars()
+            .take(QUERY_PREVIEW_CHARS)
+            .collect::<String>();
+        let truncated = redacted.chars().count() > QUERY_PREVIEW_CHARS;
+        if truncated {
+            preview.push('…');
+        }
+        json!({
+            "id": id,
+            "received_at": received_at,
+            "graph": graph,
+            "query": preview,
+            "query_redacted": true,
+            "query_truncated": truncated,
+            "elapsed_ms": u64::try_from(elapsed_ms).unwrap_or(u64::MAX)
+        })
+    };
+
+    let running = crate::query_scheduler::snapshot_running()
+        .into_iter()
+        .map(|entry| {
+            query_json(
+                entry.id,
+                entry.received_at,
+                entry.graph_name,
+                entry.query,
+                entry.start.elapsed().as_millis(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let waiting = crate::query_scheduler::snapshot_waiting()
+        .into_iter()
+        .map(|entry| {
+            query_json(
+                entry.id,
+                entry.received_at,
+                entry.graph_name,
+                entry.query,
+                entry.enqueued.elapsed().as_millis(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut slow_queries = Vec::new();
+    for graph_stats in &stats.graphs {
+        let Some(graph) = catalog.get(&graph_stats.graph) else {
+            continue;
+        };
+        for entry in graph.slowlog_entries() {
+            slow_queries.push((
+                entry.timestamp,
+                entry.latency_ms,
+                json!({
+                    "graph": graph_stats.graph,
+                    "timestamp": entry.timestamp,
+                    "command": entry.command,
+                    "query": redact_query_for_dashboard(&entry.query),
+                    "query_redacted": true,
+                    "latency_ms": entry.latency_ms
+                }),
+            ));
+        }
+    }
+    slow_queries.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| b.1.total_cmp(&a.1))
+    });
+    let slow_queries = slow_queries
+        .into_iter()
+        .take(30)
+        .map(|(_, _, value)| value)
+        .collect::<Vec<_>>();
+
+    let graphs = stats
+        .graphs
+        .into_iter()
+        .map(|graph| {
+            json!({
+                "graph": graph.graph,
+                "nodes": graph.nodes,
+                "relationships": graph.relationships,
+                "graph_version": graph.graph_version,
+                "schema_version": graph.schema_version,
+                "labels": graph.labels,
+                "relationship_types": graph.relationship_types,
+                "property_keys": graph.property_keys,
+                "index_definitions": graph.index_definitions,
+                "constraints": graph.constraints,
+                "wal_bytes": graph.wal_bytes,
+                "checkpoint_bytes": graph.checkpoint_bytes,
+                "checkpoint_count": graph.checkpoint_count,
+                "latest_checkpoint_sequence": graph.latest_checkpoint_sequence,
+                "latest_checkpoint_bytes": graph.latest_checkpoint_bytes,
+                "persistent_bytes": graph.persistent_bytes,
+                "estimated_memory_bytes": graph.estimated_memory_bytes
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json_response(200, json!({
+        "generated_at_ms": now_ms,
+        "server": {
+            "host_version": env!("CARGO_PKG_VERSION"),
+            "api_version": 1,
+            "mcp_toolset_version": crate::mcp::TOOLSET_VERSION,
+            "available_parallelism": std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+        },
+        "database": {
+            "memory_samples": MEMORY_SAMPLES,
+            "total_storage_bytes": stats.total_storage_bytes,
+            "graphs_storage_bytes": stats.graphs_storage_bytes,
+            "attributed_graph_bytes": stats.attributed_graph_bytes,
+            "unattributed_graph_storage_bytes": stats.unattributed_graph_storage_bytes,
+            "imports_storage_bytes": stats.imports_storage_bytes,
+            "imports_inside_data_dir": stats.imports_inside_data_dir,
+            "other_storage_bytes": stats.other_storage_bytes,
+            "graphs": graphs
+        },
+        "queries": {
+            "running": running,
+            "waiting": waiting,
+            "slow": slow_queries
+        }
+    }))
+}
+
+fn auth_scope(headers: &HashMap<String, String>, config: &ApiConfig) -> AuthScope {
+    if config.read_write_token.is_none()
+        && config.read_only_token.is_none()
+        && config.viewer_password.is_none()
+    {
+        return AuthScope::ReadWrite;
+    }
+
+    // The built-in dashboard uses a dedicated same-origin header so it remains
+    // usable behind reverse proxies/security layers that strip or special-case
+    // the standard Authorization header. Ordinary API/MCP clients continue to
+    // use Authorization as before.
+    let Some(header) = headers
+        .get("x-falkordb-dashboard-authorization")
+        .or_else(|| headers.get("authorization"))
+    else {
+        return AuthScope::None;
+    };
+
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        if config
+            .read_write_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, token))
+        {
+            return AuthScope::ReadWrite;
+        }
+        if config
+            .read_only_token
+            .as_ref()
+            .is_some_and(|expected| constant_time_eq(expected, token))
+        {
+            return AuthScope::ReadOnly;
+        }
+        return AuthScope::None;
+    }
+
+    if let Some(encoded) = header.strip_prefix("Basic ") {
+        let Ok(decoded) = STANDARD.decode(encoded) else {
+            return AuthScope::None;
+        };
+        let Ok(decoded) = std::str::from_utf8(&decoded) else {
+            return AuthScope::None;
+        };
+        let Some((username, password)) = decoded.split_once(':') else {
+            return AuthScope::None;
+        };
+        if username == config.viewer_username
+            && config
+                .viewer_password
+                .as_ref()
+                .is_some_and(|expected| constant_time_eq(expected, password))
+        {
+            return AuthScope::ReadOnly;
+        }
+    }
+
+    AuthScope::None
+}
+
+pub(crate) fn constant_time_eq(expected: &str, candidate: &str) -> bool {
+    if expected.len() != candidate.len() {
+        return false;
+    }
+    bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
+}
+
+fn run_query(
+    request: QueryRequest,
+    catalog: &GraphCatalog,
+    scope: AuthScope,
+) -> HttpResponse {
+    if request.graph.trim().is_empty() {
+        return error_response(400, "invalid_graph", "graph name must not be empty");
+    }
+    if request.cypher.trim().is_empty() {
+        return error_response(400, "invalid_query", "Cypher query must not be empty");
+    }
+
+    // Authorize the caller's requested operation before graph lookup. A
+    // read-only credential must never be able to probe graph existence by
+    // submitting a write and observing 404 vs 403 behavior.
+    if !request.read_only && scope != AuthScope::ReadWrite {
+        return error_response(403, "read_only_token", "write scope required");
+    }
+    let read_only = request.read_only || scope == AuthScope::ReadOnly;
+
+    let graph = if read_only {
+        match catalog.get(&request.graph) {
+            Some(graph) => graph,
+            None => {
+                return error_response(
+                    404,
+                    "graph_not_found",
+                    "read-only query cannot create a missing graph",
+                );
+            }
+        }
+    } else {
+        match catalog.get_or_create(&request.graph) {
+            Ok(graph) => graph,
+            Err(err) => return error_response(500, "graph_open_failed", &err),
+        }
+    };
+
+    let result = if read_only {
+        graph.query_read_only(&request.cypher)
+    } else {
+        graph.query(&request.cypher)
+    };
+
+    match result {
+        Ok(output) => json_response(200, query_output_json(&request.graph, output)),
+        Err(err) => error_response(400, "cypher_error", &err),
+    }
+}
+
+pub(crate) fn query_output_json(graph: &str, output: QueryOutput) -> JsonValue {
+    let rows: Vec<Vec<JsonValue>> = output
+        .wire_rows
+        .iter()
+        .map(|row| row.iter().map(wire_value_json).collect())
+        .collect();
+
+    json!({
+        "graph": graph,
+        "columns": output.columns,
+        "rows": rows,
+        "stats": stats_json(&output.stats),
+        "graph_version": output.graph_version
+    })
+}
+
+fn stats_json(stats: &OutputStats) -> JsonValue {
+    json!({
+        "labels_added": stats.labels_added,
+        "labels_removed": stats.labels_removed,
+        "nodes_created": stats.nodes_created,
+        "relationships_created": stats.relationships_created,
+        "nodes_deleted": stats.nodes_deleted,
+        "relationships_deleted": stats.relationships_deleted,
+        "properties_set": stats.properties_set,
+        "properties_removed": stats.properties_removed,
+        "indexes_created": stats.indexes_created,
+        "indexes_dropped": stats.indexes_dropped,
+        "execution_time_ms": stats.execution_time_ms,
+        "cached": stats.cached
+    })
+}
+
+fn wire_value_json(value: &WireValue) -> JsonValue {
+    match value {
+        WireValue::Null => JsonValue::Null,
+        WireValue::Bool(v) => json!(v),
+        WireValue::Int(v) => json!(v),
+        WireValue::Float(v) => json!(v),
+        WireValue::String(v) => json!(v),
+        WireValue::List(values) => {
+            JsonValue::Array(values.iter().map(wire_value_json).collect())
+        }
+        WireValue::Map(values) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in values {
+                out.insert(key.clone(), wire_value_json(value));
+            }
+            JsonValue::Object(out)
+        }
+        WireValue::Node {
+            id,
+            labels,
+            properties,
+        } => json!({
+            "type": "node",
+            "id": id,
+            "label_ids": labels,
+            "properties": properties.iter().map(|(attribute_id, value)| {
+                json!({
+                    "attribute_id": attribute_id,
+                    "value": wire_value_json(value)
+                })
+            }).collect::<Vec<_>>()
+        }),
+        WireValue::Relationship {
+            id,
+            type_id,
+            src,
+            dst,
+            properties,
+        } => json!({
+            "type": "relationship",
+            "id": id,
+            "relationship_type_id": type_id,
+            "source_id": src,
+            "destination_id": dst,
+            "properties": properties.iter().map(|(attribute_id, value)| {
+                json!({
+                    "attribute_id": attribute_id,
+                    "value": wire_value_json(value)
+                })
+            }).collect::<Vec<_>>()
+        }),
+        WireValue::Path {
+            nodes,
+            relationships,
+        } => json!({
+            "type": "path",
+            "nodes": nodes.iter().map(wire_value_json).collect::<Vec<_>>(),
+            "relationships": relationships.iter().map(wire_value_json).collect::<Vec<_>>()
+        }),
+        WireValue::Point {
+            latitude,
+            longitude,
+        } => json!({
+            "type": "point",
+            "latitude": latitude,
+            "longitude": longitude
+        }),
+        WireValue::VecF32(values) => json!({
+            "type": "vector_f32",
+            "values": values
+        }),
+        WireValue::Datetime(v) => json!({"type": "datetime", "value": v}),
+        WireValue::Date(v) => json!({"type": "date", "value": v}),
+        WireValue::Time(v) => json!({"type": "time", "value": v}),
+        WireValue::Duration(v) => json!({"type": "duration", "value": v}),
+    }
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HttpResponse> {
+    serde_json::from_slice(body)
+        .map_err(|err| error_response(400, "invalid_json", &err.to_string()))
+}
+
+pub(crate) fn json_response(status: u16, value: JsonValue) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: serde_json::to_vec(&value).expect("JSON value must serialize"),
+        content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
+        auth_failure: false,
+    }
+}
+
+pub(crate) fn raw_response(
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> HttpResponse {
+    HttpResponse {
+        status,
+        body,
+        content_type,
+        headers: Vec::new(),
+        auth_failure: false,
+    }
+}
+
+fn error_response(status: u16, code: &str, message: &str) -> HttpResponse {
+    json_response(status, json!({
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }))
+}
+
+fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> std::io::Result<()> {
+    let reason = match response.status {
+        200 => "OK",
+        202 => "Accepted",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+
+    write!(
+        writer,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\nStrict-Transport-Security: max-age=31536000\r\n",
+        response.status,
+        reason,
+        response.content_type,
+        response.body.len()
+    )?;
+    for (name, value) in &response.headers {
+        write!(writer, "{}: {}\r\n", name, value)?;
+    }
+    write!(writer, "\r\n")?;
+    writer.write_all(&response.body)
+}
+
+fn openapi_document() -> JsonValue {
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "ReversalGraph Native API",
+            "version": "1.0.0",
+            "description": "Authenticated HTTPS access to the native FalkorDB-derived reversal graph."
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer"
+                }
+            },
+            "schemas": {
+                "QueryRequest": {
+                    "type": "object",
+                    "required": ["graph", "cypher"],
+                    "properties": {
+                        "graph": {"type": "string"},
+                        "cypher": {"type": "string"},
+                        "read_only": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        },
+        "security": [{"bearerAuth": []}],
+        "paths": {
+            "/healthz": {
+                "get": {
+                    "operationId": "health",
+                    "security": [],
+                    "responses": {"200": {"description": "Service health"}}
+                }
+            },
+            "/v1/capabilities": {
+                "get": {
+                    "operationId": "getCapabilities",
+                    "responses": {"200": {"description": "API capabilities"}}
+                }
+            },
+            "/v1/graphs": {
+                "get": {
+                    "operationId": "listGraphs",
+                    "responses": {"200": {"description": "List persistent graphs"}}
+                }
+            },
+            "/v1/overview": {
+                "get": {
+                    "operationId": "getOperationsOverview",
+                    "description": "Read-only operational overview for the built-in dashboard.",
+                    "responses": {
+                        "200": {"description": "Storage, graph cardinality, memory, and live query activity"}
+                    }
+                }
+            },
+            "/v1/query": {
+                "post": {
+                    "operationId": "queryGraph",
+                    "description": "Execute Cypher. Set read_only=true for read-only execution.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/QueryRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Cypher result"},
+                        "400": {"description": "Query or JSON error"},
+                        "403": {"description": "Write attempted with read-only credential"}
+                    }
+                }
+            },
+            "/v1/batch": {
+                "post": {
+                    "operationId": "batchQueryGraph",
+                    "description": "Execute up to 100 Cypher requests sequentially.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["queries"],
+                                    "properties": {
+                                        "queries": {
+                                            "type": "array",
+                                            "maxItems": MAX_BATCH_QUERIES,
+                                            "items": {"$ref": "#/components/schemas/QueryRequest"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "Per-query results"}}
+                }
+            },
+            "/v1/graphs/delete": {
+                "post": {
+                    "operationId": "deleteGraph",
+                    "description": "Delete a graph and its WAL. Requires write scope.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["graph"],
+                                    "properties": {"graph": {"type": "string"}}
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "Deletion result"}}
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_parser_rejects_duplicate_content_length() {
+        let raw = concat!(
+            "POST /oauth/token HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Length: 4\r\n",
+            "Content-Length: 4\r\n",
+            "\r\n",
+            "test"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("duplicate Content-Length must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("duplicate security-sensitive HTTP header"));
+    }
+
+    #[test]
+    fn http_parser_rejects_oversized_request_line_before_body_allocation() {
+        let target = format!("/{}", "a".repeat(MAX_REQUEST_LINE_BYTES));
+        let raw = format!("GET {target} HTTP/1.1\r\nHost: db.example.test\r\n\r\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("oversized request line must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("HTTP request line exceeds"));
+    }
+
+    #[test]
+    fn http_parser_requires_host_for_http_11() {
+        let raw = b"GET /healthz HTTP/1.1\r\n\r\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("HTTP/1.1 without Host must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("missing Host"));
+    }
+
+    #[test]
+    fn http_parser_accepts_chunked_form_post() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "7\r\n",
+            "owner_s\r\n",
+            "9\r\n",
+            "ecret=abc\r\n",
+            "3\r\n",
+            "123\r\n",
+            "0\r\n",
+            "X-Proxy-Trailer: ok\r\n",
+            "\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let request = read_http_request(&mut reader).expect("chunked request should parse");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/oauth/authorize");
+        assert_eq!(request.body, b"owner_secret=abc123");
+    }
+
+    #[test]
+    fn http_parser_rejects_ambiguous_content_length_and_chunked() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Content-Length: 4\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "4\r\n",
+            "test\r\n",
+            "0\r\n\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("ambiguous framing must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("both Transfer-Encoding and Content-Length"));
+    }
+
+    #[test]
+    fn http_parser_rejects_unsupported_transfer_codings() {
+        let raw = concat!(
+            "POST /oauth/authorize HTTP/1.1\r\n",
+            "Host: db.example.test\r\n",
+            "Transfer-Encoding: gzip\r\n",
+            "\r\n"
+        );
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.as_bytes()));
+        let err = match read_http_request(&mut reader) {
+            Ok(_) => panic!("unsupported coding must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unsupported Transfer-Encoding"));
+    }
+
+    #[test]
+    fn remote_api_requires_tls_by_default() {
+        let config = ApiConfig {
+            bind: "0.0.0.0:8443".parse().unwrap(),
+            read_write_token: Some("secret".to_string()),
+            ..ApiConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn remote_auth_failures_are_throttled_but_loopback_is_not() {
+        let throttle = AuthThrottle::default();
+        let remote: IpAddr = "203.0.113.7".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        for _ in 0..MAX_AUTH_FAILURES_PER_REMOTE_IP {
+            throttle.record_failure(remote);
+            throttle.record_failure(loopback);
+        }
+
+        assert!(throttle.is_blocked(remote));
+        assert!(!throttle.is_blocked(loopback));
+    }
+
+    #[test]
+    fn dashboard_query_redaction_hides_literals_and_cypher_params() {
+        let redacted = redact_query_for_dashboard(
+            "CYPHER token='secret' MATCH (n:User {name:'Alice'}) RETURN n"
+        );
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("Alice"));
+        assert!(!redacted.contains("token="));
+        assert!(redacted.contains("MATCH"));
+        assert!(redacted.contains("name:'…'"));
+
+        let escaped = redact_query_for_dashboard(
+            "RETURN 'a\\'b', \"private\""
+        );
+        assert!(!escaped.contains("private"));
+        assert!(escaped.contains("'…'"));
+        assert!(escaped.contains("\"…\""));
+    }
+
+    #[test]
+    fn openapi_exposes_dashboard_overview() {
+        let spec = openapi_document();
+        assert_eq!(
+            spec["paths"]["/v1/overview"]["get"]["operationId"],
+            "getOperationsOverview"
+        );
+    }
+
+    #[test]
+    fn viewer_only_config_requires_authentication() {
+        let config = ApiConfig {
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ApiConfig::default()
+        };
+        let headers = HashMap::new();
+        assert!(auth_scope(&headers, &config) == AuthScope::None);
+        assert!(
+            config.read_write_token.is_some()
+                || config.read_only_token.is_some()
+                || config.viewer_password.is_some()
+        );
+    }
+
+    #[test]
+    fn viewer_basic_auth_is_read_only() {
+        let config = ApiConfig {
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            ..ApiConfig::default()
+        };
+
+        let encoded = STANDARD.encode("viewer:viewer-secret");
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), format!("Basic {encoded}"));
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+
+        headers.clear();
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            format!("Basic {encoded}"),
+        );
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+
+        let wrong = STANDARD.encode("viewer:wrong-secret");
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            format!("Basic {wrong}"),
+        );
+        assert!(auth_scope(&headers, &config) == AuthScope::None);
+    }
+
+    #[test]
+    fn bearer_token_scope_is_constant_time_checked() {
+        let config = ApiConfig {
+            read_write_token: Some("write-secret".to_string()),
+            read_only_token: Some("read-secret".to_string()),
+            ..ApiConfig::default()
+        };
+
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer read-secret".to_string());
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+
+        headers.insert("authorization".to_string(), "Bearer write-secret".to_string());
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadWrite);
+
+        headers.clear();
+        headers.insert(
+            "x-falkordb-dashboard-authorization".to_string(),
+            "Bearer read-secret".to_string(),
+        );
+        assert!(auth_scope(&headers, &config) == AuthScope::ReadOnly);
+    }
+
+    #[test]
+    fn dashboard_body_auth_accepts_viewer_and_tokens() {
+        let config = ApiConfig {
+            viewer_username: "viewer".to_string(),
+            viewer_password: Some("viewer-secret".to_string()),
+            read_write_token: Some("write-secret".to_string()),
+            read_only_token: Some("read-secret".to_string()),
+            ..ApiConfig::default()
+        };
+
+        let viewer = DashboardOverviewRequest {
+            viewer_username: "viewer".to_string(),
+            viewer_password: "viewer-secret".to_string(),
+            api_token: String::new(),
+        };
+        assert!(dashboard_auth_scope(&viewer, &config) == AuthScope::ReadOnly);
+
+        let read_token = DashboardOverviewRequest {
+            viewer_username: String::new(),
+            viewer_password: String::new(),
+            api_token: "read-secret".to_string(),
+        };
+        assert!(dashboard_auth_scope(&read_token, &config) == AuthScope::ReadOnly);
+
+        let write_token = DashboardOverviewRequest {
+            viewer_username: String::new(),
+            viewer_password: String::new(),
+            api_token: "write-secret".to_string(),
+        };
+        assert!(dashboard_auth_scope(&write_token, &config) == AuthScope::ReadWrite);
+
+        let wrong = DashboardOverviewRequest {
+            viewer_username: "viewer".to_string(),
+            viewer_password: "wrong".to_string(),
+            api_token: String::new(),
+        };
+        assert!(dashboard_auth_scope(&wrong, &config) == AuthScope::None);
+
+    }
+}

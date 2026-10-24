@@ -1,0 +1,223 @@
+name: FalkorDB native Windows CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      # Build branch in the public lizardpeter/win-dv-fix repo, where Actions
+      # minutes are free: pushing this tree there builds and tests server.exe.
+      - windows-build
+    paths:
+      - 'native_host/**'
+      - 'engine/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements-migration.txt'
+      - '.github/workflows/falkordb-native-win-ci.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'native_host/**'
+      - 'engine/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements-migration.txt'
+      - '.github/workflows/falkordb-native-win-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: falkordb-native-win-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream-falkordb-dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FalkorDB clients
+        run: python -m pip install --disable-pip-version-check falkordb==1.7.1 redis==8.1.0
+
+      - name: Generate DUMP with official FalkorDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name upstream-falkordb -p 6379:6379 falkordb/falkordb-server@sha256:b97408d48ab698be5725cd73153a76aeb96cd50d7073bad01a66b95c976e9283
+          trap 'docker logs upstream-falkordb || true; docker rm -f upstream-falkordb || true' EXIT
+          python - <<'PY'
+          import time
+          from redis import Redis
+          client = Redis(host="127.0.0.1", port=6379, socket_connect_timeout=1)
+          for _ in range(120):
+              try:
+                  if client.ping():
+                      break
+              except Exception:
+                  pass
+              time.sleep(0.25)
+          else:
+              raise SystemExit("official FalkorDB container did not become ready")
+          PY
+          python tests/upstream_dump_fixture.py generate \
+            --host 127.0.0.1 \
+            --port 6379 \
+            --output build/upstream-fixture/upstream-real.dump
+          python - <<'PY'
+          from redis import Redis
+          client = Redis(host="127.0.0.1", port=6379)
+          # Force this small fixture through FalkorDB's real multi-key RDB
+          # persistence path. DUMP remains single-key, but SAVE will create
+          # graphmeta virtual keys and split node/edge payloads.
+          reply = client.execute_command(
+              "GRAPH.CONFIG", "SET", "VKEY_MAX_ENTITY_COUNT", "2"
+          )
+          print("VKEY config reply:", reply)
+          assert client.save() is True
+          print("UPSTREAM_FALKORDB_RDB_SAVE_PASS")
+          PY
+          RDB_PATH="$(docker exec upstream-falkordb sh -lc 'find /var/lib/falkordb /data -name dump.rdb -type f 2>/dev/null | head -n 1')"
+          test -n "$RDB_PATH"
+          docker cp "upstream-falkordb:$RDB_PATH" build/upstream-fixture/upstream-real.rdb
+          test -s build/upstream-fixture/upstream-real.rdb
+          ls -lh build/upstream-fixture/upstream-real.rdb
+
+      - name: Upload upstream FalkorDB DUMP
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: upstream-falkordb-v4.20.6-dump
+          path: |
+            build/upstream-fixture/upstream-real.dump
+            build/upstream-fixture/upstream-real.dump.json
+            build/upstream-fixture/upstream-real.rdb
+          if-no-files-found: error
+
+  windows-native:
+    needs: upstream-falkordb-dump
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Download upstream FalkorDB DUMP
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-falkordb-v4.20.6-dump
+          path: build/upstream-fixture
+
+      - name: Install Rust MSVC
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          git --version
+          cmake --version
+          python --version
+          rustc -Vv
+          cargo -V
+          Get-Command cl.exe -ErrorAction SilentlyContinue
+          Get-Command link.exe -ErrorAction SilentlyContinue
+
+      - name: Restore Rust build cache
+        id: rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/cargo-target
+          key: falkordb-native-rust-v3-${{ runner.os }}-${{ hashFiles('native_host/Cargo.toml', 'native_host/Cargo.lock', 'engine/graph/Cargo.toml', 'engine/graph/build.rs') }}
+
+      - name: Audit resolved Rust dependencies
+        shell: pwsh
+        run: |
+          # Audit exactly what is built: the committed lockfile, not a fresh
+          # resolution.
+          cargo metadata --manifest-path '.\native_host\Cargo.toml' --locked --format-version 1 > $null
+          if ($LASTEXITCODE -ne 0) { throw "native_host/Cargo.lock is missing or out of date" }
+          cargo install cargo-audit --version 0.22.2 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-audit installation failed" }
+          Push-Location '.\native_host'
+          try {
+            cargo audit
+            if ($LASTEXITCODE -ne 0) { throw "RustSec dependency audit failed" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Install official FalkorDB Python client
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check falkordb==1.7.1 redis==8.1.0 trustme==1.2.1
+
+      - name: Compile, link, and run smoke test
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\scripts\diagnose.ps1'
+
+      - name: Run performance regression smoke
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\scripts\perf_smoke.ps1' -WorkDir '.\build\logs\perf-smoke'
+
+      - name: Build deployable Windows package
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass
+          & '.\scripts\package_windows.ps1'
+
+      - name: Upload deployable Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: falkordb-native-windows-x64
+          path: build/package/falkordb-native-windows-x64/server.exe
+          if-no-files-found: error
+
+      - name: Upload optional Windows migration tools
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: falkordb-native-windows-x64-tools
+          path: build/package/falkordb-native-windows-x64-tools.zip
+          if-no-files-found: error
+
+      - name: Save Rust build cache
+        if: success() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/cargo-target
+          key: falkordb-native-rust-v3-${{ runner.os }}-${{ hashFiles('native_host/Cargo.toml', 'native_host/Cargo.lock', 'engine/graph/Cargo.toml', 'engine/graph/build.rs') }}
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: falkordb-native-windows-diagnostics
+          path: build/logs
+          if-no-files-found: ignore

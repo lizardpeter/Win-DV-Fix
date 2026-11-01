@@ -142,6 +142,22 @@ if (($HostRegressionOutput -join "`n") -notmatch "all host regression cases pass
     throw "host_regression did not report all cases passed"
 }
 
+Write-Host "=== Stage 6e: all-or-nothing transactions (atomic /v1/batch) ==="
+cargo build --manifest-path $HostManifest --bin transaction_smoke --release 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07d_transaction_smoke_build.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "transaction_smoke build failed with exit code $LASTEXITCODE"
+}
+$TransactionSmokeExe = Join-Path $env:CARGO_TARGET_DIR "release\transaction_smoke.exe"
+$TransactionSmokeOutput = & $TransactionSmokeExe 2>&1 |
+    Tee-Object -FilePath (Join-Path $Logs "07d_transaction_smoke_run.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "transaction_smoke failed with exit code $LASTEXITCODE"
+}
+if (($TransactionSmokeOutput -join "`n") -notmatch "transaction smoke: ok") {
+    throw "transaction_smoke did not report ok"
+}
+
 Write-Host ""
 Write-Host "NATIVE_WINDOWS_FULL_STANDALONE_PASS"
 Write-Host "Logs: $Logs"

@@ -1205,6 +1205,144 @@ impl NativeGraph {
     }
 }
 
+impl NativeGraph {
+    /// Run several Cypher statements as ONE all-or-nothing write: every statement runs against the same private MVCC version,
+    /// later statements see what earlier ones wrote, and the version is published (and made durable as one WAL payload) only if
+    /// every statement succeeds. On any error nothing is published and the index of the failing statement is returned.
+    ///
+    /// Index and constraint DDL are refused inside a transaction: the engine publishes index documents outside the MVCC
+    /// version, so they could not be rolled back with it.
+    pub fn transaction(&self, cyphers: &[String]) -> Result<Vec<QueryOutput>, (usize, String)> {
+        if cyphers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut breadcrumb = diagnostics::start_query(&self.name, "<transaction>", "TXN");
+        let timeout_ms = native_config::effective_timeout(None, true).map_err(|e| (0, e))?;
+        let _permit = QueryPermit::acquire(&self.name, "<transaction>", QueryMode::Write).map_err(|e| (0, e))?;
+        let mut failed_at = 0usize;
+        let result = {
+            let mut host_guard = self.inner.write();
+            release_claim_on_error(&mut host_guard, |host_guard| {
+                self.transaction_locked(host_guard, cyphers, timeout_ms, &mut failed_at)
+            })
+        };
+        breadcrumb.complete(result.is_ok());
+        result.map_err(|e| (failed_at, e))
+    }
+
+    fn transaction_locked(
+        &self,
+        host_guard: &mut MvccGraph,
+        cyphers: &[String],
+        timeout_ms: Option<u64>,
+        failed_at: &mut usize,
+    ) -> Result<Vec<QueryOutput>, String> {
+        let private = host_guard
+            .write()
+            .ok_or_else(|| "native host: another MVCC write is in progress".to_string())?;
+        let escalation = PrelockedWriteEscalation::new(&self.index_publication);
+        let mut effects: Option<EffectsBuffer> = None;
+        let mut outputs = Vec::with_capacity(cyphers.len());
+        let mut modified_any = false;
+        let mut last: Option<Runtime<'_>> = None;
+
+        // Undo everything: the private version is discarded, and any index documents already published by an escalated
+        // statement are resynchronised to the committed graph.
+        let abort = |host_guard: &mut MvccGraph, last: &Option<Runtime<'_>>, err: String| -> Result<Vec<QueryOutput>, String> {
+            if escalation.crossed()
+                && let Some(rt) = last
+            {
+                let committed = host_guard.read();
+                rt.resync_published_indexes(&committed);
+            }
+            host_guard.rollback();
+            Err(err)
+        };
+
+        for (i, cypher) in cyphers.iter().enumerate() {
+            *failed_at = i;
+            let planned = {
+                let g = private.borrow();
+                g.get_plan(cypher)
+            };
+            let planned = match planned {
+                Ok(p) => p,
+                Err(err) => return abort(host_guard, &last, err),
+            };
+            if planned
+                .plan
+                .iter()
+                .any(|n| matches!(n, IR::CreateIndex { .. } | IR::DropIndex { .. }))
+            {
+                return abort(host_guard, &last, "index DDL is not allowed inside a transaction".to_string());
+            }
+            let is_write = plan_is_write(&planned);
+            let Plan { plan, cached, parameters, .. } = planned;
+            let runtime = Runtime::new(
+                Arc::clone(&private),
+                parameters,
+                is_write,
+                plan,
+                false,
+                native_config::runtime_config().import_folder,
+                native_config::runtime_config().result_set_size,
+                false,
+                timeout_ms,
+                native_config::runtime_config().query_mem_capacity,
+                None,
+                &escalation,
+            );
+            runtime.build_effects.set(self.wal.is_some());
+            // one effects payload for the whole transaction: replayed from the WAL as one unit
+            if let Some(buf) = effects.take() {
+                *runtime.effects_buffer.borrow_mut() = Some(buf);
+            }
+            // one index undo log for the whole transaction: a failure in this statement resyncs every index document the
+            // earlier statements published (they live outside the MVCC version)
+            if let Some(prev) = &last {
+                runtime.carry_published_from(prev);
+            }
+            let mut result = match runtime.query() {
+                Ok(result) => result,
+                Err(err) => {
+                    last = Some(runtime);
+                    return abort(host_guard, &last, err);
+                }
+            };
+            result.stats.cached = cached;
+            modified_any |= query_modified(&runtime, &result.stats);
+            let output = capture_output(&runtime, &result);
+            drop(result);
+            effects = runtime.effects_buffer.borrow_mut().take();
+            last = Some(runtime);
+            match output {
+                Ok(o) => outputs.push(o),
+                Err(err) => return abort(host_guard, &last, err),
+            }
+        }
+        *failed_at = cyphers.len();
+
+        if escalation.crossed() {
+            if modified_any
+                && let Some(wal) = &self.wal
+            {
+                let Some(buf) = effects.take() else {
+                    // nothing reached the effects stream: the data is unchanged, so publish nothing
+                    let _ = abort(host_guard, &last, String::new());
+                    return Ok(outputs);
+                };
+                if let Err(err) = wal.append_effects(buf, self.name.as_bytes()) {
+                    return abort(host_guard, &last, err);
+                }
+            }
+            host_guard.commit(Arc::clone(&private));
+        } else {
+            host_guard.rollback();
+        }
+        Ok(outputs)
+    }
+}
+
 
 fn format_profile(runtime: &Runtime<'_>) -> Vec<String> {
     let plan = &runtime.plan;

@@ -1646,6 +1646,16 @@ impl Pending {
         g.commit_edge_index_locked(&edge_guard, &mut edge_adds, &mut edge_removes);
     }
 
+    /// Take over every index document another query published (a host transaction runs several queries on one private
+    /// version): a later failure in this query then undoes the whole transaction's index documents, not only its own.
+    pub fn absorb_published_from(
+        &mut self,
+        other: &mut Pending,
+    ) {
+        let theirs = std::mem::take(&mut other.published);
+        self.published.merge(&theirs);
+    }
+
     /// Write this `Commit`'s index documents to RediSearch. Writer mode only.
     pub fn commit_deferred_indexes(
         &mut self,

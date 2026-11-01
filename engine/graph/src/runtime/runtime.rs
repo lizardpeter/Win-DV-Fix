@@ -516,6 +516,16 @@ impl<'a> Runtime<'a> {
             .resync_published_indexes(committed, &self.g);
     }
 
+    /// Carry the index documents `earlier` published into this runtime's undo log (see
+    /// [`Pending::absorb_published_from`]): used when several queries form one transaction.
+    pub fn carry_published_from(
+        &self,
+        earlier: &Runtime<'_>,
+    ) {
+        let mut theirs = earlier.pending.borrow_mut();
+        self.pending.borrow_mut().absorb_published_from(&mut theirs);
+    }
+
     /// Write this `Commit`'s index documents to RediSearch. Writer mode only.
     pub fn commit_deferred_indexes(&self) {
         self.pending.borrow_mut().commit_deferred_indexes(&self.g);

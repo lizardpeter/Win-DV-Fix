@@ -227,6 +227,9 @@ struct QueryRequest {
 #[derive(Debug, Deserialize)]
 struct BatchRequest {
     queries: Vec<QueryRequest>,
+    /// all queries target one graph and run as ONE all-or-nothing write (`NativeGraph::transaction`)
+    #[serde(default)]
+    atomic: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -758,8 +761,10 @@ fn route_http(
                 "overview",
                 "query",
                 "batch_query",
+                "atomic_batch",
                 "delete_graph"
             ],
+            "atomic_batch": true,
             "max_batch_queries": MAX_BATCH_QUERIES,
             "max_body_bytes": MAX_BODY_BYTES
         })),
@@ -787,6 +792,9 @@ fn route_http(
                 );
             }
 
+            if payload.atomic {
+                return run_atomic_batch(payload.queries, catalog, scope);
+            }
             let mut results = Vec::with_capacity(payload.queries.len());
             for query in payload.queries {
                 let response = run_query(query, catalog, scope);
@@ -1083,6 +1091,53 @@ pub(crate) fn constant_time_eq(expected: &str, candidate: &str) -> bool {
         return false;
     }
     bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
+}
+
+/// `POST /v1/batch` with `"atomic": true`: every query runs in one transaction on one graph. The response lists one result
+/// per query and `"committed"`: when false, nothing was written; the failing query has its error, the others say rolled back.
+fn run_atomic_batch(queries: Vec<QueryRequest>, catalog: &GraphCatalog, scope: AuthScope) -> HttpResponse {
+    if scope != AuthScope::ReadWrite {
+        return error_response(403, "read_only_token", "write scope required");
+    }
+    let Some(first) = queries.first() else {
+        return json_response(200, json!({"results": [], "atomic": true, "committed": true}));
+    };
+    let graph_name = first.graph.clone();
+    if graph_name.trim().is_empty() {
+        return error_response(400, "invalid_graph", "graph name must not be empty");
+    }
+    if queries.iter().any(|q| q.graph != graph_name) {
+        return error_response(400, "atomic_multi_graph", "an atomic batch must target exactly one graph");
+    }
+    if queries.iter().any(|q| q.cypher.trim().is_empty()) {
+        return error_response(400, "invalid_query", "Cypher query must not be empty");
+    }
+    let graph = match catalog.get_or_create(&graph_name) {
+        Ok(graph) => graph,
+        Err(err) => return error_response(500, "graph_open_failed", &err),
+    };
+    let cyphers: Vec<String> = queries.into_iter().map(|q| q.cypher).collect();
+    match graph.transaction(&cyphers) {
+        Ok(outputs) => {
+            let results: Vec<JsonValue> = outputs
+                .into_iter()
+                .map(|o| json!({"status": 200, "body": query_output_json(&graph_name, o)}))
+                .collect();
+            json_response(200, json!({"results": results, "atomic": true, "committed": true}))
+        }
+        Err((at, err)) => {
+            let results: Vec<JsonValue> = (0..cyphers.len())
+                .map(|i| {
+                    if i == at {
+                        json!({"status": 400, "body": {"error": {"code": "cypher_error", "message": err}}})
+                    } else {
+                        json!({"status": 409, "body": {"error": {"code": "rolled_back", "message": "the transaction was rolled back"}}})
+                    }
+                })
+                .collect();
+            json_response(200, json!({"results": results, "atomic": true, "committed": false, "failed_at": at}))
+        }
+    }
 }
 
 fn run_query(
@@ -1396,7 +1451,7 @@ fn openapi_document() -> JsonValue {
             "/v1/batch": {
                 "post": {
                     "operationId": "batchQueryGraph",
-                    "description": "Execute up to 100 Cypher requests sequentially.",
+                    "description": "Execute up to 100 Cypher requests sequentially. With atomic=true all requests must target one graph and run as one all-or-nothing transaction: the response's committed flag says whether anything was written.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -1409,7 +1464,8 @@ fn openapi_document() -> JsonValue {
                                             "type": "array",
                                             "maxItems": MAX_BATCH_QUERIES,
                                             "items": {"$ref": "#/components/schemas/QueryRequest"}
-                                        }
+                                        },
+                                        "atomic": {"type": "boolean", "default": false}
                                     }
                                 }
                             }

@@ -1195,7 +1195,7 @@ fn tools_list_result(modern: bool, tunnel_mode: bool) -> JsonValue {
         tool_definition(
             "batch_graph_queries",
             "Batch graph queries",
-            "Execute up to 100 Cypher operations sequentially. Each item can be read-only or read/write.",
+            "Execute up to 100 Cypher operations sequentially. Each item can be read-only or read/write. With atomic=true every item must target one graph: the batch runs as one all-or-nothing transaction (committed says whether anything was written), or, when every item is read_only, reads one consistent snapshot.",
             object_schema(
                 json!({
                     "queries": {
@@ -1212,7 +1212,8 @@ fn tools_list_result(modern: bool, tunnel_mode: bool) -> JsonValue {
                                 "read_only": {"type": "boolean", "default": false}
                             }
                         }
-                    }
+                    },
+                    "atomic": {"type": "boolean", "default": false}
                 }),
                 &["queries"],
             ),
@@ -1851,6 +1852,10 @@ fn run_batch(args: &JsonMap<String, JsonValue>, catalog: &GraphCatalog) -> Resul
         ));
     }
 
+    if args.get("atomic").and_then(JsonValue::as_bool).unwrap_or(false) {
+        return run_atomic_batch(queries, catalog);
+    }
+
     let mut results = Vec::with_capacity(queries.len());
     for item in queries {
         let object = item
@@ -1888,6 +1893,49 @@ fn run_batch(args: &JsonMap<String, JsonValue>, catalog: &GraphCatalog) -> Resul
         }
     }
     Ok(json!({"results": results}))
+}
+
+/// `batch_graph_queries` with atomic=true: one transaction (or, all read_only, one snapshot) on one graph.
+fn run_atomic_batch(queries: &[JsonValue], catalog: &GraphCatalog) -> Result<JsonValue, String> {
+    let mut graph_name: Option<&str> = None;
+    let mut cyphers = Vec::with_capacity(queries.len());
+    let mut all_read = true;
+    for item in queries {
+        let object = item.as_object().ok_or_else(|| "each query must be an object".to_string())?;
+        let g = required_string(object, "graph")?;
+        if graph_name.is_some_and(|n| n != g) {
+            return Err("an atomic batch must target exactly one graph".to_string());
+        }
+        graph_name = Some(g);
+        cyphers.push(required_string(object, "cypher")?.to_string());
+        all_read &= object.get("read_only").and_then(JsonValue::as_bool).unwrap_or(false);
+    }
+    let graph_name = graph_name.ok_or_else(|| "queries must contain at least one item".to_string())?;
+    let outcome = if all_read {
+        let graph = catalog.get(graph_name).ok_or_else(|| "graph does not exist".to_string())?;
+        graph.snapshot_read(&cyphers)
+    } else {
+        catalog.get_or_create(graph_name)?.transaction(&cyphers)
+    };
+    match outcome {
+        Ok(outputs) => Ok(json!({
+            "atomic": true,
+            "snapshot": all_read,
+            "committed": true,
+            "results": outputs.into_iter().map(|o| json!({"ok": true, "result": query_output_json(graph_name, o)})).collect::<Vec<_>>()
+        })),
+        Err((at, err)) => Ok(json!({
+            "atomic": true,
+            "snapshot": all_read,
+            "committed": false,
+            "failed_at": at,
+            "results": (0..cyphers.len()).map(|i| if i == at {
+                json!({"ok": false, "graph": graph_name, "error": err})
+            } else {
+                json!({"ok": false, "graph": graph_name, "error": if all_read { "the snapshot read failed" } else { "rolled back" }})
+            }).collect::<Vec<_>>()
+        })),
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {

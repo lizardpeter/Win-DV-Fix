@@ -765,6 +765,7 @@ fn route_http(
                 "delete_graph"
             ],
             "atomic_batch": true,
+            "snapshot_batch": true,
             "max_batch_queries": MAX_BATCH_QUERIES,
             "max_body_bytes": MAX_BODY_BYTES
         })),
@@ -1096,8 +1097,12 @@ pub(crate) fn constant_time_eq(expected: &str, candidate: &str) -> bool {
 /// `POST /v1/batch` with `"atomic": true`: every query runs in one transaction on one graph. The response lists one result
 /// per query and `"committed"`: when false, nothing was written; the failing query has its error, the others say rolled back.
 fn run_atomic_batch(queries: Vec<QueryRequest>, catalog: &GraphCatalog, scope: AuthScope) -> HttpResponse {
-    if scope != AuthScope::ReadWrite {
+    let all_read = !queries.is_empty() && queries.iter().all(|q| q.read_only);
+    if !all_read && scope != AuthScope::ReadWrite {
         return error_response(403, "read_only_token", "write scope required");
+    }
+    if all_read {
+        return run_snapshot_batch(queries, catalog);
     }
     let Some(first) = queries.first() else {
         return json_response(200, json!({"results": [], "atomic": true, "committed": true}));
@@ -1136,6 +1141,42 @@ fn run_atomic_batch(queries: Vec<QueryRequest>, catalog: &GraphCatalog, scope: A
                 })
                 .collect();
             json_response(200, json!({"results": results, "atomic": true, "committed": false, "failed_at": at}))
+        }
+    }
+}
+
+/// An atomic batch whose queries are all read-only: every query reads the same committed snapshot.
+fn run_snapshot_batch(queries: Vec<QueryRequest>, catalog: &GraphCatalog) -> HttpResponse {
+    let graph_name = queries[0].graph.clone();
+    if queries.iter().any(|q| q.graph != graph_name) {
+        return error_response(400, "atomic_multi_graph", "an atomic batch must target exactly one graph");
+    }
+    if queries.iter().any(|q| q.cypher.trim().is_empty()) {
+        return error_response(400, "invalid_query", "Cypher query must not be empty");
+    }
+    let Some(graph) = catalog.get(&graph_name) else {
+        return error_response(404, "graph_not_found", "read-only query cannot create a missing graph");
+    };
+    let cyphers: Vec<String> = queries.into_iter().map(|q| q.cypher).collect();
+    match graph.snapshot_read(&cyphers) {
+        Ok(outputs) => {
+            let results: Vec<JsonValue> = outputs
+                .into_iter()
+                .map(|o| json!({"status": 200, "body": query_output_json(&graph_name, o)}))
+                .collect();
+            json_response(200, json!({"results": results, "atomic": true, "snapshot": true, "committed": true}))
+        }
+        Err((at, err)) => {
+            let results: Vec<JsonValue> = (0..cyphers.len())
+                .map(|i| {
+                    if i == at {
+                        json!({"status": 400, "body": {"error": {"code": "cypher_error", "message": err}}})
+                    } else {
+                        json!({"status": 409, "body": {"error": {"code": "not_returned", "message": "the snapshot read failed"}}})
+                    }
+                })
+                .collect();
+            json_response(200, json!({"results": results, "atomic": true, "snapshot": true, "committed": false, "failed_at": at}))
         }
     }
 }
@@ -1451,7 +1492,7 @@ fn openapi_document() -> JsonValue {
             "/v1/batch": {
                 "post": {
                     "operationId": "batchQueryGraph",
-                    "description": "Execute up to 100 Cypher requests sequentially. With atomic=true all requests must target one graph and run as one all-or-nothing transaction: the response's committed flag says whether anything was written.",
+                    "description": "Execute up to 100 Cypher requests sequentially. With atomic=true all requests must target one graph and run as one all-or-nothing transaction: the response's committed flag says whether anything was written. An atomic batch whose requests are all read_only reads one consistent snapshot (read scope suffices).",
                     "requestBody": {
                         "required": true,
                         "content": {

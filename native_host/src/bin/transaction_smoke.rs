@@ -92,6 +92,31 @@ fn main() -> Result<(), String> {
         g.query("MATCH (n:Idx) DETACH DELETE n")?;
         g.query("DROP INDEX FOR (n:Idx) ON (n.k)")?;
 
+        // snapshot reads: several reads of one committed version; a write inside is refused and changes nothing
+        let snap = g.snapshot_read(&s(&["MATCH (c:Claim) RETURN count(c)", "MATCH (c:Claim)-[:HEAD]->(v:Ver) RETURN count(v)"]))
+            .map_err(|(i, e)| format!("snapshot read failed at {i}: {e}"))?;
+        check(snap.len() == 2 && snap[1].rows.first().is_some_and(|r| r[0].contains('1')), "snapshot read returns both results")?;
+        let r = g.snapshot_read(&s(&["MATCH (c:Claim) RETURN count(c)", "CREATE (:Claim {cid:'w1'})"]));
+        check(matches!(r, Err((1, ref e)) if e.contains("write")), "a write inside a snapshot read is refused")?;
+        check(count(&g, "MATCH (c:Claim {cid:'w1'}) RETURN count(c)")? == "0", "the refused write wrote nothing")?;
+        // isolation: a snapshot taken before a write keeps reading the old version while a writer commits on another thread
+        {
+            let g2 = &g;
+            let before = count(g2, "MATCH (c:Claim) RETURN count(c)")?;
+            std::thread::scope(|sc| -> Result<(), String> {
+                let reader = sc.spawn(|| {
+                    let qs: Vec<String> = (0..200).map(|_| "MATCH (n:Tmp) RETURN count(n)".to_string()).collect();
+                    g2.snapshot_read(&qs).map(|outs| outs.iter().map(|o| o.rows[0][0].clone()).collect::<std::collections::BTreeSet<_>>())
+                });
+                for k in 0..20 {
+                    g2.query(&format!("CREATE (:Tmp {{k:{k}}})"))?;
+                }
+                let seen = reader.join().map_err(|_| "reader panicked".to_string())?.map_err(|(i, e)| format!("snapshot {i}: {e}"))?;
+                check(seen.len() == 1, &format!("one snapshot gives one answer across 200 reads while writes land: {seen:?} (before {before})"))
+            })?;
+            g.query("MATCH (n:Tmp) DELETE n")?;
+        }
+
         // the graph still takes writes, transactional and plain
         g.transaction(&s(&["CREATE (:Claim {cid:'s2'})", "MATCH (c:Claim {cid:'s2'}) SET c.ok = true"]))
             .map_err(|(i, e)| format!("second transaction failed at {i}: {e}"))?;

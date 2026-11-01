@@ -1048,6 +1048,20 @@ impl NativeGraph {
     fn execute_read(
         &self,
         snapshot: Arc<atomic_refcell::AtomicRefCell<graph::graph::graph::Graph>>,
+        plan: Plan,
+        timeout_ms: Option<u64>,
+    ) -> Result<QueryOutput, String> {
+        // Keep an escalated writer from publishing index documents while this
+        // snapshot reader may scan the shared index.
+        let _publication = self.index_publication.read();
+        self.execute_read_held(snapshot, plan, timeout_ms)
+    }
+
+    /// `execute_read` for a caller that already holds `index_publication` shared (a snapshot batch holds it across all its
+    /// reads, so the shared index can't move under the snapshot between them).
+    fn execute_read_held(
+        &self,
+        snapshot: Arc<atomic_refcell::AtomicRefCell<graph::graph::graph::Graph>>,
         Plan {
             plan,
             cached,
@@ -1057,9 +1071,6 @@ impl NativeGraph {
         timeout_ms: Option<u64>,
     ) -> Result<QueryOutput, String> {
         let lock = ReadOnlyEscalation;
-        // Keep an escalated writer from publishing index documents while this
-        // snapshot reader may scan the shared index.
-        let _publication = self.index_publication.read();
         let runtime = Runtime::new(
             snapshot,
             parameters,
@@ -1228,6 +1239,43 @@ impl NativeGraph {
         };
         breadcrumb.complete(result.is_ok());
         result.map_err(|e| (failed_at, e))
+    }
+
+    /// Run several read-only Cypher statements against ONE committed snapshot: every statement sees the same graph version,
+    /// whatever is written meanwhile. Write plans are refused (the index of the first one is returned).
+    pub fn snapshot_read(&self, cyphers: &[String]) -> Result<Vec<QueryOutput>, (usize, String)> {
+        let mut breadcrumb = diagnostics::start_query(&self.name, "<snapshot>", "SNAPSHOT");
+        // Lock order as for every read: the scheduler permit first, then index publication. One permit covers the whole
+        // batch (taking one per statement while holding publication would deadlock against a writer that holds its write
+        // permit and waits for publication). Publication is held shared for the whole batch so the shared index can't
+        // change between the batch's reads.
+        let _permit = QueryPermit::acquire(&self.name, "<snapshot>", QueryMode::Read).map_err(|e| (0, e))?;
+        let _publication = self.index_publication.read();
+        let snapshot = {
+            let host_guard = self.inner.read();
+            host_guard.read()
+        };
+        let mut outputs = Vec::with_capacity(cyphers.len());
+        for (i, cypher) in cyphers.iter().enumerate() {
+            let timeout_ms = native_config::effective_timeout(None, false).map_err(|e| (i, e))?;
+            let plan = {
+                let g = snapshot.borrow();
+                g.get_plan(cypher).map_err(|e| (i, e))?
+            };
+            if plan_is_write(&plan) {
+                breadcrumb.complete(false);
+                return Err((i, "a snapshot read can't contain a write".to_string()));
+            }
+            match self.execute_read_held(Arc::clone(&snapshot), plan, timeout_ms) {
+                Ok(o) => outputs.push(o),
+                Err(e) => {
+                    breadcrumb.complete(false);
+                    return Err((i, e));
+                }
+            }
+        }
+        breadcrumb.complete(true);
+        Ok(outputs)
     }
 
     fn transaction_locked(

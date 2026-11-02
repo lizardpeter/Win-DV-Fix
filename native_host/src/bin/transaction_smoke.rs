@@ -117,6 +117,53 @@ fn main() -> Result<(), String> {
             g.query("MATCH (n:Tmp) DELETE n")?;
         }
 
+        // K1 (adv_v23): snapshot batches racing writes that escalate (an indexed label) must never deadlock
+        {
+            g.query("CREATE INDEX FOR (n:Race) ON (n.k)")?;
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let g2 = &g;
+            std::thread::scope(|sc| -> Result<(), String> {
+                let watchdog = sc.spawn(|| {
+                    let start = std::time::Instant::now();
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        if start.elapsed() > std::time::Duration::from_secs(300) {
+                            eprintln!("FAILED: snapshot reads and writes deadlocked");
+                            std::process::exit(2);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                });
+                let readers: Vec<_> = (0..3).map(|_| sc.spawn(|| -> Result<(), String> {
+                    for _ in 0..150 {
+                        g2.snapshot_read(&s(&["MATCH (n:Race) RETURN count(n)", "MATCH (n:Race {k:1}) RETURN count(n)"]))
+                            .map_err(|(i, e)| format!("snapshot {i}: {e}"))?;
+                    }
+                    Ok(())
+                })).collect();
+                for k in 0..300 {
+                    if k % 3 == 0 {
+                        g2.transaction(&s(&[&format!("CREATE (:Race {{k:{k}}})"), &format!("MATCH (n:Race {{k:{k}}}) SET n.k2 = {k}")]))
+                            .map_err(|(i, e)| format!("race transaction {i}: {e}"))?;
+                    } else {
+                        g2.query(&format!("CREATE (:Race {{k:{k}}})"))?;
+                    }
+                }
+                for r in readers {
+                    r.join().map_err(|_| "reader panicked".to_string())??;
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                watchdog.join().map_err(|_| "watchdog panicked".to_string())?;
+                Ok(())
+            })?;
+            g.query("MATCH (n:Race) DELETE n")?;
+            g.query("DROP INDEX FOR (n:Race) ON (n.k)")?;
+        }
+
+        // K2 (adv_v23): a statement flagged read-only inside a transaction can't write
+        let r = g.transaction_flagged(&s(&["CREATE (:Claim {cid:'f1'})", "CREATE (:Claim {cid:'f2'})"]), &[false, true]);
+        check(matches!(r, Err((1, ref e)) if e.contains("Read only")), "a flagged read-only statement that writes fails the transaction")?;
+        check(count(&g, "MATCH (c:Claim) WHERE c.cid IN ['f1','f2'] RETURN count(c)")? == "0", "and nothing of it is written")?;
+
         // the graph still takes writes, transactional and plain
         g.transaction(&s(&["CREATE (:Claim {cid:'s2'})", "MATCH (c:Claim {cid:'s2'}) SET c.ok = true"]))
             .map_err(|(i, e)| format!("second transaction failed at {i}: {e}"))?;

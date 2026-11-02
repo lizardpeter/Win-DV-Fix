@@ -1224,6 +1224,11 @@ impl NativeGraph {
     /// Index and constraint DDL are refused inside a transaction: the engine publishes index documents outside the MVCC
     /// version, so they could not be rolled back with it.
     pub fn transaction(&self, cyphers: &[String]) -> Result<Vec<QueryOutput>, (usize, String)> {
+        self.transaction_flagged(cyphers, &[])
+    }
+
+    /// `transaction` where `read_only[i]` marks statement i as read-only: a write plan there fails the transaction (adv_v23 K2).
+    pub fn transaction_flagged(&self, cyphers: &[String], read_only: &[bool]) -> Result<Vec<QueryOutput>, (usize, String)> {
         if cyphers.is_empty() {
             return Ok(Vec::new());
         }
@@ -1234,7 +1239,7 @@ impl NativeGraph {
         let result = {
             let mut host_guard = self.inner.write();
             release_claim_on_error(&mut host_guard, |host_guard| {
-                self.transaction_locked(host_guard, cyphers, timeout_ms, &mut failed_at)
+                self.transaction_locked(host_guard, cyphers, read_only, timeout_ms, &mut failed_at)
             })
         };
         breadcrumb.complete(result.is_ok());
@@ -1250,11 +1255,14 @@ impl NativeGraph {
         // permit and waits for publication). Publication is held shared for the whole batch so the shared index can't
         // change between the batch's reads.
         let _permit = QueryPermit::acquire(&self.name, "<snapshot>", QueryMode::Read).map_err(|e| (0, e))?;
-        let _publication = self.index_publication.read();
+        // The snapshot is taken (and the host lock released) BEFORE publication is held: a writer holds the host lock for its
+        // whole write and takes publication at escalation, so holding publication while waiting for the host lock deadlocks
+        // (adv_v23 K1). Ordinary reads take them in this same order and never nest them.
         let snapshot = {
             let host_guard = self.inner.read();
             host_guard.read()
         };
+        let _publication = self.index_publication.read();
         let mut outputs = Vec::with_capacity(cyphers.len());
         for (i, cypher) in cyphers.iter().enumerate() {
             let timeout_ms = native_config::effective_timeout(None, false).map_err(|e| (i, e))?;
@@ -1282,6 +1290,7 @@ impl NativeGraph {
         &self,
         host_guard: &mut MvccGraph,
         cyphers: &[String],
+        read_only: &[bool],
         timeout_ms: Option<u64>,
         failed_at: &mut usize,
     ) -> Result<Vec<QueryOutput>, String> {
@@ -1325,6 +1334,9 @@ impl NativeGraph {
                 return abort(host_guard, &last, "index DDL is not allowed inside a transaction".to_string());
             }
             let is_write = plan_is_write(&planned);
+            if is_write && read_only.get(i).copied().unwrap_or(false) {
+                return abort(host_guard, &last, "Read only query cannot perform writes".to_string());
+            }
             let Plan { plan, cached, parameters, .. } = planned;
             let runtime = Runtime::new(
                 Arc::clone(&private),

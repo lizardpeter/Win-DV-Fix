@@ -766,6 +766,7 @@ fn route_http(
             ],
             "atomic_batch": true,
             "snapshot_batch": true,
+            "snapshot_batch_version": 2,
             "max_batch_queries": MAX_BATCH_QUERIES,
             "max_body_bytes": MAX_BODY_BYTES
         })),
@@ -1121,8 +1122,9 @@ fn run_atomic_batch(queries: Vec<QueryRequest>, catalog: &GraphCatalog, scope: A
         Ok(graph) => graph,
         Err(err) => return error_response(500, "graph_open_failed", &err),
     };
+    let flags: Vec<bool> = queries.iter().map(|q| q.read_only).collect();
     let cyphers: Vec<String> = queries.into_iter().map(|q| q.cypher).collect();
-    match graph.transaction(&cyphers) {
+    match graph.transaction_flagged(&cyphers, &flags) {
         Ok(outputs) => {
             let results: Vec<JsonValue> = outputs
                 .into_iter()

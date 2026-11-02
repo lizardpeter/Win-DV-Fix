@@ -1899,6 +1899,7 @@ fn run_batch(args: &JsonMap<String, JsonValue>, catalog: &GraphCatalog) -> Resul
 fn run_atomic_batch(queries: &[JsonValue], catalog: &GraphCatalog) -> Result<JsonValue, String> {
     let mut graph_name: Option<&str> = None;
     let mut cyphers = Vec::with_capacity(queries.len());
+    let mut flags = Vec::with_capacity(queries.len());
     let mut all_read = true;
     for item in queries {
         let object = item.as_object().ok_or_else(|| "each query must be an object".to_string())?;
@@ -1908,14 +1909,16 @@ fn run_atomic_batch(queries: &[JsonValue], catalog: &GraphCatalog) -> Result<Jso
         }
         graph_name = Some(g);
         cyphers.push(required_string(object, "cypher")?.to_string());
-        all_read &= object.get("read_only").and_then(JsonValue::as_bool).unwrap_or(false);
+        let ro = object.get("read_only").and_then(JsonValue::as_bool).unwrap_or(false);
+        flags.push(ro);
+        all_read &= ro;
     }
     let graph_name = graph_name.ok_or_else(|| "queries must contain at least one item".to_string())?;
     let outcome = if all_read {
         let graph = catalog.get(graph_name).ok_or_else(|| "graph does not exist".to_string())?;
         graph.snapshot_read(&cyphers)
     } else {
-        catalog.get_or_create(graph_name)?.transaction(&cyphers)
+        catalog.get_or_create(graph_name)?.transaction_flagged(&cyphers, &flags)
     };
     match outcome {
         Ok(outputs) => Ok(json!({

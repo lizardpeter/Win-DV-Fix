@@ -164,6 +164,50 @@ fn main() -> Result<(), String> {
         check(matches!(r, Err((1, ref e)) if e.contains("Read only")), "a flagged read-only statement that writes fails the transaction")?;
         check(count(&g, "MATCH (c:Claim) WHERE c.cid IN ['f1','f2'] RETURN count(c)")? == "0", "and nothing of it is written")?;
 
+        // L1 (adv_v24): an index lookup must agree with the snapshot it runs on, while a writer keeps moving indexed values
+        {
+            g.query("CREATE INDEX FOR (n:Idx2) ON (n.k)")?;
+            g.query("UNWIND range(0, 49) AS i CREATE (:Idx2 {k: i, id: i})")?;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let g2 = &g;
+            let bad = std::sync::atomic::AtomicUsize::new(0);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let (bad_r, done_r) = (&bad, &done);
+            std::thread::scope(|sc| -> Result<(), String> {
+                let readers: Vec<_> = (0..2).map(|t| sc.spawn(move || -> Result<(), String> {
+                    let (bad, done) = (bad_r, done_r);
+                    let mut n = 0;
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) || n < 50 {
+                        n += 1;
+                        // every row the index returns for k = 0 must have k = 0 and the label in that same snapshot
+                        let out = if t == 0 {
+                            g2.query_read_only("MATCH (n:Idx2 {k: 0}) RETURN n.k, labels(n)")?
+                        } else {
+                            g2.snapshot_read(&s(&["MATCH (n:Idx2 {k: 0}) RETURN n.k, labels(n)"])).map_err(|(_, e)| e)?.remove(0)
+                        };
+                        for row in &out.rows {
+                            if row[0] != "Int(0)" || !row[1].contains("Idx2") {
+                                bad.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Ok(())
+                })).collect();
+                for round in 0..200 {
+                    g2.query(&format!("MATCH (n:Idx2) SET n.k = (n.id + {}) % 50", round + 1))?;
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                for r in readers {
+                    r.join().map_err(|_| "reader panicked".to_string())??;
+                }
+                Ok(())
+            })?;
+            let b = bad.load(std::sync::atomic::Ordering::SeqCst);
+            check(b == 0, &format!("index lookups agree with their snapshot under a busy writer ({b} rows disagreed)"))?;
+            g.query("MATCH (n:Idx2) DELETE n")?;
+            g.query("DROP INDEX FOR (n:Idx2) ON (n.k)")?;
+        }
+
         // the graph still takes writes, transactional and plain
         g.transaction(&s(&["CREATE (:Claim {cid:'s2'})", "MATCH (c:Claim {cid:'s2'}) SET c.ok = true"]))
             .map_err(|(i, e)| format!("second transaction failed at {i}: {e}"))?;

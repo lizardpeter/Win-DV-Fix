@@ -573,6 +573,23 @@ impl NativeGraph {
         ))
     }
 
+    /// A committed snapshot together with shared hold of index publication, taken so the shared index matches the snapshot
+    /// (adv_v24 L1): the host lock is held while publication is acquired, then released. Every holder of publication's write
+    /// side also holds the host write lock (an escalated write, bulk insert, constraint DDL), so while this thread holds the
+    /// host read lock no writer can hold or wait for publication: no cycle with the writers' order (host, then publication).
+    fn consistent_snapshot(
+        &self,
+    ) -> (
+        Arc<atomic_refcell::AtomicRefCell<graph::graph::graph::Graph>>,
+        parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
+    ) {
+        let host_guard = self.inner.read();
+        let publication = self.index_publication.read_arc();
+        let snapshot = host_guard.read();
+        drop(host_guard);
+        (snapshot, publication)
+    }
+
     pub fn query(&self, cypher: &str) -> Result<QueryOutput, String> {
         self.query_with_timeout(cypher, None)
     }
@@ -600,16 +617,12 @@ impl NativeGraph {
             self.execute_write(cypher, timeout_ms)
         } else {
             let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Read)?;
-            let (snapshot, plan) = {
-                let host_guard = self.inner.read();
-                let snapshot = host_guard.read();
-                let plan = {
-                    let graph_ref = snapshot.borrow();
-                    graph_ref.get_plan(cypher)?
-                };
-                (snapshot, plan)
+            let (snapshot, _publication) = self.consistent_snapshot();
+            let plan = {
+                let graph_ref = snapshot.borrow();
+                graph_ref.get_plan(cypher)?
             };
-            self.execute_read(snapshot, plan, timeout_ms)
+            self.execute_read_held(snapshot, plan, timeout_ms)
         };
 
         if result.is_ok() {
@@ -648,18 +661,14 @@ impl NativeGraph {
         }
 
         let _permit = QueryPermit::acquire(&self.name, cypher, QueryMode::Read)?;
-        let (snapshot, plan) = {
-            let host_guard = self.inner.read();
-            let snapshot = host_guard.read();
-            let plan = {
-                let graph_ref = snapshot.borrow();
-                graph_ref.get_plan(cypher)?
-            };
-            (snapshot, plan)
+        let (snapshot, _publication) = self.consistent_snapshot();
+        let plan = {
+            let graph_ref = snapshot.borrow();
+            graph_ref.get_plan(cypher)?
         };
         debug_assert!(!plan_is_write(&plan));
         let timeout_ms = native_config::effective_timeout(per_query_timeout, false)?;
-        let result = self.execute_read(snapshot, plan, timeout_ms);
+        let result = self.execute_read_held(snapshot, plan, timeout_ms);
         if result.is_ok() {
             self.slow_log
                 .add("GRAPH.RO_QUERY", cypher, wall.elapsed().as_secs_f64() * 1000.0);
@@ -1255,14 +1264,10 @@ impl NativeGraph {
         // permit and waits for publication). Publication is held shared for the whole batch so the shared index can't
         // change between the batch's reads.
         let _permit = QueryPermit::acquire(&self.name, "<snapshot>", QueryMode::Read).map_err(|e| (0, e))?;
-        // The snapshot is taken (and the host lock released) BEFORE publication is held: a writer holds the host lock for its
-        // whole write and takes publication at escalation, so holding publication while waiting for the host lock deadlocks
-        // (adv_v23 K1). Ordinary reads take them in this same order and never nest them.
-        let snapshot = {
-            let host_guard = self.inner.read();
-            host_guard.read()
-        };
-        let _publication = self.index_publication.read();
+        // Snapshot and publication are taken together, host lock first (see consistent_snapshot): never publication first,
+        // which deadlocks against a writer (adv_v23 K1), and never with a gap between them, which lets the shared index run
+        // ahead of the snapshot (adv_v24 L1).
+        let (snapshot, _publication) = self.consistent_snapshot();
         let mut outputs = Vec::with_capacity(cyphers.len());
         for (i, cypher) in cyphers.iter().enumerate() {
             let timeout_ms = native_config::effective_timeout(None, false).map_err(|e| (i, e))?;

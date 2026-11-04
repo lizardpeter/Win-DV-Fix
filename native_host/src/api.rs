@@ -225,6 +225,30 @@ struct QueryRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginLoadRequest {
+    name: String,
+    wasm_base64: String,
+    #[serde(default)]
+    replace: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginDeleteRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginCallRequest {
+    plugin: String,
+    function: String,
+    graph: String,
+    #[serde(default)]
+    input: JsonValue,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BatchRequest {
     queries: Vec<QueryRequest>,
     /// all queries target one graph and run as ONE all-or-nothing write (`NativeGraph::transaction`)
@@ -730,6 +754,14 @@ fn route_http(
         return response;
     }
 
+    // a plug-in's own page (an HTML shell with no data in it, like the dashboard's): GET /plugins/<name>/<path>.
+    // Its data comes through the authenticated /v1/plugins/call, with the caller's own token.
+    if request.method == "GET" {
+        if let Some(rest) = request_path.strip_prefix("/plugins/") {
+            return plugin_ui_response(rest);
+        }
+    }
+
     if let Some(response) = crate::browser::route(&request) {
         return response;
     }
@@ -762,7 +794,8 @@ fn route_http(
                 "query",
                 "batch_query",
                 "atomic_batch",
-                "delete_graph"
+                "delete_graph",
+                "plugins"
             ],
             "atomic_batch": true,
             "snapshot_batch": true,
@@ -823,6 +856,72 @@ fn route_http(
                     "deleted": removed
                 })),
                 Err(err) => error_response(409, "graph_delete_failed", &err),
+            }
+        }
+        ("GET", "/v1/plugins") => match crate::plugin_host::get() {
+            Some(host) => json_response(200, json!({"plugins": host.list()})),
+            None => error_response(503, "plugins_unavailable", "the plug-in host is not running"),
+        },
+        ("POST", "/v1/plugins/load") => {
+            if scope != AuthScope::ReadWrite {
+                return error_response(403, "read_only_token", "write scope required");
+            }
+            let payload: PluginLoadRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            let Some(host) = crate::plugin_host::get() else {
+                return error_response(503, "plugins_unavailable", "the plug-in host is not running");
+            };
+            let bytes = match STANDARD.decode(payload.wasm_base64.trim()) {
+                Ok(b) => b,
+                Err(e) => return error_response(400, "invalid_base64", &e.to_string()),
+            };
+            match host.load(&payload.name, &bytes, payload.replace) {
+                Ok(info) => json_response(200, json!({"plugin": info})),
+                Err(e) => error_response(400, "plugin_load_failed", &e),
+            }
+        }
+        ("POST", "/v1/plugins/delete") => {
+            if scope != AuthScope::ReadWrite {
+                return error_response(403, "read_only_token", "write scope required");
+            }
+            let payload: PluginDeleteRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            let Some(host) = crate::plugin_host::get() else {
+                return error_response(503, "plugins_unavailable", "the plug-in host is not running");
+            };
+            match host.delete(&payload.name) {
+                Ok(removed) => json_response(200, json!({"name": payload.name, "deleted": removed})),
+                Err(e) => error_response(500, "plugin_delete_failed", &e),
+            }
+        }
+        ("POST", "/v1/plugins/call") => {
+            let payload: PluginCallRequest = match parse_json(&request.body) {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+            if payload.graph.trim().is_empty() {
+                return error_response(400, "invalid_graph", "graph name must not be empty");
+            }
+            let Some(host) = crate::plugin_host::get() else {
+                return error_response(503, "plugins_unavailable", "the plug-in host is not running");
+            };
+            // a plug-in reaches only the graph the call names, and writes only with the caller's write scope
+            let graph = if scope == AuthScope::ReadWrite {
+                match catalog.get_or_create(&payload.graph) {
+                    Ok(g) => Some(g),
+                    Err(err) => return error_response(500, "graph_open_failed", &err),
+                }
+            } else {
+                catalog.get(&payload.graph)
+            };
+            match host.call(&payload.plugin, &payload.function, &payload.graph, graph, scope == AuthScope::ReadWrite,
+                            &payload.input, payload.timeout_ms) {
+                Ok(r) => json_response(200, json!({"output": r.output, "log": r.log, "elapsed_ms": r.elapsed_ms})),
+                Err(e) => error_response(422, "plugin_call_failed", &e),
             }
         }
         _ => error_response(404, "not_found", "unknown API route"),
@@ -1347,6 +1446,37 @@ fn wire_value_json(value: &WireValue) -> JsonValue {
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HttpResponse> {
     serde_json::from_slice(body)
         .map_err(|err| error_response(400, "invalid_json", &err.to_string()))
+}
+
+fn plugin_ui_response(rest: &str) -> HttpResponse {
+    let (name, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let Some(host) = crate::plugin_host::get() else {
+        return error_response(503, "plugins_unavailable", "the plug-in host is not running");
+    };
+    match host.ui(name, path) {
+        Ok((kind, body)) => {
+            let content_type: &'static str = match kind.as_str() {
+                "html" => "text/html; charset=utf-8",
+                "js" => "application/javascript; charset=utf-8",
+                "css" => "text/css; charset=utf-8",
+                "svg" => "image/svg+xml",
+                _ => "text/plain; charset=utf-8",
+            };
+            HttpResponse {
+                status: 200,
+                body,
+                content_type,
+                headers: vec![
+                    ("Cache-Control".into(), "no-store".into()),
+                    ("X-Content-Type-Options".into(), "nosniff".into()),
+                    ("Referrer-Policy".into(), "no-referrer".into()),
+                    ("X-Frame-Options".into(), "DENY".into()),
+                ],
+                auth_failure: false,
+            }
+        }
+        Err(e) => error_response(404, "not_found", &e),
+    }
 }
 
 pub(crate) fn json_response(status: u16, value: JsonValue) -> HttpResponse {

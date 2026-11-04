@@ -21,6 +21,8 @@ serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 ring = "0.17.12"
 rpassword = "7.4"
+# Sandboxed WebAssembly plug-ins (plugin_host.rs). No WASI: a plug-in reaches nothing but the host calls.
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "parallel-compilation"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }

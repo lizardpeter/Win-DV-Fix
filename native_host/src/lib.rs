@@ -16,6 +16,7 @@ pub mod redis_dump;
 pub mod server;
 pub mod native_config;
 pub mod udf_store;
+pub mod plugin_host;
 pub mod snapshot;
 pub mod slowlog;
 pub mod wal;

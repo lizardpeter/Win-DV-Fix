@@ -251,6 +251,7 @@ impl GraphCatalog {
         }
 
         udf_store::restore(&data_dir)?;
+        crate::plugin_host::open(&data_dir)?;
         let graph_dir = data_dir.join("graphs");
         fs::create_dir_all(&graph_dir)
             .map_err(|e| format!("create graph data directory {}: {e}", graph_dir.display()))?;
@@ -1129,7 +1130,11 @@ impl GraphCatalog {
 
     pub fn delete(&self, name: &str) -> Result<bool, String> {
         let _lifecycle = self.lifecycle.lock();
-        self.delete_locked(name)
+        let removed = self.delete_locked(name);
+        if let Some(host) = crate::plugin_host::get() {
+            host.drop_graph(name);
+        }
+        removed
     }
 
     fn delete_locked(&self, name: &str) -> Result<bool, String> {

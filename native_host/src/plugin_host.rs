@@ -10,6 +10,9 @@
 //! never the server.
 //!
 //! ABI (plain core WebAssembly, any source language):
+//! ABI 1 is for 32-bit modules (pointers and lengths i32, results packed as below); ABI 2 is the same for a module whose
+//! memory is 64-bit (memory64): pointers and lengths are i64, and a returned buffer is an i64 pointer to [len: u64 LE][bytes]
+//! (freed as (ptr, 8 + len)). The host picks the ABI from the module's exported memory.
 //!   exports  memory
 //!            plugin_alloc(len: i32) -> i32          a buffer the host may fill
 //!            plugin_free(ptr: i32, len: i32)
@@ -37,14 +40,25 @@ use parking_lot::Mutex;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use wasmtime::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
+use wasmtime::{Caller, Config, Engine, Func, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Val};
 
 use crate::NativeGraph;
 
 /// Largest module accepted.
 pub const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
-/// Linear memory a plug-in instance may grow to.
+/// Linear memory a 32-bit plug-in instance may grow to.
 pub const MAX_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024 - 65536;
+/// Linear memory a 64-bit (memory64) plug-in instance may grow to, unless FALKORDB_PLUGIN_MEMORY_GB says otherwise.
+pub const DEFAULT_MAX_MEMORY64_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
+fn max_memory64() -> usize {
+    std::env::var("FALKORDB_PLUGIN_MEMORY_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|g| *g >= 1)
+        .map(|g| g.saturating_mul(1024 * 1024 * 1024))
+        .unwrap_or(DEFAULT_MAX_MEMORY64_BYTES)
+}
 /// Default and largest wall-clock time for one call.
 pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_CALL_TIMEOUT_MS: u64 = 600_000;
@@ -65,9 +79,12 @@ pub struct PluginInfo {
 struct Loaded {
     info: PluginInfo,
     module: Module,
+    /// a 64-bit memory: ABI 2
+    wide: bool,
 }
 
 struct HostState {
+    wide: bool,
     graph: Option<Arc<NativeGraph>>,
     graph_name: String,
     may_write: bool,
@@ -78,9 +95,33 @@ struct HostState {
 struct Live {
     store: Store<HostState>,
     memory: Memory,
-    alloc: TypedFunc<i32, i32>,
-    free: TypedFunc<(i32, i32), ()>,
+    alloc: Func,
+    free: Func,
     instance: Instance,
+    wide: bool,
+}
+
+/// a pointer-sized argument in the module's ABI
+fn word(wide: bool, x: u64) -> Val {
+    if wide { Val::I64(x as i64) } else { Val::I32(x as u32 as i32) }
+}
+
+fn word_of(v: &Val) -> u64 {
+    match v {
+        Val::I32(x) => *x as u32 as u64,
+        Val::I64(x) => *x as u64,
+        _ => 0,
+    }
+}
+
+fn call_alloc(alloc: &Func, mut store: impl wasmtime::AsContextMut, wide: bool, len: u64) -> wasmtime::Result<u64> {
+    let mut out = [word(wide, 0)];
+    alloc.call(&mut store, &[word(wide, len)], &mut out)?;
+    Ok(word_of(&out[0]))
+}
+
+fn call_free(free: &Func, mut store: impl wasmtime::AsContextMut, wide: bool, ptr: u64, len: u64) {
+    let _ = free.call(&mut store, &[word(wide, ptr), word(wide, len)], &mut []);
 }
 
 pub struct PluginHost {
@@ -111,6 +152,11 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// a module whose exported memory is 64-bit uses ABI 2
+fn module_is_wide(m: &Module) -> bool {
+    m.exports().find(|e| e.name() == "memory").and_then(|e| e.ty().memory().map(|t| t.is_64())).unwrap_or(false)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -127,6 +173,7 @@ impl PluginHost {
     fn new(data_dir: &Path) -> Result<Self, String> {
         let mut cfg = Config::new();
         cfg.epoch_interruption(true);
+        cfg.wasm_memory64(true);
         let engine = Engine::new(&cfg).map_err(|e| format!("plugin engine: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -174,7 +221,8 @@ impl PluginHost {
                 return Err(format!("plug-in {}: stored module does not match its recorded hash", info.name));
             }
             let module = self.compile(&bytes)?;
-            map.insert(info.name.clone(), Arc::new(Loaded { info, module }));
+            let wide = module_is_wide(&module);
+            map.insert(info.name.clone(), Arc::new(Loaded { info, module, wide }));
         }
         Ok(())
     }
@@ -190,6 +238,23 @@ impl PluginHost {
 
     fn compile(&self, bytes: &[u8]) -> Result<Module, String> {
         let module = Module::new(&self.engine, bytes).map_err(|e| format!("invalid WebAssembly module: {e:#}"))?;
+        let wide = module.exports().find(|e| e.name() == "memory").and_then(|e| e.ty().memory().map(|m| m.is_64())).unwrap_or(false);
+        // the exports' signatures must match the module's ABI
+        let w = if wide { wasmtime::ValType::I64 } else { wasmtime::ValType::I32 };
+        for e in module.exports() {
+            if let Some(f) = e.ty().func() {
+                let (ps, rs): (Vec<_>, Vec<_>) = (f.params().collect(), f.results().collect());
+                let want_ok = match e.name() {
+                    "plugin_alloc" => ps.len() == 1 && ps[0].matches(&w) && rs.len() == 1 && rs[0].matches(&w),
+                    "plugin_free" => ps.len() == 2 && ps.iter().all(|p| p.matches(&w)) && rs.is_empty(),
+                    n if n.starts_with("api_") => ps.len() == 2 && ps.iter().all(|p| p.matches(&w)) && rs.len() == 1 && rs[0].matches(&wasmtime::ValType::I64),
+                    _ => true,
+                };
+                if !want_ok {
+                    return Err(format!("export {} does not have the {} ABI signature", e.name(), if wide { "64-bit" } else { "32-bit" }));
+                }
+            }
+        }
         for (name, want) in [("memory", "memory"), ("plugin_alloc", "func"), ("plugin_free", "func")] {
             let ok = module.exports().any(|e| {
                 e.name() == name
@@ -224,6 +289,7 @@ impl PluginHost {
             return Err(format!("module is larger than {MAX_MODULE_BYTES} bytes"));
         }
         let module = self.compile(bytes)?;
+        let wide = module_is_wide(&module);
         let functions: Vec<String> = module
             .exports()
             .filter(|e| e.name().starts_with("api_") && e.ty().func().is_some())
@@ -238,7 +304,7 @@ impl PluginHost {
         let tmp = self.dir.join(format!("{name}.wasm.tmp"));
         fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &path).map_err(|e| format!("store plug-in: {e}"))?;
-        let previous = map.insert(name.to_string(), Arc::new(Loaded { info: info.clone(), module }));
+        let previous = map.insert(name.to_string(), Arc::new(Loaded { info: info.clone(), module, wide }));
         if let Err(e) = self.persist(&map) {
             match previous {
                 Some(p) => {
@@ -278,47 +344,52 @@ impl PluginHost {
     }
 
     fn instantiate(&self, loaded: &Loaded, graph_name: &str) -> Result<Live, String> {
-        let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY_BYTES).instances(1).tables(16).memories(1).build();
+        let wide = loaded.wide;
+        let cap = if wide { max_memory64() } else { MAX_MEMORY_BYTES };
+        let limits = StoreLimitsBuilder::new().memory_size(cap).instances(1).tables(16).memories(1).build();
         let mut store = Store::new(
             &self.engine,
-            HostState { graph: None, graph_name: graph_name.to_string(), may_write: false, limits, log: Vec::new() },
+            HostState { wide, graph: None, graph_name: graph_name.to_string(), may_write: false, limits, log: Vec::new() },
         );
         store.limiter(|s| &mut s.limits);
         store.set_epoch_deadline(u64::MAX / 2);
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
-        linker
-            .func_wrap("host", "now_ms", || -> i64 { now_ms() as i64 })
-            .and_then(|l| {
-                l.func_wrap("host", "log", |mut c: Caller<'_, HostState>, ptr: i32, len: i32| {
-                    if let Ok(s) = read_guest(&mut c, ptr, len) {
-                        let line = String::from_utf8_lossy(&s).chars().take(2000).collect::<String>();
-                        let log = &mut c.data_mut().log;
-                        if log.len() < LOG_LINES {
-                            log.push(line);
-                        }
-                    }
+        linker.func_wrap("host", "now_ms", || -> i64 { now_ms() as i64 }).map_err(|e| format!("plug-in host functions: {e}"))?;
+        let r = if wide {
+            linker
+                .func_wrap("host", "log", |mut c: Caller<'_, HostState>, ptr: i64, len: i64| host_log(&mut c, ptr as u64, len as u64))
+                .and_then(|l| {
+                    l.func_wrap("host", "query", |mut c: Caller<'_, HostState>, ptr: i64, len: i64, read_only: i32| -> wasmtime::Result<i64> {
+                        host_query_call(&mut c, ptr as u64, len as u64, read_only)
+                    })
                 })
-            })
-            .and_then(|l| {
-                l.func_wrap("host", "query", |mut c: Caller<'_, HostState>, ptr: i32, len: i32, read_only: i32| -> wasmtime::Result<i64> {
-                    let cypher = String::from_utf8(read_guest(&mut c, ptr, len)?).map_err(|_| wasmtime::Error::msg("query text is not UTF-8"))?;
-                    let out = host_query(c.data(), &cypher, read_only != 0);
-                    write_guest(&mut c, &serde_json::to_vec(&out)?)
+                .and_then(|l| {
+                    l.func_wrap("host", "transaction", |mut c: Caller<'_, HostState>, ptr: i64, len: i64| -> wasmtime::Result<i64> {
+                        host_transaction_call(&mut c, ptr as u64, len as u64)
+                    })
                 })
-            })
-            .and_then(|l| {
-                l.func_wrap("host", "transaction", |mut c: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i64> {
-                    let body = read_guest(&mut c, ptr, len)?;
-                    let out = host_transaction(c.data(), &body);
-                    write_guest(&mut c, &serde_json::to_vec(&out)?)
+                .map(|_| ())
+        } else {
+            linker
+                .func_wrap("host", "log", |mut c: Caller<'_, HostState>, ptr: i32, len: i32| host_log(&mut c, ptr as u32 as u64, len as u32 as u64))
+                .and_then(|l| {
+                    l.func_wrap("host", "query", |mut c: Caller<'_, HostState>, ptr: i32, len: i32, read_only: i32| -> wasmtime::Result<i64> {
+                        host_query_call(&mut c, ptr as u32 as u64, len as u32 as u64, read_only)
+                    })
                 })
-            })
-            .map_err(|e| format!("plug-in host functions: {e}"))?;
+                .and_then(|l| {
+                    l.func_wrap("host", "transaction", |mut c: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i64> {
+                        host_transaction_call(&mut c, ptr as u32 as u64, len as u32 as u64)
+                    })
+                })
+                .map(|_| ())
+        };
+        r.map_err(|e| format!("plug-in host functions: {e}"))?;
         let instance = linker.instantiate(&mut store, &loaded.module).map_err(|e| format!("instantiate: {e:#}"))?;
         let memory = instance.get_memory(&mut store, "memory").ok_or("no exported memory")?;
-        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "plugin_alloc").map_err(|e| format!("plugin_alloc: {e}"))?;
-        let free = instance.get_typed_func::<(i32, i32), ()>(&mut store, "plugin_free").map_err(|e| format!("plugin_free: {e}"))?;
-        Ok(Live { store, memory, alloc, free, instance })
+        let alloc = instance.get_func(&mut store, "plugin_alloc").ok_or("no plugin_alloc")?;
+        let free = instance.get_func(&mut store, "plugin_free").ok_or("no plugin_free")?;
+        Ok(Live { store, memory, alloc, free, instance, wide })
     }
 
     /// Run `api_<function>` of a plug-in against one graph with JSON input. `may_write`: the caller holds write scope.
@@ -400,19 +471,34 @@ pub struct CallResult {
 }
 
 fn run_call(live: &mut Live, function: &str, input: &JsonValue) -> Result<JsonValue, String> {
-    let f = live
-        .instance
-        .get_typed_func::<(i32, i32), i64>(&mut live.store, &format!("api_{function}"))
-        .map_err(|e| format!("api_{function} must take (i32, i32) and return i64: {e}"))?;
+    let wide = live.wide;
+    let f = live.instance.get_func(&mut live.store, &format!("api_{function}")).ok_or_else(|| format!("no api_{function}"))?;
     let bytes = serde_json::to_vec(input).map_err(|e| e.to_string())?;
-    let len = i32::try_from(bytes.len()).map_err(|_| "input too large".to_string())?;
-    let ptr = live.alloc.call(&mut live.store, len).map_err(trap)?;
+    if !wide && i32::try_from(bytes.len()).is_err() {
+        return Err("input too large".into());
+    }
+    let len = bytes.len() as u64;
+    let ptr = call_alloc(&live.alloc, &mut live.store, wide, len).map_err(trap)?;
     live.memory
-        .write(&mut live.store, ptr as u32 as usize, &bytes)
+        .write(&mut live.store, ptr as usize, &bytes)
         .map_err(|_| "plugin_alloc returned a buffer outside its memory".to_string())?;
-    let packed = f.call(&mut live.store, (ptr, len)).map_err(trap)?;
-    let _ = live.free.call(&mut live.store, (ptr, len));
-    let (optr, olen) = unpack(packed);
+    let mut out_v = [Val::I64(0)];
+    f.call(&mut live.store, &[word(wide, ptr), word(wide, len)], &mut out_v).map_err(trap)?;
+    call_free(&live.free, &mut live.store, wide, ptr, len);
+    let packed = match out_v[0] {
+        Val::I64(x) => x,
+        _ => return Err(format!("api_{function} must return i64")),
+    };
+    let (optr, olen, freelen) = if wide {
+        let p = packed as u64 as usize;
+        let mut lb = [0u8; 8];
+        live.memory.read(&live.store, p, &mut lb).map_err(|_| "plug-in returned a result outside its memory".to_string())?;
+        let l = u64::from_le_bytes(lb) as usize;
+        (p + 8, l, 8 + l)
+    } else {
+        let (p, l) = unpack(packed);
+        (p, l, l)
+    };
     if olen > MAX_MESSAGE_BYTES {
         return Err("plug-in result too large".into());
     }
@@ -420,7 +506,8 @@ fn run_call(live: &mut Live, function: &str, input: &JsonValue) -> Result<JsonVa
     live.memory
         .read(&live.store, optr, &mut out)
         .map_err(|_| "plug-in returned a result outside its memory".to_string())?;
-    let _ = live.free.call(&mut live.store, (optr as i32, olen as i32));
+    let base = if wide { optr - 8 } else { optr };
+    call_free(&live.free, &mut live.store, wide, base as u64, freelen as u64);
     serde_json::from_slice(&out).map_err(|e| format!("plug-in result is not JSON: {e}"))
 }
 
@@ -437,28 +524,57 @@ fn guest_memory(c: &mut Caller<'_, HostState>) -> wasmtime::Result<Memory> {
     c.get_export("memory").and_then(|e| e.into_memory()).ok_or_else(|| wasmtime::Error::msg("no exported memory"))
 }
 
-fn read_guest(c: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> wasmtime::Result<Vec<u8>> {
-    let len = len as u32 as usize;
+fn read_guest(c: &mut Caller<'_, HostState>, ptr: u64, len: u64) -> wasmtime::Result<Vec<u8>> {
+    let len = len as usize;
     if len > MAX_MESSAGE_BYTES {
         return Err(wasmtime::Error::msg("host call message too large"));
     }
     let mem = guest_memory(c)?;
     let mut buf = vec![0u8; len];
-    mem.read(&*c, ptr as u32 as usize, &mut buf).map_err(|_| wasmtime::Error::msg("buffer outside the plug-in's memory"))?;
+    mem.read(&*c, ptr as usize, &mut buf).map_err(|_| wasmtime::Error::msg("buffer outside the plug-in's memory"))?;
     Ok(buf)
 }
 
+/// a reply into the plug-in's memory, returned in its ABI
 fn write_guest(c: &mut Caller<'_, HostState>, bytes: &[u8]) -> wasmtime::Result<i64> {
-    let alloc = c
-        .get_export("plugin_alloc")
-        .and_then(|e| e.into_func())
-        .ok_or_else(|| wasmtime::Error::msg("no plugin_alloc"))?
-        .typed::<i32, i32>(&*c)?;
-    let len = i32::try_from(bytes.len()).map_err(|_| wasmtime::Error::msg("host reply too large"))?;
-    let ptr = alloc.call(&mut *c, len)?;
+    let wide = c.data().wide;
+    let alloc = c.get_export("plugin_alloc").and_then(|e| e.into_func()).ok_or_else(|| wasmtime::Error::msg("no plugin_alloc"))?;
+    if !wide && i32::try_from(bytes.len()).is_err() {
+        return Err(wasmtime::Error::msg("host reply too large"));
+    }
+    let total = if wide { 8 + bytes.len() } else { bytes.len() };
+    let ptr = call_alloc(&alloc, &mut *c, wide, total as u64)?;
     let mem = guest_memory(c)?;
-    mem.write(&mut *c, ptr as u32 as usize, bytes).map_err(|_| wasmtime::Error::msg("plugin_alloc returned a bad buffer"))?;
-    Ok(pack(ptr, len))
+    if wide {
+        mem.write(&mut *c, ptr as usize, &(bytes.len() as u64).to_le_bytes()).map_err(|_| wasmtime::Error::msg("plugin_alloc returned a bad buffer"))?;
+        mem.write(&mut *c, ptr as usize + 8, bytes).map_err(|_| wasmtime::Error::msg("plugin_alloc returned a bad buffer"))?;
+        Ok(ptr as i64)
+    } else {
+        mem.write(&mut *c, ptr as usize, bytes).map_err(|_| wasmtime::Error::msg("plugin_alloc returned a bad buffer"))?;
+        Ok(pack(ptr as u32 as i32, bytes.len() as i32))
+    }
+}
+
+fn host_log(c: &mut Caller<'_, HostState>, ptr: u64, len: u64) {
+    if let Ok(s) = read_guest(c, ptr, len) {
+        let line = String::from_utf8_lossy(&s).chars().take(2000).collect::<String>();
+        let log = &mut c.data_mut().log;
+        if log.len() < LOG_LINES {
+            log.push(line);
+        }
+    }
+}
+
+fn host_query_call(c: &mut Caller<'_, HostState>, ptr: u64, len: u64, read_only: i32) -> wasmtime::Result<i64> {
+    let cypher = String::from_utf8(read_guest(c, ptr, len)?).map_err(|_| wasmtime::Error::msg("query text is not UTF-8"))?;
+    let out = host_query(c.data(), &cypher, read_only != 0);
+    write_guest(c, &serde_json::to_vec(&out)?)
+}
+
+fn host_transaction_call(c: &mut Caller<'_, HostState>, ptr: u64, len: u64) -> wasmtime::Result<i64> {
+    let body = read_guest(c, ptr, len)?;
+    let out = host_transaction(c.data(), &body);
+    write_guest(c, &serde_json::to_vec(&out)?)
 }
 
 fn host_query(st: &HostState, cypher: &str, read_only: bool) -> JsonValue {

@@ -24,6 +24,9 @@ use crate::{
 };
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// a plug-in upload (POST /v1/plugins/load: a base64 WebAssembly module) may be larger, but only with a valid read-write
+/// token, checked from the headers before any of the body is read; every other request keeps MAX_BODY_BYTES
+const MAX_PLUGIN_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_QUERIES: usize = 100;
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
@@ -366,7 +369,7 @@ fn handle_http_connection<S: Read + Write>(
     auth_throttle: &AuthThrottle,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(io);
-    let request = read_http_request(&mut reader)?;
+    let request = read_http_request_with(&mut reader, Some(config))?;
 
     let health_request = request.method == "GET"
         && request
@@ -440,7 +443,22 @@ fn read_line_limited<R: BufRead>(
     Ok(line)
 }
 
+#[cfg(test)]
 fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> {
+    read_http_request_with(reader, None)
+}
+
+/// the body limit for a request: MAX_PLUGIN_BODY_BYTES for a plug-in upload that carries a valid read-write token,
+/// MAX_BODY_BYTES otherwise (no config: MAX_BODY_BYTES)
+fn body_limit(method: &str, target: &str, headers: &HashMap<String, String>, config: Option<&ApiConfig>) -> usize {
+    let path = target.split_once('?').map_or(target, |(p, _)| p);
+    match config {
+        Some(c) if method == "POST" && path == "/v1/plugins/load" && auth_scope(headers, c) == AuthScope::ReadWrite => MAX_PLUGIN_BODY_BYTES,
+        _ => MAX_BODY_BYTES,
+    }
+}
+
+fn read_http_request_with<R: BufRead>(reader: &mut R, config: Option<&ApiConfig>) -> Result<HttpRequest, String> {
     let request_line = read_line_limited(reader, MAX_REQUEST_LINE_BYTES, "HTTP request line")?;
     if request_line.is_empty() {
         return Err("HTTP client closed before request line".to_string());
@@ -537,6 +555,7 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
         );
     }
 
+    let limit = body_limit(&method, &target, &headers, config);
     let body = match transfer_encoding {
         None => {
             let content_length = headers
@@ -548,8 +567,8 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
                 .transpose()?
                 .unwrap_or(0);
 
-            if content_length > MAX_BODY_BYTES {
-                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            if content_length > limit {
+                return Err(format!("request body exceeds {limit} bytes"));
             }
 
             // Grows as bytes arrive rather than trusting Content-Length.
@@ -565,14 +584,14 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
                 .transpose()?
                 .unwrap_or(0);
 
-            if content_length > MAX_BODY_BYTES {
-                return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+            if content_length > limit {
+                return Err(format!("request body exceeds {limit} bytes"));
             }
 
             // Grows as bytes arrive rather than trusting Content-Length.
             crate::server::read_exact_growing(reader, content_length, "read HTTP request body")?
         }
-        Some(value) if value.eq_ignore_ascii_case("chunked") => read_chunked_body(reader)?,
+        Some(value) if value.eq_ignore_ascii_case("chunked") => read_chunked_body(reader, limit)?,
         Some(_) => {
             return Err(
                 "unsupported Transfer-Encoding; only identity and chunked are supported"
@@ -589,7 +608,7 @@ fn read_http_request<R: BufRead>(reader: &mut R) -> Result<HttpRequest, String> 
     })
 }
 
-fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+fn read_chunked_body<R: BufRead>(reader: &mut R, limit: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
 
     loop {
@@ -641,8 +660,8 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
             .len()
             .checked_add(size)
             .ok_or_else(|| "HTTP chunked body length overflow".to_string())?;
-        if new_len > MAX_BODY_BYTES {
-            return Err(format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+        if new_len > limit {
+            return Err(format!("request body exceeds {limit} bytes"));
         }
 
         let start = body.len();
@@ -801,7 +820,8 @@ fn route_http(
             "snapshot_batch": true,
             "snapshot_batch_version": 2,
             "max_batch_queries": MAX_BATCH_QUERIES,
-            "max_body_bytes": MAX_BODY_BYTES
+            "max_body_bytes": MAX_BODY_BYTES,
+            "max_plugin_body_bytes": MAX_PLUGIN_BODY_BYTES
         })),
         ("GET", "/v1/graphs") => {
             json_response(200, json!({"graphs": catalog.list()}))
@@ -1933,5 +1953,52 @@ mod tests {
         };
         assert!(dashboard_auth_scope(&wrong, &config) == AuthScope::None);
 
+    }
+
+    /// a plug-in upload past 8 MB is read only with a valid read-write token; without one, with the read-only token, or on
+    /// any other path, the 8 MB limit holds before any of the body is read
+    #[test]
+    fn plugin_uploads_get_a_larger_body_limit_only_with_the_read_write_token() {
+        let config = ApiConfig {
+            read_write_token: Some("rw-secret".to_string()),
+            read_only_token: Some("ro-secret".to_string()),
+            ..ApiConfig::default()
+        };
+        let big = MAX_BODY_BYTES + 1024;
+        let request = |path: &str, auth: Option<&str>| {
+            let mut raw = format!("POST {path} HTTP/1.1\r\nHost: db.example.test\r\nContent-Length: {big}\r\n");
+            if let Some(a) = auth {
+                raw.push_str(&format!("Authorization: Bearer {a}\r\n"));
+            }
+            raw.push_str("\r\n");
+            let mut bytes = raw.into_bytes();
+            bytes.resize(bytes.len() + big, b'x');
+            let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+            read_http_request_with(&mut reader, Some(&config))
+        };
+        let ok = request("/v1/plugins/load", Some("rw-secret")).expect("a plug-in upload with the read-write token");
+        assert_eq!(ok.body.len(), big);
+        for (path, auth) in [
+            ("/v1/plugins/load", None),
+            ("/v1/plugins/load", Some("ro-secret")),
+            ("/v1/plugins/load", Some("wrong")),
+            ("/v1/plugins/call", Some("rw-secret")),
+            ("/v1/batch", Some("rw-secret")),
+        ] {
+            let err = match request(path, auth) {
+                Ok(_) => panic!("{path} with {auth:?} must keep the 8 MB limit"),
+                Err(e) => e,
+            };
+            assert!(err.contains(&format!("exceeds {MAX_BODY_BYTES} bytes")), "{path} {auth:?}: {err}");
+        }
+        // past the plug-in limit even with the token
+        let over = MAX_PLUGIN_BODY_BYTES + 1;
+        let raw = format!("POST /v1/plugins/load HTTP/1.1\r\nHost: db.example.test\r\nContent-Length: {over}\r\nAuthorization: Bearer rw-secret\r\n\r\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(raw.into_bytes()));
+        let err = match read_http_request_with(&mut reader, Some(&config)) {
+            Ok(_) => panic!("past the plug-in limit"),
+            Err(e) => e,
+        };
+        assert!(err.contains(&format!("exceeds {MAX_PLUGIN_BODY_BYTES} bytes")), "{err}");
     }
 }
